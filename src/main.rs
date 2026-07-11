@@ -157,6 +157,8 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/metrics", get(metrics))
         .route("/v1/discover", get(discover))
         .route("/api/v1/discover", get(discover))
+        .route("/v1/dispatch/ticket", post(dispatch_ticket_issue))
+        .route("/api/v1/dispatch/ticket", post(dispatch_ticket_issue))
         .route("/v1/bootstrap", get(bootstrap))
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/v1/events", get(events))
@@ -410,6 +412,272 @@ async fn discover(
             "public, max-age=60, s-maxage=300, stale-while-revalidate=120",
         )
         .header("vary", "Accept-Encoding")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+/// `POST /v1/dispatch/ticket` — one short-lived, prompt-free route disclosure.
+///
+/// V1 tickets bind the signed directory disclosure to one intent/node/expiry. They
+/// do not authorize node task ingress and deliberately have no stateful redemption
+/// cache; node-admission tickets are a separately versioned future profile.
+#[derive(Debug, Deserialize)]
+struct DispatchTicketRequest {
+    intent: String,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    min_reputation: Option<f64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    relay_capable: Option<bool>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    node_id_prefix: Option<String>,
+    #[serde(default)]
+    exclude_node_id_prefixes: Vec<String>,
+    // The directory is control-plane only. These fields are explicit so a caller
+    // cannot accidentally send a task body through a ticket request.
+    #[serde(default)]
+    prompt: Option<serde_json::Value>,
+    #[serde(default)]
+    messages: Option<serde_json::Value>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    chat: Option<serde_json::Value>,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    response: Option<serde_json::Value>,
+}
+
+const DISPATCH_TICKET_DOMAIN: &str = "iicp:dispatch-route-ticket:v1\n";
+const DISPATCH_TICKET_AUDIENCE: &str = "iicp.directory.dispatch";
+const DISPATCH_TICKET_TTL_SECONDS: i64 = 120;
+
+fn dispatch_ticket_route_material(node: &types::Node) -> serde_json::Value {
+    let value = live_node_value(node);
+    let allowed = [
+        "node_id",
+        "endpoint",
+        "transport_endpoint",
+        "transport_method",
+        "transport_metadata",
+        "cx_public_key",
+        "region",
+        "score",
+        "health_label",
+        "health_confidence",
+        "routing_hint",
+        "browser_usable",
+        "reachability_tier",
+        "route_evidence",
+        "models",
+        "capability_summary",
+        "pricing",
+        "node_policy_manifest",
+        "available",
+        "reputation_score",
+        "reputation_tier",
+        "exposure_mode",
+        "transport",
+        "directory_observed_reachable",
+    ];
+    let mut route = serde_json::Map::new();
+    if let Some(source) = value.as_object() {
+        for field in allowed {
+            if let Some(value) = source.get(field).filter(|value| !value.is_null()) {
+                route.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(route)
+}
+
+async fn dispatch_ticket_issue(
+    State(st): State<AppState>,
+    Json(req): Json<DispatchTicketRequest>,
+) -> axum::response::Response {
+    if req.prompt.is_some()
+        || req.messages.is_some()
+        || req.payload.is_some()
+        || req.input.is_some()
+        || req.chat.is_some()
+        || req.content.is_some()
+        || req.response.is_some()
+    {
+        return reject(
+            "validation_error",
+            "Dispatch ticket issuance is control-plane only; send task payloads directly to the selected node.",
+        )
+        .into_response();
+    }
+    if !validate_intent(&req.intent) {
+        return reject("validation_error", "invalid intent URN").into_response();
+    }
+    if let Some(classification) = policy::IntentPolicyGuard::public_mesh_refusal(&req.intent) {
+        return policy_reject(&classification).into_response();
+    }
+    if req.node_id.as_ref().is_some_and(|id| id.len() > 64)
+        || req
+            .node_id_prefix
+            .as_ref()
+            .is_some_and(|id| !(4..=36).contains(&id.len()))
+        || req.exclude_node_id_prefixes.len() > 10
+        || req
+            .exclude_node_id_prefixes
+            .iter()
+            .any(|prefix| !(4..=36).contains(&prefix.len()))
+    {
+        return reject(
+            "validation_error",
+            "invalid node selector or exclusion prefix",
+        )
+        .into_response();
+    }
+    if req.node_id.is_some() && req.node_id_prefix.is_some() {
+        return reject(
+            "validation_error",
+            "Use node_id or node_id_prefix, not both.",
+        )
+        .into_response();
+    }
+    if let Some(min_reputation) = req.min_reputation {
+        if !(0.0..=1.0).contains(&min_reputation) {
+            return reject("validation_error", "min_reputation must be in [0, 1]").into_response();
+        }
+    }
+    let discovery_limit = if req.node_id.is_some() || req.node_id_prefix.is_some() {
+        50
+    } else {
+        req.limit.unwrap_or(10).clamp(1, 50)
+    };
+    let mut nodes = st
+        .repo
+        .discover(&DiscoverQuery {
+            intent: req.intent.clone(),
+            region: req.region.clone(),
+            limit: discovery_limit,
+            min_reputation: req.min_reputation,
+        })
+        .await;
+    nodes.retain(|node| {
+        node.health_models
+            .as_ref()
+            .map_or(true, |models| !models.is_empty())
+            && req.model.as_ref().map_or(true, |model| {
+                node.health_models
+                    .as_ref()
+                    .unwrap_or(&node.models)
+                    .contains(model)
+            })
+            && req.relay_capable.map_or(true, |required| {
+                node.relay_capable.unwrap_or(false) == required
+            })
+            && !req
+                .exclude_node_id_prefixes
+                .iter()
+                .any(|prefix| node.node_id.starts_with(prefix))
+    });
+    for node in &mut nodes {
+        node.address_family = Some(detect_address_family(
+            &node.endpoint,
+            node.transport_endpoint.as_deref(),
+        ));
+        node.transport = transport_methods(&node.endpoint, node.transport_endpoint.as_deref());
+        node.operator_display_name =
+            operator_display_name_for(&st, node.operator_pubkey.as_deref()).await;
+        node.operator_fingerprint = operator_fingerprint_for(node.operator_pubkey.as_deref());
+    }
+    let selected = if let Some(node_id) = req.node_id.as_deref() {
+        nodes
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or(404)
+    } else if let Some(prefix) = req.node_id_prefix.as_deref() {
+        let mut matches: Vec<_> = nodes
+            .into_iter()
+            .filter(|node| node.node_id.starts_with(prefix))
+            .collect();
+        match matches.len() {
+            0 => Err(404),
+            1 => Ok(matches.remove(0)),
+            _ => Err(409),
+        }
+    } else {
+        nodes.into_iter().next().ok_or(404)
+    };
+    let selected = match selected {
+        Ok(node) => node,
+        Err(status) => {
+            let (code, message) = if status == 409 {
+                ("ambiguous_node_prefix", "The node_id_prefix matches more than one eligible node; provide a longer prefix.")
+            } else {
+                (
+                    "no_route_available",
+                    "No eligible route matched the requested intent and filters.",
+                )
+            };
+            return err_json(StatusCode::from_u16(status).unwrap(), code, message).into_response();
+        }
+    };
+    let Some(secret) = st.signing_key.as_deref() else {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_configured",
+            "Dispatch route ticket signing key not configured on this directory.",
+        )
+        .into_response();
+    };
+    let now = unix_now();
+    let expires_at = now + DISPATCH_TICKET_TTL_SECONDS;
+    let ticket_id = uuid::Uuid::new_v4().simple().to_string()[..24].to_string();
+    let claims = serde_json::json!({
+        "v": 1,
+        "typ": "dispatch-route-ticket",
+        "iss": "https://iicp.network",
+        "aud": DISPATCH_TICKET_AUDIENCE,
+        "jti": ticket_id,
+        "node_id": selected.node_id,
+        "intent": req.intent,
+        "iat": now,
+        "exp": expires_at,
+    });
+    let Some(ticket) = sign_domain_token(secret, DISPATCH_TICKET_DOMAIN, &claims) else {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_configured",
+            "Dispatch route ticket signing key not configured on this directory.",
+        )
+        .into_response();
+    };
+    let node_id = selected.node_id.clone();
+    let route = dispatch_ticket_route_material(&selected);
+    let body = serde_json::json!({
+        "ticket": ticket,
+        "ticket_id_prefix": &ticket_id[..12],
+        "expires_at": expires_at,
+        "intent": claims["intent"],
+        "node_id": node_id,
+        "node_id_prefix": &selected.node_id[..selected.node_id.len().min(8)],
+        "route": route,
+        "algorithm": "ed25519",
+        "data_class": "ticketed_route_dispatch",
+        "route_fields_present": true,
+        "prompt_payload_accepted": false,
+    });
+    axum::response::Response::builder()
+        .status(StatusCode::CREATED)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .header("x-iicp-discover-data-class", "ticketed_route_dispatch")
         .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }
@@ -4117,6 +4385,74 @@ mod tests {
         assert_eq!(body["relay_node_id"], "relay-eu");
         assert_eq!(body["algorithm"], "ed25519");
         assert!(body["ticket"].as_str().unwrap().contains('.'));
+    }
+
+    #[tokio::test]
+    async fn dispatch_ticket_returns_prompt_free_route_bound_ticket() {
+        let request = serde_json::json!({"intent": "urn:iicp:intent:llm:chat:v1", "node_id": "a"});
+        let resp = app(test_state_with_signing_key())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/dispatch/ticket")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(resp
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("no-store")));
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["node_id"], "a");
+        assert_eq!(body["intent"], "urn:iicp:intent:llm:chat:v1");
+        assert_eq!(body["algorithm"], "ed25519");
+        assert!(body["ticket"].as_str().unwrap().contains('.'));
+        assert_eq!(body["route"]["node_id"], "a");
+        assert_eq!(body["route"]["endpoint"], "https://a");
+        let token_payload = body["ticket"].as_str().unwrap().split('.').next().unwrap();
+        use ct_codecs::{Base64UrlSafeNoPadding, Decoder};
+        let claims: serde_json::Value = serde_json::from_slice(
+            &Base64UrlSafeNoPadding::decode_to_vec(token_payload, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["typ"], "dispatch-route-ticket");
+        assert_eq!(claims["aud"], DISPATCH_TICKET_AUDIENCE);
+        assert_eq!(claims["node_id"], "a");
+        assert!(claims.get("prompt").is_none());
+        assert!(claims.get("payload").is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_ticket_rejects_payload_and_high_risk_intents() {
+        for request in [
+            serde_json::json!({"intent": "urn:iicp:intent:llm:chat:v1", "prompt": "GDPR_CANARY_PROMPT_DO_NOT_LOG_20260701"}),
+            serde_json::json!({"intent": "urn:iicp:intent:medical:diagnosis:v1"}),
+        ] {
+            let resp = app(test_state_with_signing_key())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/dispatch/ticket")
+                        .method("POST")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&body).contains("GDPR_CANARY_PROMPT_DO_NOT_LOG_20260701")
+            );
+            assert!(value["error"]["code"].is_string());
+        }
     }
 
     #[tokio::test]

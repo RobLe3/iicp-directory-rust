@@ -85,7 +85,7 @@ The public discover/detail wire shape is intentionally not a raw Rust `Node` ser
 
 ## v1.10.69 required gaps
 
-- `POST /api/v1/dispatch/ticket` and its intent-scoped, endpoint-safe route ticket.
+- ✅ `POST /api/v1/dispatch/ticket`: prompt-free, signed, intent/node/expiry-scoped route disclosure ticket. V1 is disclosure-only; stateful redemption/node admission is deferred.
 - ✅ Intent-policy refusal for prohibited and high-risk capability/discovery intent families; transparency and general/custom intents remain routable.
 - Operator challenge/acceptance plus signed DSR export, restriction and anonymisation.
 - Policy-manifest verification and operator-key lifecycle/revocation records.
@@ -118,7 +118,7 @@ suites.
 ```bash
 cd iicp-directory-rs
 cargo fmt --check && cargo test --locked
-# 210 passed
+# 212 passed
 ```
 
 New parity tests added in this refresh:
