@@ -196,6 +196,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pre_normative_profile_fixture_is_present_and_well_formed() {
+        // This is an integrity-consumption gate, not a claim that Rust already
+        // enforces every profile scenario. Runtime policy/ticket/DSR parity is
+        // still tracked by issue #1. Keeping the exact shared fixture in the
+        // Rust repository prevents an independent taxonomy fork while those
+        // implementations are delivered.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
+                .expect("profile fixture must be valid JSON");
+        assert_eq!(fixture["fixture_version"], "0.1.0-draft");
+        assert_eq!(fixture["status"], "pre-normative");
+        let scenarios = fixture["scenarios"]
+            .as_array()
+            .expect("fixture scenarios array");
+        assert_eq!(scenarios.len(), 9);
+        assert!(scenarios
+            .iter()
+            .any(|item| item["name"] == "required_extension"));
+        assert!(scenarios
+            .iter()
+            .any(|item| item["name"] == "mcp_tool_dangerous"));
+    }
+
+    #[test]
     fn intent_accepts_standard_and_custom() {
         assert!(validate_intent("urn:iicp:intent:llm:chat:v1"));
         assert!(validate_intent("urn:iicp:intent:x:acme-corp:thing:v2"));

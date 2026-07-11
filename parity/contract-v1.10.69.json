@@ -31,6 +31,9 @@
     ]
   },
   "rust": {
+    "required_shared_paths": [
+      "parity/profile-compatibility-v0.json"
+    ],
     "required_route_fragments": [
       "/api/v1/dispatch/ticket",
       "/api/v1/operator/challenge",

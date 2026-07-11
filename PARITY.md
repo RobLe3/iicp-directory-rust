@@ -92,6 +92,16 @@ The public discover/detail wire shape is intentionally not a raw Rust `Node` ser
 
 These are control-plane safety features, not cosmetic route aliases. Rust must not claim full directory parity until each has equivalent storage, authorization, redaction and contract tests.
 
+## Shared profile-fixture baseline
+
+Rust now carries the exact pre-normative
+`parity/profile-compatibility-v0.json` fixture used by the seed strategic
+compatibility simulation. Its current test is an **integrity-consumption gate**:
+it verifies fixture version, status and scenario coverage, but does not claim
+that Rust enforces the profile behaviours yet. Each runtime slice above must
+replace that integrity-only proof with executable policy, ticket and receipt
+conformance results before the strict parity contract can pass.
+
 ## Remaining parity cautions
 
 - **Compliance attestation:** Rust emits a compact signed attestation when configured. Production PHP includes latest REACH conformance probe evidence and cache behavior; Rust needs a real probe-data path before this is production-equivalent.
