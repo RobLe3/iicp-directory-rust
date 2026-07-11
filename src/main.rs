@@ -515,18 +515,83 @@ fn dispatch_ticket_route_material(node: &types::Node) -> serde_json::Value {
     serde_json::Value::Object(route)
 }
 
-async fn dispatch_ticket_issue(
-    State(st): State<AppState>,
-    Json(req): Json<DispatchTicketRequest>,
-) -> axum::response::Response {
-    if req.prompt.is_some()
+fn dispatch_ticket_contains_payload(req: &DispatchTicketRequest) -> bool {
+    req.prompt.is_some()
         || req.messages.is_some()
         || req.payload.is_some()
         || req.input.is_some()
         || req.chat.is_some()
         || req.content.is_some()
         || req.response.is_some()
+}
+
+fn dispatch_ticket_selector_error(req: &DispatchTicketRequest) -> Option<&'static str> {
+    let invalid_selector = req.node_id.as_ref().is_some_and(|id| id.len() > 64)
+        || req
+            .node_id_prefix
+            .as_ref()
+            .is_some_and(|id| !(4..=36).contains(&id.len()))
+        || req.exclude_node_id_prefixes.len() > 10
+        || req
+            .exclude_node_id_prefixes
+            .iter()
+            .any(|prefix| !(4..=36).contains(&prefix.len()));
+    if invalid_selector {
+        Some("invalid node selector or exclusion prefix")
+    } else if req.node_id.is_some() && req.node_id_prefix.is_some() {
+        Some("Use node_id or node_id_prefix, not both.")
+    } else if req
+        .min_reputation
+        .is_some_and(|min_reputation| !(0.0..=1.0).contains(&min_reputation))
     {
+        Some("min_reputation must be in [0, 1]")
+    } else {
+        None
+    }
+}
+
+fn select_dispatch_ticket_node(
+    nodes: Vec<types::Node>,
+    req: &DispatchTicketRequest,
+) -> Result<types::Node, (StatusCode, &'static str, &'static str)> {
+    if let Some(node_id) = req.node_id.as_deref() {
+        return nodes.into_iter().find(|node| node.node_id == node_id).ok_or((
+            StatusCode::NOT_FOUND,
+            "no_route_available",
+            "No eligible route matched the requested intent and filters.",
+        ));
+    }
+    if let Some(prefix) = req.node_id_prefix.as_deref() {
+        let mut matches: Vec<_> = nodes
+            .into_iter()
+            .filter(|node| node.node_id.starts_with(prefix))
+            .collect();
+        return match matches.len() {
+            0 => Err((
+                StatusCode::NOT_FOUND,
+                "no_route_available",
+                "No eligible route matched the requested intent and filters.",
+            )),
+            1 => Ok(matches.remove(0)),
+            _ => Err((
+                StatusCode::CONFLICT,
+                "ambiguous_node_prefix",
+                "The node_id_prefix matches more than one eligible node; provide a longer prefix.",
+            )),
+        };
+    }
+    nodes.into_iter().next().ok_or((
+        StatusCode::NOT_FOUND,
+        "no_route_available",
+        "No eligible route matched the requested intent and filters.",
+    ))
+}
+
+async fn dispatch_ticket_issue(
+    State(st): State<AppState>,
+    Json(req): Json<DispatchTicketRequest>,
+) -> axum::response::Response {
+    if dispatch_ticket_contains_payload(&req) {
         return reject(
             "validation_error",
             "Dispatch ticket issuance is control-plane only; send task payloads directly to the selected node.",
@@ -539,34 +604,8 @@ async fn dispatch_ticket_issue(
     if let Some(classification) = policy::IntentPolicyGuard::public_mesh_refusal(&req.intent) {
         return policy_reject(&classification).into_response();
     }
-    if req.node_id.as_ref().is_some_and(|id| id.len() > 64)
-        || req
-            .node_id_prefix
-            .as_ref()
-            .is_some_and(|id| !(4..=36).contains(&id.len()))
-        || req.exclude_node_id_prefixes.len() > 10
-        || req
-            .exclude_node_id_prefixes
-            .iter()
-            .any(|prefix| !(4..=36).contains(&prefix.len()))
-    {
-        return reject(
-            "validation_error",
-            "invalid node selector or exclusion prefix",
-        )
-        .into_response();
-    }
-    if req.node_id.is_some() && req.node_id_prefix.is_some() {
-        return reject(
-            "validation_error",
-            "Use node_id or node_id_prefix, not both.",
-        )
-        .into_response();
-    }
-    if let Some(min_reputation) = req.min_reputation {
-        if !(0.0..=1.0).contains(&min_reputation) {
-            return reject("validation_error", "min_reputation must be in [0, 1]").into_response();
-        }
+    if let Some(message) = dispatch_ticket_selector_error(&req) {
+        return reject("validation_error", message).into_response();
     }
     let discovery_limit = if req.node_id.is_some() || req.node_id_prefix.is_some() {
         50
@@ -610,37 +649,9 @@ async fn dispatch_ticket_issue(
             operator_display_name_for(&st, node.operator_pubkey.as_deref()).await;
         node.operator_fingerprint = operator_fingerprint_for(node.operator_pubkey.as_deref());
     }
-    let selected = if let Some(node_id) = req.node_id.as_deref() {
-        nodes
-            .into_iter()
-            .find(|node| node.node_id == node_id)
-            .ok_or(404)
-    } else if let Some(prefix) = req.node_id_prefix.as_deref() {
-        let mut matches: Vec<_> = nodes
-            .into_iter()
-            .filter(|node| node.node_id.starts_with(prefix))
-            .collect();
-        match matches.len() {
-            0 => Err(404),
-            1 => Ok(matches.remove(0)),
-            _ => Err(409),
-        }
-    } else {
-        nodes.into_iter().next().ok_or(404)
-    };
-    let selected = match selected {
+    let selected = match select_dispatch_ticket_node(nodes, &req) {
         Ok(node) => node,
-        Err(status) => {
-            let (code, message) = if status == 409 {
-                ("ambiguous_node_prefix", "The node_id_prefix matches more than one eligible node; provide a longer prefix.")
-            } else {
-                (
-                    "no_route_available",
-                    "No eligible route matched the requested intent and filters.",
-                )
-            };
-            return err_json(StatusCode::from_u16(status).unwrap(), code, message).into_response();
-        }
+        Err((status, code, message)) => return err_json(status, code, message).into_response(),
     };
     let Some(secret) = st.signing_key.as_deref() else {
         return err_json(
