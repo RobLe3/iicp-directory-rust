@@ -4,8 +4,9 @@ Last refreshed: **2026-07-11**. The Laravel seed is currently `v1.10.69`.
 
 > **Status:** this Rust implementation is a reconciled parity baseline, not a
 > cutover-ready replacement. It remains behind the seed for ticketed dispatch,
-> risk-policy enforcement, operator self-service/DSR, policy-key lifecycle, and
-> dispatch-usage accounting. `directory/parity/contract-v1.10.69.json` is the
+> ticketed dispatch, operator self-service/DSR, policy-key lifecycle, and
+> dispatch-usage accounting. Public-mesh intent-policy refusal is now implemented
+> from the shared canonical taxonomy. `directory/parity/contract-v1.10.69.json` is the
 > authoritative gap checklist; do not infer parity from route count alone.
 
 The goal is not merely to compile a Rust server. The Rust directory must be wire-compatible with the PHP/Laravel directory for clients, nodes, relays, the website and future replicas. The PHP seed remains production authority until live conformance and operational evidence justify a cutover.
@@ -85,22 +86,25 @@ The public discover/detail wire shape is intentionally not a raw Rust `Node` ser
 ## v1.10.69 required gaps
 
 - `POST /api/v1/dispatch/ticket` and its intent-scoped, endpoint-safe route ticket.
-- Intent-policy refusal for prohibited/restricted risk classes.
+- ✅ Intent-policy refusal for prohibited and high-risk capability/discovery intent families; transparency and general/custom intents remain routable.
 - Operator challenge/acceptance plus signed DSR export, restriction and anonymisation.
 - Policy-manifest verification and operator-key lifecycle/revocation records.
 - Dispatch usage accounting, telemetry retention and the matching operational commands.
 
 These are control-plane safety features, not cosmetic route aliases. Rust must not claim full directory parity until each has equivalent storage, authorization, redaction and contract tests.
 
-## Shared profile-fixture baseline
+## Shared profile-fixture and policy-taxonomy baseline
 
-Rust now carries the exact pre-normative
-`parity/profile-compatibility-v0.json` fixture used by the seed strategic
-compatibility simulation. Its current test is an **integrity-consumption gate**:
-it verifies fixture version, status and scenario coverage, but does not claim
-that Rust enforces the profile behaviours yet. Each runtime slice above must
-replace that integrity-only proof with executable policy, ticket and receipt
-conformance results before the strict parity contract can pass.
+Rust carries the exact pre-normative `parity/profile-compatibility-v0.json`
+fixture and the canonical `parity/intent-risk-taxonomy.json` used by the seed.
+The policy guard enforces the taxonomy at registration and discovery: prohibited
+and high-risk families fail closed with `IICP-POLICY-001`; transparency-risk and
+general/custom families remain routable. This is identifier-only control-plane
+policy, not prompt moderation: task payloads do not pass through the directory.
+
+Profile fixture coverage remains an integrity-consumption gate until ticket,
+receipt, DSR and lifecycle profile behaviours have their own executable parity
+suites.
 
 ## Remaining parity cautions
 
@@ -113,8 +117,8 @@ conformance results before the strict parity contract can pass.
 
 ```bash
 cd iicp-directory-rs
-cargo test
-# 203 passed
+cargo fmt --check && cargo test --locked
+# 210 passed
 ```
 
 New parity tests added in this refresh:
@@ -122,6 +126,7 @@ New parity tests added in this refresh:
 - `/api/v1/*` aliases do not 404 for the live PHP route surface.
 - `/api/v1/discover` contains the current live PHP compatibility fields.
 - `/api/v1/directory-key` exposes the Ed25519 public key from a libsodium secret key.
+- Registration refuses prohibited capability families before persistence; discovery refuses high-risk public-mesh intents before repository lookup.
 - `/api/v1/consumer-token` and `/api/v1/relay/ticket` issue signed short-lived tokens.
 
 ## Cutover rule

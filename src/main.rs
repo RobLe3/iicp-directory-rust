@@ -13,6 +13,7 @@ mod db;
 mod delegation;
 mod federation;
 mod health;
+mod policy;
 mod recognition;
 mod replica;
 mod repo;
@@ -313,6 +314,11 @@ async fn discover(
                 .unwrap();
         }
     };
+    // Public-mesh intent policy is enforced before repository access. This is an
+    // identifier-only guard: neither prompts nor task payloads reach the directory.
+    if let Some(classification) = policy::IntentPolicyGuard::public_mesh_refusal(&intent) {
+        return policy_reject(&classification).into_response();
+    }
     // DIR-DISC-09: min_reputation out of [0, 1] MUST return 422 (out-of-range input rejected).
     // PHP validates min:0 AND max:1 — a NEGATIVE value must 422 too (the old check only
     // caught > 1.0, silently accepting e.g. -0.5 despite the "[0, 1]" error text).
@@ -1111,6 +1117,11 @@ async fn register(
                 "validation_error",
                 &format!("invalid intent URN: {}", cap.intent),
             );
+        }
+        // Refuse restricted capability families before they are persisted or
+        // become discoverable through the public mesh.
+        if let Some(classification) = policy::IntentPolicyGuard::public_mesh_refusal(&cap.intent) {
+            return policy_reject(&classification);
         }
     }
     // AL2 (#401) — exposure_mode enum parity with PHP RegisterController: reject
@@ -3329,6 +3340,18 @@ fn node_id_from_auth(headers: &axum::http::HeaderMap, token: &str) -> Option<Str
 
 fn reject(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     err_json(StatusCode::UNPROCESSABLE_ENTITY, code, message)
+}
+
+/// Canonical public-mesh policy refusal. The response deliberately includes only
+/// taxonomy evidence, never submitted task content or the full identifier.
+fn policy_reject(
+    classification: &policy::IntentClassification,
+) -> (StatusCode, Json<serde_json::Value>) {
+    err_json(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        policy::REFUSAL_CODE,
+        &policy::refusal_message(classification),
+    )
 }
 
 /// Structured error with an explicit status (PHP parity: `{error:{code,message}}`).
@@ -5659,6 +5682,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_refuses_prohibited_capability_before_persistence() {
+        let body = serde_json::json!({
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:social-scoring:rank:v1"}]
+        });
+        let resp = app(test_state())
+            .oneshot(post_register(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], policy::REFUSAL_CODE);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("social scoring"));
+        assert!(!value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("urn:iicp:"));
+    }
+
+    #[tokio::test]
     async fn register_non_routable_endpoint_is_422_in_prod() {
         let body = serde_json::json!({
             "endpoint": "http://192.168.1.10:8090",
@@ -5960,6 +6007,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 422);
+    }
+
+    #[tokio::test]
+    async fn discover_refuses_high_risk_public_mesh_intent_before_lookup() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:medical:diagnosis:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], policy::REFUSAL_CODE);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("healthcare decision"));
     }
 
     // ALIGN/#385 parity (#404): min_reputation out of [0,1] MUST 422 — including NEGATIVE
