@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     id              CHAR(36)            NOT NULL PRIMARY KEY,
     endpoint        VARCHAR(255)        NOT NULL,
     region          VARCHAR(64)         NOT NULL DEFAULT '',
-    load            FLOAT               NOT NULL DEFAULT 0.0,
+    `load`          FLOAT               NOT NULL DEFAULT 0.0,
     active_jobs     INT UNSIGNED        NOT NULL DEFAULT 0,
     available       TINYINT(1)          NOT NULL DEFAULT 1,
     last_seen       TIMESTAMP           NULL,

@@ -10,18 +10,26 @@
 mod auth;
 mod background;
 mod db;
+mod delegation;
+mod federation;
 mod health;
+mod recognition;
+mod replica;
 mod repo;
 mod reputation;
 mod types;
 mod validate;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
+use std::{net::ToSocketAddrs, time::Duration};
 
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Query, Request, State};
+use axum::http::{header, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::{
+    middleware::{self, Next},
     routing::{get, post},
     Json, Router,
 };
@@ -30,10 +38,13 @@ use repo::{
     NodeRepository, ProbeResult, ProxyObservation, RegistryStats,
 };
 use serde::Deserialize;
-use types::NodeList;
 use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
+const SDK_BASELINE_VERSION: &str = "0.7.68";
+
+/// This directory's DID (single source for /.well-known/did.json + signed-event signer_did).
+const DIRECTORY_DID: &str = "did:web:iicp.network";
 
 /// Derive `address_family` from an endpoint URL (PHP NodeScorer::detectAddressFamily parity).
 /// Returns "ipv4" | "ipv6" | "hostname" | "unknown".
@@ -118,39 +129,141 @@ static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 struct AppState {
     repo: Arc<dyn NodeRepository>,
     env: Env,
+    /// #442: this directory's Ed25519 signing key (libsodium 64-byte / 128-hex), from
+    /// IICP_GENESIS_ED25519_SECRET_KEY. `None` → events emit unsigned (PHP parity: when no
+    /// key is configured, NodeEventLogger::sign returns null).
+    signing_key: Option<String>,
+    /// IICP-E034 registration rate-limit counter, per source IP (W-033 PHP parity).
+    register_rate: RegisterRateMap,
+}
+
+/// Emit + sign a federated event onto this directory's log if a signing key is configured
+/// (#442). No-op when unsigned. Keeps the write-path handlers a single call (complexity-flat).
+async fn emit_event(st: &AppState, event_type: &str, node_id: &str, payload: serde_json::Value) {
+    if let Some(key) = st.signing_key.as_deref() {
+        st.repo
+            .append_signed_event(key, event_type, node_id, &payload)
+            .await;
+    }
 }
 
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/stats", get(stats))
+        .route("/api/v1/stats", get(stats))
         .route("/v1/metrics", get(metrics))
+        .route("/api/v1/metrics", get(metrics))
         .route("/v1/discover", get(discover))
+        .route("/api/v1/discover", get(discover))
         .route("/v1/bootstrap", get(bootstrap))
+        .route("/api/v1/bootstrap", get(bootstrap))
+        .route("/v1/events", get(events))
+        .route("/v1/snapshot", get(snapshot))
+        // #442 — federation endpoints are also served under /api/v1 so a replica (PHP or
+        // Rust) can federate FROM a Rust seed: ReplicaStartCommand + replica::fetch_events
+        // both poll `{seed}/api/v1/events` + `/api/v1/snapshot` + `/api/v1/replicas/register`
+        // (the PHP seed mounts everything under /api). Without these aliases a Rust seed is
+        // unreachable to /api/v1-expecting replicas (404 on the path).
+        .route("/api/v1/events", get(events))
+        .route("/api/v1/snapshot", get(snapshot))
+        .route("/api/v1/replicas/register", post(replicas_register))
         .route("/v1/me", get(me))
+        .route("/api/v1/me", get(me))
         .route("/v1/node/:id", get(node_detail))
+        .route("/api/v1/node/:id", get(node_detail))
         .route("/v1/register", post(register).delete(deregister))
+        .route("/api/v1/register", post(register).delete(deregister))
+        .route("/v1/operator/rename", post(operator_rename))
+        .route("/api/v1/operator/rename", post(operator_rename))
+        .route("/v1/leaderboards/:board_id", get(leaderboard))
+        .route("/api/v1/leaderboards/:board_id", get(leaderboard))
+        .route("/v1/replicas/register", post(replicas_register))
         .route("/v1/peers", post(peers))
+        .route("/api/v1/peers", post(peers))
         .route("/v1/heartbeat", post(heartbeat))
+        .route("/api/v1/heartbeat", post(heartbeat))
         .route("/v1/registry/nodes", get(registry_nodes))
+        .route("/api/v1/registry/nodes", get(registry_nodes))
         .route("/v1/registry/nodes/:id", get(registry_node_detail))
+        .route("/api/v1/registry/nodes/:id", get(registry_node_detail))
         .route("/v1/registry/intents", get(registry_intents))
+        .route("/api/v1/registry/intents", get(registry_intents))
         .route("/v1/registry/stats", get(registry_stats))
+        .route("/api/v1/registry/stats", get(registry_stats))
         .route("/.well-known/did.json", get(did_document))
+        .route("/.well-known/iicp-replicas.json", get(iicp_replicas))
+        .route("/v1/directory-key", get(directory_key))
+        .route("/api/v1/directory-key", get(directory_key))
+        .route("/v1/consumer-token", post(consumer_token_issue))
+        .route("/api/v1/consumer-token", post(consumer_token_issue))
+        .route("/v1/relay/ticket", post(relay_ticket_issue))
+        .route("/api/v1/relay/ticket", post(relay_ticket_issue))
+        .route("/v1/compliance-attestation", get(compliance_attestation))
+        .route(
+            "/api/v1/compliance-attestation",
+            get(compliance_attestation),
+        )
         .route("/v1/credits/balance", get(credits_balance))
+        .route("/api/v1/credits/balance", get(credits_balance))
+        .route("/v1/credits/summary", get(credits_summary))
+        .route("/api/v1/credits/summary", get(credits_summary))
         .route("/v1/credits/award", post(credits_award))
+        .route("/api/v1/credits/award", post(credits_award))
         .route("/v1/credits/transactions", get(credits_transactions))
+        .route("/api/v1/credits/transactions", get(credits_transactions))
         .route("/v1/audit-report", post(audit_report))
+        .route("/api/v1/audit-report", post(audit_report))
         .route("/v1/telemetry/probe", post(telemetry_probe))
+        .route("/api/v1/telemetry/probe", post(telemetry_probe))
         .route("/v1/telemetry", post(telemetry_proxy))
+        .route("/api/v1/telemetry", post(telemetry_proxy))
         .route("/v1/credits/quote", get(credits_quote))
+        .route("/api/v1/credits/quote", get(credits_quote))
         .route("/v1/badges", get(badges_list))
+        .route("/api/v1/conformance/badges", get(badges_list))
         .route("/v1/badge/:tier", get(badge_svg))
+        .route("/api/v1/badge/:tier", get(badge_svg))
         .route("/v1/submit", post(conformance_submit))
+        .route("/api/v1/conformance/submit", post(conformance_submit))
         .route("/v1/verify", get(conformance_verify))
+        .route("/api/v1/conformance/verify", get(conformance_verify))
         .route("/v1/probe", get(probe_node))
+        .route("/api/v1/probe", get(probe_node))
         .route("/", get(root_info))
         .with_state(state)
+}
+
+/// Replica write-gate (DIR-FED-18): when this directory runs as a replica
+/// (`IICP_REPLICA_MODE=true`), it MUST NOT accept writes — token issuance and the
+/// event log are single-source on the seed. Unsafe methods (POST/PUT/PATCH/DELETE) get
+/// a 307 Temporary Redirect to the seed, preserving path + query; reads pass through.
+/// Reciprocal of the PHP `ReplicaModeRedirect` middleware. Applied only in replica mode.
+async fn replica_write_gate(State(seed_url): State<String>, req: Request, next: Next) -> Response {
+    if matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        let path_q = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/");
+        let location = format!("{}{}", seed_url.trim_end_matches('/'), path_q);
+        return (
+            StatusCode::TEMPORARY_REDIRECT,
+            [
+                (header::LOCATION, location),
+                (
+                    header::HeaderName::from_static("x-iicp-redirect-reason"),
+                    "replica_mode".to_string(),
+                ),
+                (header::RETRY_AFTER, "0".to_string()),
+            ],
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -173,6 +286,10 @@ struct DiscoverParams {
     /// Accepted as boolean or "1"/"0"/"true"/"false".
     #[serde(default)]
     cip_capable: Option<String>,
+    /// #494 — filter to nodes whose live health_models contains this model name.
+    /// Falls back to the static `models` list when health_models is not yet reported.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// `GET /v1/discover` → NODELIST (iicp-dir §3.3/§3.4).
@@ -196,9 +313,11 @@ async fn discover(
                 .unwrap();
         }
     };
-    // DIR-DISC-09: min_reputation > 1.0 MUST return 422 (out-of-range input rejected).
+    // DIR-DISC-09: min_reputation out of [0, 1] MUST return 422 (out-of-range input rejected).
+    // PHP validates min:0 AND max:1 — a NEGATIVE value must 422 too (the old check only
+    // caught > 1.0, silently accepting e.g. -0.5 despite the "[0, 1]" error text).
     if let Some(mr) = p.min_reputation {
-        if mr > 1.0 {
+        if !(0.0..=1.0).contains(&mr) {
             return axum::response::Response::builder()
                 .status(422)
                 .header("content-type", "application/json")
@@ -230,25 +349,52 @@ async fn discover(
     } else {
         nodes
     };
-    // Enrich with server-side derived fields (PHP NodeScorer parity).
+    // #494 — health_models=[] means the runtime has no models loaded; exclude from ALL discover.
+    // health_models=None means not yet reported → keep (backward compat). PHP NodeScorer parity.
     let nodes: Vec<types::Node> = nodes
         .into_iter()
-        .map(|mut n| {
-            n.address_family = Some(detect_address_family(
-                &n.endpoint,
-                n.transport_endpoint.as_deref(),
-            ));
-            // #397 — transport protocols, derived from endpoint schemes (PHP parity).
-            n.transport = transport_methods(&n.endpoint, n.transport_endpoint.as_deref());
-            n
-        })
+        .filter(|n| n.health_models.as_ref().map_or(true, |hm| !hm.is_empty()))
         .collect();
-    let count = nodes.len() as u32;
-    let body = NodeList {
-        nodes,
-        count,
-        query_ms: started.elapsed().as_millis() as u32,
+    // #494 — ?model= filter: prefer health_models (live); fall back to static models list.
+    // Nodes with health_models=[] are already excluded above.
+    let nodes: Vec<types::Node> = if let Some(ref model_filter) = p.model {
+        nodes
+            .into_iter()
+            .filter(|n| {
+                if let Some(ref hm) = n.health_models {
+                    hm.contains(model_filter)
+                } else {
+                    n.models.contains(model_filter)
+                }
+            })
+            .collect()
+    } else {
+        nodes
     };
+    // Enrich with server-side derived fields (PHP NodeScorer parity).
+    let mut enriched = Vec::with_capacity(nodes.len());
+    for mut n in nodes {
+        n.address_family = Some(detect_address_family(
+            &n.endpoint,
+            n.transport_endpoint.as_deref(),
+        ));
+        // #397 — transport protocols, derived from endpoint schemes (PHP parity).
+        n.transport = transport_methods(&n.endpoint, n.transport_endpoint.as_deref());
+        // #525/G3 — public operator handle + short fingerprint; never expose operator_pubkey.
+        n.operator_display_name =
+            operator_display_name_for(&st, n.operator_pubkey.as_deref()).await;
+        n.operator_fingerprint = operator_fingerprint_for(n.operator_pubkey.as_deref());
+        enriched.push(n);
+    }
+    let nodes = enriched;
+    let count = nodes.len() as u32;
+    let relay_available = nodes.iter().any(|n| n.relay_capable.unwrap_or(false));
+    let body = serde_json::json!({
+        "nodes": nodes.iter().map(live_node_value).collect::<Vec<_>>(),
+        "count": count,
+        "relay_available": relay_available,
+        "query_ms": started.elapsed().as_millis() as u32,
+    });
     // PHP adds Cache-Control for CDN caching (Cloudflare s-maxage=300 + stale-while-revalidate).
     axum::response::Response::builder()
         .status(200)
@@ -275,8 +421,9 @@ async fn node_detail(
                 &node.endpoint,
                 node.transport_endpoint.as_deref(),
             ));
+            node.transport = transport_methods(&node.endpoint, node.transport_endpoint.as_deref());
             // PHP NodeController includes capabilities array (REACH DIR-NODE-01).
-            let mut v = serde_json::to_value(&node).unwrap();
+            let mut v = live_node_value(&node);
             if !v
                 .as_object()
                 .map(|o| o.contains_key("capabilities"))
@@ -294,6 +441,263 @@ async fn node_detail(
             ),
         ),
     }
+}
+
+/// Add the current PHP/live-directory discover fields on top of the Rust `Node`
+/// storage model. This keeps the Rust implementation wire-compatible with
+/// `/api/v1/discover` without forcing every DB row and older test fixture to
+/// carry newest PHP-only columns.
+fn live_node_value(n: &types::Node) -> serde_json::Value {
+    let mut v = serde_json::to_value(n).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(obj) = v.as_object_mut() else {
+        return v;
+    };
+
+    let public_key = n.public_key.clone().unwrap_or(serde_json::Value::Null);
+    obj.insert("cx_public_key".into(), public_key.clone());
+    obj.insert("public_key".into(), public_key.clone());
+    let key_ready = !public_key.is_null();
+    obj.insert("key_ready".into(), serde_json::json!(key_ready));
+    obj.insert(
+        "privacy_routing_status".into(),
+        serde_json::json!(if key_ready {
+            "key_ready"
+        } else {
+            "transitional"
+        }),
+    );
+
+    let sdk_status = sdk_status(n.sdk_version.as_deref());
+    obj.insert("sdk_status".into(), serde_json::json!(sdk_status));
+    obj.insert(
+        "sdk_baseline_version".into(),
+        serde_json::json!(SDK_BASELINE_VERSION),
+    );
+    obj.insert(
+        "upgrade_required".into(),
+        serde_json::json!(sdk_status != "current"),
+    );
+    obj.insert(
+        "auto_update".into(),
+        serde_json::json!({
+            "enabled": serde_json::Value::Null,
+            "interval_s": serde_json::Value::Null,
+            "latest_seen": n.sdk_version.clone(),
+            "last_checked_at": serde_json::Value::Null,
+            "error_class": serde_json::Value::Null,
+            "evidence": "unknown"
+        }),
+    );
+
+    let completed = n.completed_tasks_count;
+    obj.insert("probation".into(), serde_json::json!(completed < 100));
+    obj.insert(
+        "trust_progress".into(),
+        serde_json::json!({
+            "completed_tasks": completed,
+            "gold_min_tasks": 100,
+            "platinum_min_tasks": 1000,
+            "tasks_until_gold": 100_u64.saturating_sub(completed),
+            "tasks_until_platinum": 1000_u64.saturating_sub(completed),
+            "probation": completed < 100
+        }),
+    );
+
+    let browser_usable = browser_usable_endpoint(&n.endpoint);
+    let route_evidence = if n.reachability_signal >= 1.0 {
+        "directory_observed"
+    } else if self_attests_route(n) {
+        "self_attested"
+    } else {
+        "missing"
+    };
+    obj.insert(
+        "directory_observed_reachable".into(),
+        if n.reachability_signal >= 1.0 {
+            serde_json::json!(true)
+        } else {
+            serde_json::Value::Null
+        },
+    );
+    obj.insert("route_evidence".into(), serde_json::json!(route_evidence));
+    obj.insert("routing_hint".into(), serde_json::json!(routing_hint(n)));
+    obj.insert("browser_usable".into(), serde_json::json!(browser_usable));
+    obj.insert(
+        "reachability_tier".into(),
+        serde_json::json!(if n.reachability_signal >= 1.0 {
+            "direct"
+        } else if n.relay_capable.unwrap_or(false) || n.exposure_mode.is_some() {
+            "relay"
+        } else {
+            "limited"
+        }),
+    );
+
+    obj.insert("backend".into(), serde_json::json!("unknown"));
+    obj.insert(
+        "backend_stability".into(),
+        serde_json::json!({
+            "backend_state": "unknown",
+            "reason_class": "not_reported",
+            "routing_guard": "none",
+            "evidence": "not_reported",
+            "retry_after_s": serde_json::Value::Null,
+            "drain_until": serde_json::Value::Null,
+            "summary": "Backend stability has not been reported yet."
+        }),
+    );
+
+    let live_models = n.health_models.clone().unwrap_or_else(|| n.models.clone());
+    obj.insert(
+        "capability_summary".into(),
+        serde_json::json!({
+            "registered_model_count": n.models.len(),
+            "live_model_count": live_models.len(),
+            "modalities": ["text"]
+        }),
+    );
+    obj.insert("input_modalities".into(), serde_json::json!(["text"]));
+    if !obj.contains_key("pricing") || obj.get("pricing").is_some_and(|p| p.is_null()) {
+        obj.insert(
+            "pricing".into(),
+            serde_json::json!({
+                "credit_cost_multiplier": n.credit_cost_multiplier,
+                "pricing_model": n.pricing_model.as_deref().unwrap_or("per_token"),
+                "attested": n.attested
+            }),
+        );
+    }
+    obj.insert(
+        "performance".into(),
+        serde_json::json!({
+            "task_latency_ms": n.latency_estimate_ms,
+            "task_latency_ms_basis": if n.latency_estimate_ms.is_some() { "proxy_observed_task" } else { "none" },
+            "proxy_observed_latency_ms": n.latency_estimate_ms,
+            "self_reported_recent_latency_ms": serde_json::Value::Null,
+            "self_reported_lifetime_latency_ms": serde_json::Value::Null,
+            "health_impact": "separate_from_operational_health",
+            "summary": "Task/inference latency is a performance signal, not a reachability-health input."
+        }),
+    );
+    if !obj.contains_key("health_confidence") {
+        obj.insert(
+            "health_confidence".into(),
+            serde_json::json!(if n.health_label.as_deref() == Some("healthy") {
+                "medium"
+            } else {
+                "low"
+            }),
+        );
+    }
+
+    // Keep the public discover/detail contract aligned with the live PHP
+    // directory. These fields remain available internally on `Node` for scoring,
+    // health and accounting, but PHP exposes them through nested public blocks
+    // (`pricing`, `trust_progress`, `performance`) or not at all.
+    for internal_field in [
+        "completed_tasks_count",
+        "tasks_failed",
+        "credit_cost_multiplier",
+        "pricing_model",
+        "attested",
+        "operator_verified",
+        "operator_trust_tier",
+        "health_models",
+    ] {
+        obj.remove(internal_field);
+    }
+
+    v
+}
+
+fn browser_usable_endpoint(endpoint: &str) -> bool {
+    let lower = endpoint.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    if !lower.starts_with("http://") {
+        return false;
+    }
+    let host = endpoint
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    }
+    .to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+fn self_attests_route(n: &types::Node) -> bool {
+    n.reachability_signal >= 1.0 || n.relay_capable.unwrap_or(false) || n.exposure_mode.is_some()
+}
+
+fn routing_hint(n: &types::Node) -> &'static str {
+    if n.relay_capable.unwrap_or(false) {
+        return "relay_service";
+    }
+    let lower = n.endpoint.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return "https_direct";
+    }
+    if lower.starts_with("http://") {
+        return if url_host_family(&n.endpoint) == "ipv6" {
+            "http_ipv6"
+        } else {
+            "http_direct"
+        };
+    }
+    "unknown"
+}
+
+fn sdk_status(version: Option<&str>) -> &'static str {
+    let Some(v) = version.map(str::trim).filter(|v| !v.is_empty()) else {
+        return "unknown";
+    };
+    if version_at_least(v, SDK_BASELINE_VERSION) {
+        "current"
+    } else {
+        "downlevel"
+    }
+}
+
+fn version_at_least(version: &str, baseline: &str) -> bool {
+    let a = version_parts(version);
+    let b = version_parts(baseline);
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        if x > y {
+            return true;
+        }
+        if x < y {
+            return false;
+        }
+    }
+    true
+}
+
+fn version_parts(version: &str) -> Vec<u32> {
+    version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split('.')
+        .map_while(|p| {
+            let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse().ok()
+            }
+        })
+        .collect()
 }
 
 // ── register (iicp-dir §3.1) ──────────────────────────────────────────────────
@@ -319,6 +723,10 @@ struct RegisterRequest {
     #[serde(default)]
     node_id: Option<String>,
     endpoint: String,
+    /// IICP-E050 (#529) — the node's existing token, proving ownership when an
+    /// already-registered `node_id` re-registers with a changed `endpoint`.
+    #[serde(default)]
+    current_node_token: Option<String>,
     #[serde(default)]
     region: Option<String>,
     capabilities: Vec<Capability>,
@@ -350,6 +758,312 @@ struct RegisterRequest {
     /// NAT traversal metadata blob (ADR-043).
     #[serde(default)]
     transport_metadata: Option<serde_json::Value>,
+    /// ADR-045 Phase A (#407) — optional verifiable operator→node delegation (ed25519).
+    #[serde(default)]
+    operator_delegation: Option<delegation::OperatorDelegation>,
+    /// #463/#464 — operator-identity attributes (bound only when the delegation verifies).
+    /// display_name is the public handle; created_at + integrity_hash are identity-integrity.
+    /// contact/email is NEVER accepted (private).
+    #[serde(default)]
+    operator_display_name: Option<String>,
+    #[serde(default)]
+    operator_created_at: Option<String>,
+    #[serde(default)]
+    operator_integrity_hash: Option<String>,
+    /// WQ-058 / ADR-017 REG-01 — operator public-listing opt-in (PHP: `listing` object with
+    /// `public_listing` bool + `operator_url`). Absent → not listed.
+    #[serde(default)]
+    listing: Option<ListingInput>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ListingInput {
+    #[serde(default)]
+    public_listing: bool,
+    #[serde(default)]
+    operator_url: Option<String>,
+}
+
+/// Normalize operator display names for uniqueness checks (PHP NodeRegistry parity):
+/// trim, fold runs of whitespace to one space, lowercase. Empty becomes None.
+pub(crate) fn normalize_operator_display_name(display_name: &str) -> Option<String> {
+    let mut folded = String::new();
+    let mut last_was_space = false;
+    for ch in display_name.trim().chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                folded.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            folded.extend(ch.to_lowercase());
+            last_was_space = false;
+        }
+    }
+    if folded.is_empty() {
+        None
+    } else {
+        Some(folded)
+    }
+}
+
+/// Public, non-secret operator key fingerprint for display-name disambiguation.
+fn public_operator_fingerprint(operator_pubkey: &str) -> String {
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        operator_pubkey.as_bytes(),
+    ))
+    .chars()
+    .take(12)
+    .collect()
+}
+
+/// #463 — resolve a node's public operator handle (display_name) by its operator_pubkey.
+/// Returns None when the node has no bound operator or no name set. The operator_pubkey is
+/// directory-private — callers serve only the returned display_name, never the key.
+async fn operator_display_name_for(st: &AppState, operator_pubkey: Option<&str>) -> Option<String> {
+    match operator_pubkey {
+        Some(p) => st.repo.operator_display_name(p).await,
+        None => None,
+    }
+}
+
+fn operator_fingerprint_for(operator_pubkey: Option<&str>) -> Option<String> {
+    operator_pubkey
+        .filter(|p| !p.is_empty())
+        .map(public_operator_fingerprint)
+}
+
+/// #463/#310/#464 — upsert the operator-identity record (keyed by operator_id ==
+/// operator_pubkey) when a delegation verified. display_name is public + mutable; contact is
+/// never accepted; integrity_hash + first_seen_ms are pinned on first insert (PHP parity #385).
+async fn upsert_operator_from_register(
+    st: &AppState,
+    operator_pubkey: &Option<String>,
+    display_name: Option<&str>,
+    created_at: Option<&str>,
+    integrity_hash: Option<&str>,
+) {
+    if let Some(op_pub) = operator_pubkey {
+        st.repo
+            .upsert_operator(op_pub, display_name, created_at, integrity_hash)
+            .await;
+    }
+}
+
+/// #460 — body of `POST /v1/operator/rename`. Self-authenticating: `sig` is the operator's
+/// ed25519 signature over the canonical rename bytes (no node token). `contact` is never
+/// accepted here (private; never mutated via this endpoint).
+#[derive(Debug, Deserialize)]
+struct RenameRequest {
+    operator_pub: String,
+    display_name: String,
+    ts: i64,
+    sig: String,
+}
+
+/// Replay window for the signed rename timestamp (seconds) — PHP `TS_WINDOW` parity.
+const RENAME_TS_WINDOW: i64 = 300;
+
+/// `POST /v1/operator/rename` (#460, PHP `OperatorController::rename` parity #385). Changes
+/// the public, mutable `display_name` over the immutable operator_id (== operator_pubkey).
+/// Only the operator key-holder may rename — authenticated by their ed25519 signature over
+/// the canonical bytes, replay-protected by a ±300s timestamp window. One signed call
+/// updates the single operator-keyed record, reflected on every node + the leaderboard;
+/// the operator_id and any earned founder ordinal stay bound to the key.
+async fn operator_rename(
+    State(st): State<AppState>,
+    Json(req): Json<RenameRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Validation parity: operator_pub ≤64, sig ≤128, display_name 1..=64 with no control chars.
+    if req.operator_pub.len() > 64 || req.sig.len() > 128 {
+        return reject("validation_error", "operator_pub or sig too long");
+    }
+    let name_len = req.display_name.chars().count();
+    if name_len == 0 || name_len > 64 {
+        return reject("validation_error", "display_name must be 1..=64 characters");
+    }
+    if req.display_name.chars().any(|c| c.is_control()) {
+        return reject(
+            "validation_error",
+            "display_name contains control characters",
+        );
+    }
+
+    // Replay protection: the signed ts must be recent.
+    let now = delegation::now_unix() as i64;
+    if (now - req.ts).abs() > RENAME_TS_WINDOW {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "IICP-E041",
+            "stale or future-dated rename request",
+        );
+    }
+
+    // Operator-signed authentication (only the key-holder may rename).
+    let (ok, reason) =
+        delegation::verify_rename(&req.operator_pub, &req.display_name, req.ts, &req.sig);
+    if !ok {
+        let (code, msg) = if reason == "malformed" {
+            ("IICP-E042", "malformed operator key or signature")
+        } else {
+            ("IICP-E043", "operator signature verification failed")
+        };
+        return err_json(StatusCode::UNAUTHORIZED, code, msg);
+    }
+
+    // The operator must already exist (bound via a verified delegation at register).
+    if !st
+        .repo
+        .rename_operator(&req.operator_pub, &req.display_name)
+        .await
+    {
+        return err_json(
+            StatusCode::NOT_FOUND,
+            "IICP-E044",
+            "unknown operator (register a node with this operator delegation first)",
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "display_name": req.display_name })),
+    )
+}
+
+/// `GET /v1/leaderboards/{board_id}` (#310/#463, spec iicp-recognition §6). Anonymous-read
+/// public recognition view. First board `founders`: operators with a founder ordinal, best
+/// (lowest) first, serving only the public display_name + recognition state — operator_pubkey
+/// is directory-private and never returned. Boards needing the §5 composite rank_score are
+/// deferred (not fabricated) and 404 here.
+async fn leaderboard(
+    State(st): State<AppState>,
+    axum::extract::Path(board_id): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if board_id != "founders" {
+        return err_json(
+            StatusCode::NOT_FOUND,
+            "IICP-E050",
+            "unknown or not-yet-computed leaderboard",
+        );
+    }
+    let founders = st.repo.list_founders(100).await;
+    let locked_count = founders.len();
+    let entries: Vec<serde_json::Value> = founders
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| {
+            serde_json::json!({
+                "place": i + 1,
+                "display_name": f.display_name,
+                "ordinal": f.ordinal,
+                "tier": f.tier,
+                "badge": f.badge,
+            })
+        })
+        .collect();
+
+    // Additive `pending` section (spec iicp-recognition 0.6.2 §6, PHP parity): provisional
+    // operators on the 30-day clock. projected_ordinal is an ESTIMATE — ordinals are only
+    // assigned at lock-in (§5.4.3) and the projection shifts if a predecessor drops out.
+    const LOCKIN_MIN_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let pending: Vec<serde_json::Value> = st
+        .repo
+        .list_pending_founders(25)
+        .await
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let elapsed = (now_ms - p.first_seen_ms).max(0);
+            let remaining_ms = (LOCKIN_MIN_AGE_MS - elapsed).max(0);
+            serde_json::json!({
+                "display_name": p.display_name,
+                "projected_ordinal": locked_count + i + 1,
+                "days_remaining": (remaining_ms + 86_400_000 - 1) / 86_400_000,
+                "provisional": true,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "board_id": "founders",
+            "title": "Founding Cohort",
+            "count": entries.len(),
+            "entries": entries,
+            "pending": pending,
+        })),
+    )
+}
+
+/// Registration rate limit (IICP-E034, W-033 PHP parity): max registrations per source IP
+/// per window, to stop rapid capability cycling. Matches RegisterController's 60 / 60s.
+const REGISTER_RATE_LIMIT: u32 = 60;
+const REGISTER_RATE_TTL_MS: u64 = 60_000;
+
+/// Per-instance per-IP registration counter (held in AppState, not a global, so tests and
+/// multiple instances don't share state). Per-instance is the unit, like PHP's per-instance Cache.
+type RegisterRateMap = Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, u64)>>>;
+
+fn new_register_rate() -> RegisterRateMap {
+    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Pure window step for the registration rate limit (so the limit/TTL rule is unit-tested,
+/// #404; the handler holds the map under a Mutex). Returns the new `(count, window_start_ms)`:
+/// within the live window → increment in place; expired/new → reset to `(1, now_ms)`.
+fn register_rate_step(prev: Option<(u32, u64)>, now_ms: u64, ttl_ms: u64) -> (u32, u64) {
+    match prev {
+        Some((count, start_ms)) if now_ms.saturating_sub(start_ms) < ttl_ms => {
+            (count + 1, start_ms)
+        }
+        _ => (1, now_ms),
+    }
+}
+
+/// IICP-E050 (F2/#529) re-registration endpoint-ownership decision — PHP NodeRegistry
+/// `applyReRegistrationUpdate` parity. When an existing node's primary `endpoint` changes
+/// on re-register, the change is allowed ONLY if the caller proves ownership
+/// (`current_node_token` matches the stored hash) OR the old endpoint is verifiably gone
+/// (so the change can't be a live takeover). A downlevel client without a token can still
+/// rotate when its old endpoint is dead (migration-safe); an attacker pointing a victim's
+/// `node_id` at a live, different endpoint is rejected. Pure so the rule is unit-tested;
+/// the handler supplies `old_endpoint_alive` from a liveness probe.
+fn endpoint_change_allowed(
+    endpoint_changed: bool,
+    has_token_ownership: bool,
+    old_endpoint_alive: bool,
+) -> bool {
+    if !endpoint_changed {
+        return true; // same endpoint → ordinary refresh, always fine
+    }
+    if has_token_ownership {
+        return true; // proven owner may rotate even while the old endpoint is alive
+    }
+    !old_endpoint_alive // no token: allow only if the old endpoint is gone
+}
+
+/// Liveness probe for the IICP-E050 absence path — PHP `isEndpointAlive` parity. A 2xx
+/// from `<endpoint>/iicp/health` within 5s means the old endpoint is still serving (so a
+/// token-less endpoint change is a likely takeover → rejected). Certs are not verified
+/// (operators run self-signed tunnels), matching the PHP `withoutVerifying()`. Any error
+/// (timeout, refused, DNS) → not alive. NOTE: like the PHP probe, this dials a
+/// node-controlled URL; the SSRF/DNS-rebind hardening tracked in #535 applies to both.
+async fn probe_endpoint_alive(endpoint: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let url = format!("{}/iicp/health", endpoint.trim_end_matches('/'));
+    matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
 }
 
 /// `POST /v1/register` (iicp-dir §3.1). Validates the endpoint routability invariant
@@ -361,6 +1075,33 @@ async fn register(
     headers: axum::http::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // IICP-E034 (W-033 PHP parity): rate-limit registrations per source IP BEFORE any work,
+    // so rapid capability cycling can't churn the directory. Source IP via get_client_ip
+    // (CF-Connecting-IP → X-Forwarded-For), same extraction the rest of the handler uses.
+    {
+        let ip = get_client_ip(&headers).to_string();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let count = {
+            let mut g = st.register_rate.lock().unwrap();
+            let (count, start) =
+                register_rate_step(g.get(&ip).copied(), now_ms, REGISTER_RATE_TTL_MS);
+            g.insert(ip, (count, start));
+            count
+        };
+        if count > REGISTER_RATE_LIMIT {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "IICP-E034",
+                    "message": "Too many registration attempts from this source IP. Try again shortly.",
+                    "retry_after": REGISTER_RATE_TTL_MS / 1000
+                })),
+            );
+        }
+    }
     if req.capabilities.is_empty() {
         return reject("validation_error", "at least one capability is required");
     }
@@ -410,9 +1151,85 @@ async fn register(
     } else {
         uuid::Uuid::new_v4().to_string()
     };
+
+    // IICP-E049/E050 (F2/#529) — re-registration ownership guards. When this node_id
+    // already exists, protect the two takeover vectors. Ownership = a current_node_token
+    // that verifies against the stored hash; computed once and shared. PHP NodeRegistry
+    // applyReRegistrationUpdate parity.
+    if let Some(existing) = st.repo.get(&node_id).await {
+        let has_ownership = match req.current_node_token.as_deref() {
+            Some(t) if !t.is_empty() => st.repo.verify_node_token(&node_id, t).await,
+            _ => false,
+        };
+
+        // IICP-E049 — changing the node's identity key (cx_public_key) is pure ownership:
+        // it requires current_node_token, with no dead-endpoint excuse. Otherwise an
+        // attacker could re-register a victim's node_id with their own key (impersonation).
+        let cx_changed = req
+            .cx_public_key
+            .as_ref()
+            .is_some_and(|k| !k.is_null() && existing.public_key.as_ref() != Some(k));
+        if cx_changed && !has_ownership {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "IICP-E049",
+                    "message": "cx_public_key update requires a valid current_node_token"
+                })),
+            );
+        }
+
+        // IICP-E050 — a primary endpoint change requires ownership OR a verifiably-dead
+        // old endpoint (so a token-less rotation of a CGNAT/tunnel node still works, but a
+        // live-takeover is rejected). The liveness probe only runs when there's no token.
+        if existing.endpoint != req.endpoint && !has_ownership {
+            let old_alive = probe_endpoint_alive(&existing.endpoint).await;
+            if !endpoint_change_allowed(true, false, old_alive) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "IICP-E050",
+                        "message": "endpoint change requires the current node_token (the existing endpoint is still reachable); re-register with current_node_token to prove ownership"
+                    })),
+                );
+            }
+        }
+    }
+
     let node_token = uuid::Uuid::new_v4().to_string();
     let proxy_token = uuid::Uuid::new_v4().to_string();
     let node_hmac_key = hex::encode(uuid::Uuid::new_v4().as_bytes());
+
+    // ADR-045 Phase A (#407) — verify an optional operator→node delegation and bind the
+    // verified operator identity (PHP NodeRegistry parity, #385; lenient/fail-safe: an
+    // invalid or absent delegation leaves the node unverified, never aborts registration).
+    let (operator_pubkey, operator_verified, operator_trust_tier) = delegation::evaluate(
+        req.operator_delegation.as_ref(),
+        &node_id,
+        delegation::now_unix(),
+    );
+    // #463/#464 — capture before operator_pubkey moves into the Node, for the operators upsert.
+    let operator_pubkey_for_upsert = operator_pubkey.clone();
+
+    // #525/G3 — operator display names are public handles; a look-alike claim by another
+    // verified operator is rejected using PHP's whitespace-folded, case-insensitive check.
+    if let (Some(op_pub), Some(display_name)) = (
+        operator_pubkey_for_upsert.as_deref(),
+        req.operator_display_name.as_deref(),
+    ) {
+        if let Some(normalized) = normalize_operator_display_name(display_name) {
+            if st
+                .repo
+                .operator_display_name_claimed_by_other(op_pub, &normalized)
+                .await
+            {
+                return reject(
+                    "validation_error",
+                    "operator_display_name is already claimed by another verified operator (IICP-E051)",
+                );
+            }
+        }
+    }
 
     let node = types::Node {
         node_id: node_id.clone(),
@@ -480,6 +1297,19 @@ async fn register(
             false,
             req.relay_capable.unwrap_or(false),
         ),
+        operator_pubkey,
+        operator_display_name: None,
+        operator_fingerprint: None,
+        operator_verified,
+        operator_trust_tier,
+        // WQ-058 / ADR-017 REG-01 — operator public-listing opt-in (default: not listed).
+        public_listing: req
+            .listing
+            .as_ref()
+            .map(|l| l.public_listing)
+            .unwrap_or(false),
+        operator_url: req.listing.as_ref().and_then(|l| l.operator_url.clone()),
+        health_models: None, // #494 — populated by the first heartbeat with a backend URL
     };
     let intents = req.capabilities.iter().map(|c| c.intent.clone()).collect();
     st.repo
@@ -498,6 +1328,33 @@ async fn register(
     st.repo
         .observe_address(&node_id, client_ip, "register")
         .await;
+
+    // #463/#310/#464 — upsert the operator-identity record when the delegation verified.
+    upsert_operator_from_register(
+        &st,
+        &operator_pubkey_for_upsert,
+        req.operator_display_name.as_deref(),
+        req.operator_created_at.as_deref(),
+        req.operator_integrity_hash.as_deref(),
+    )
+    .await;
+
+    // #442 — emit a signed REGISTER event onto the log so replicas can mirror this node
+    // (carries capabilities, #438, so a replica's /v1/discover can serve it). No-op unsigned.
+    emit_event(
+        &st,
+        "REGISTER",
+        &node_id,
+        serde_json::json!({
+            "endpoint": req.endpoint,
+            "region": req.region,
+            "capabilities": req.capabilities.iter().map(|c| serde_json::json!({
+                "intent": c.intent,
+                "models": c.models,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
 
     // Issue a JWT (HS256, sub=node_id, exp=now+3600).
     let jwt_token = auth::issue_jwt(&node_id);
@@ -559,6 +1416,10 @@ struct HeartbeatRequest {
     metrics: Option<HeartbeatMetrics>,
     #[serde(default)]
     pricing: Option<HeartbeatPricing>,
+    /// #494 — live model list probed by the SDK on each heartbeat.
+    /// null / absent = SDK did not report (backward compat); [] = no models loaded.
+    #[serde(default)]
+    health_models: Option<Vec<String>>,
 }
 
 /// `POST /v1/heartbeat` (iicp-dir §3.2). Requires `Authorization: Bearer <node_token>`.
@@ -634,6 +1495,7 @@ async fn heartbeat(
             tasks_delta,
             tasks_failed,
             delta,
+            req.health_models,
         )
         .await
     {
@@ -734,15 +1596,88 @@ async fn credits_balance(
     }
 }
 
+/// GET /v1/credits/summary — lifetime income / spending / balance + `reconciles`
+/// integrity flag (#456). PHP-parity with CreditsController::summary.
+async fn credits_summary(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::json!({ "error": { "code": "unauthorized", "message": "missing node_token" } }),
+                ),
+            )
+        }
+    };
+    let node_id = match node_id_from_auth(&headers, &token) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(
+                    serde_json::json!({ "error": { "code": "validation_error", "message": "X-Node-Id header required (or use JWT)" } }),
+                ),
+            )
+        }
+    };
+    if !st.repo.verify_node_token(&node_id, &token).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(
+                serde_json::json!({ "error": { "code": "unauthorized", "message": "invalid node_token" } }),
+            ),
+        );
+    }
+    match st.repo.credit_summary(&node_id).await {
+        Some(s) => {
+            // Integrity invariant: balance MUST equal earned − spent (4-decimal precision).
+            let reconciles = (s.balance - (s.total_earned - s.total_spent)).abs() < 0.0001;
+            // Operator wallet — aggregate over the operator's nodes (null when the
+            // node is not operator-bound). operator_pubkey itself is never returned.
+            let operator_wallet = st
+                .repo
+                .operator_wallet_summary(&node_id)
+                .await
+                .map(serde_json::to_value)
+                .and_then(Result::ok)
+                .unwrap_or(serde_json::Value::Null);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "node_id": node_id,
+                    "balance": s.balance,
+                    "total_earned": s.total_earned,
+                    "total_spent": s.total_spent,
+                    "tx_count": s.tx_count,
+                    "reconciles": reconciles,
+                    "unit": "credit",
+                    "tokens_per_credit": 1000,
+                    "operator_wallet": operator_wallet
+                })),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::json!({ "error": { "code": "IICP-E003", "message": "node not found" } }),
+            ),
+        ),
+    }
+}
+
 /// Verify a CIP credit receipt HMAC-SHA256 signature (W-009, iicp-dir §6.2).
-/// canonical = "task_id:tokens_used:cip_parent_task_id:cip_session_key:nonce:response_hash"
+/// canonical = "task_id:tokens_used:cip_parent_task_id:cip_session_key:nonce:response_hash[:querying_node_id]"
 /// Uses constant-time comparison via the hmac crate's verify_slice().
 fn verify_cip_receipt(req: &CreditAwardRequest, hmac_key: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let canonical = format!(
+    let mut canonical = format!(
         "{}:{}:{}:{}:{}:{}",
         req.task_id,
         req.tokens_used,
@@ -751,6 +1686,12 @@ fn verify_cip_receipt(req: &CreditAwardRequest, hmac_key: &str) -> bool {
         req.nonce,
         req.response_hash
     );
+    if let Some(querying_node_id) = req.querying_node_id.as_deref() {
+        if !querying_node_id.is_empty() {
+            canonical.push(':');
+            canonical.push_str(querying_node_id);
+        }
+    }
     let Ok(expected_bytes) = hex::decode(&req.signature) else {
         return false;
     };
@@ -776,6 +1717,10 @@ struct CreditAwardRequest {
     signature: String,
     /// Credit amount to award. Capped at tokens_used/1000 × 1.1 on the server side.
     amount: f64,
+    /// Optional querying node identity. When present, it is included in the receipt HMAC
+    /// and lets the directory exclude self-dealing credit/reputation loops.
+    #[serde(default)]
+    querying_node_id: Option<String>,
 }
 
 /// `POST /v1/credits/award` (iicp-dir §6.2). Verifies the CIP receipt HMAC before
@@ -841,20 +1786,132 @@ async fn credits_award(
     let ceiling = (req.tokens_used as f64 / 1000.0) * 1.1;
     let amount = req.amount.min(ceiling).max(0.0);
 
+    // WQ-098 / G1: credit/reputation trust attribution. Missing querying_node_id
+    // remains backwards-compatible for credit settlement but is marked with zero
+    // trust weight. Known self-deal paths return a net-zero success so callers do
+    // not retry, and no CREDIT_AWARD event is emitted.
+    let mut attribution = "legacy_unattributed";
+    let mut trust_weight = 0.0_f64;
+    if let Some(querying_node_id) = req.querying_node_id.as_deref().filter(|id| !id.is_empty()) {
+        if querying_node_id == req.node_id {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "node_id": req.node_id,
+                    "awarded": 0.0,
+                    "spent": 0.0,
+                    "excluded": true,
+                    "reason": "self_query_excluded",
+                    "attribution": "self_node",
+                    "trust_weight": 0.0
+                })),
+            );
+        }
+
+        let serving = st.repo.get(&req.node_id).await;
+        let querying = st.repo.get(querying_node_id).await;
+        let Some(querying) = querying else {
+            return reject(
+                "IICP-E027",
+                "querying_node_id does not identify a registered node",
+            );
+        };
+
+        if let Some(serving_pubkey) = serving.as_ref().and_then(|n| n.operator_pubkey.as_deref()) {
+            if !serving_pubkey.is_empty()
+                && querying.operator_pubkey.as_deref() == Some(serving_pubkey)
+            {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "node_id": req.node_id,
+                        "awarded": 0.0,
+                        "spent": 0.0,
+                        "excluded": true,
+                        "reason": "self_query_excluded",
+                        "attribution": "self_operator",
+                        "trust_weight": 0.0
+                    })),
+                );
+            }
+        }
+
+        let has_verified_operators = serving
+            .as_ref()
+            .and_then(|n| n.operator_pubkey.as_deref())
+            .is_some_and(|v| !v.is_empty())
+            && querying
+                .operator_pubkey
+                .as_deref()
+                .is_some_and(|v| !v.is_empty());
+        attribution = if has_verified_operators {
+            "attributed_cross_operator"
+        } else {
+            "attributed_cross_node_unverified_operator"
+        };
+        trust_weight = if has_verified_operators { 1.0 } else { 0.5 };
+    }
+
     match st
         .repo
         .record_credit_award(&req.node_id, amount, &req.task_id, &req.nonce)
         .await
     {
-        Ok(new_balance) => (
-            StatusCode::CREATED,
-            // PHP returns {node_id, awarded, balance} — no ok field
-            Json(serde_json::json!({
+        Ok(new_balance) => {
+            let spend = if let Some(querying_node_id) =
+                req.querying_node_id.as_deref().filter(|id| !id.is_empty())
+            {
+                Some(
+                    st.repo
+                        .debit_for_consumer(querying_node_id, amount, &req.task_id, "task_spend")
+                        .await,
+                )
+            } else {
+                None
+            };
+            let spent = spend.as_ref().map(|s| s.spent).unwrap_or(0.0);
+            // #442 — mirror the award to replicas via a signed CREDIT_AWARD event. No-op
+            // unsigned. #459 bug B: include `amount` + `task_id` to match the PHP emit payload
+            // (PHP+Rust parity #385) — replicas reconstruct the award, and `iicp-node credits
+            // --verify` sums the verified per-award amounts from the signed log.
+            emit_event(
+                &st,
+                "CREDIT_AWARD",
+                &req.node_id,
+                serde_json::json!({
+                    "amount": amount,
+                    "new_balance": new_balance,
+                    "task_id": req.task_id,
+                    "querying_node_id": req.querying_node_id.clone(),
+                    "attribution": attribution,
+                    "trust_weight": trust_weight,
+                    "spent": spent,
+                    "spend_scope": spend.as_ref().map(|s| s.scope),
+                    "debit_count": spend.as_ref().map(|s| s.debit_count),
+                }),
+            )
+            .await;
+            let mut response = serde_json::json!({
                 "node_id": req.node_id,
                 "awarded": amount,
-                "balance": new_balance
-            })),
-        ),
+                "balance": new_balance,
+                "spent": spent,
+                "attribution": attribution,
+                "trust_weight": trust_weight
+            });
+            if let Some(spend) = spend {
+                response["spend_scope"] = serde_json::json!(spend.scope);
+                response["debit_count"] = serde_json::json!(spend.debit_count);
+                if let Some(reason) = spend.reason {
+                    response["spend_reason"] = serde_json::json!(reason);
+                }
+            }
+            (
+                StatusCode::CREATED,
+                // PHP returns {node_id, awarded, balance, spent} — no ok field
+                Json(response),
+            )
+        }
         Err(CreditError::NonceReplay) => (
             StatusCode::CONFLICT,
             Json(
@@ -1006,6 +2063,17 @@ struct RegistryNodesParams {
     per_page: Option<usize>,
 }
 
+/// WQ-058 / ADR-017 REG-01 — public-listing exposure rule: `operator_url` is served only
+/// when the operator opted into the public listing (`public_listing=true`); otherwise null,
+/// respecting the opt-out. Pure so the rule is unit-tested in-process.
+fn listing_exposure(public_listing: bool, operator_url: &Option<String>) -> serde_json::Value {
+    if public_listing {
+        serde_json::json!(operator_url)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
 /// `GET /v1/registry/nodes` (ADR-017, iicp-dir §3.10a). Public node listing.
 /// Returns node identities and reputation tiers without exposing endpoints or tokens.
 async fn registry_nodes(
@@ -1032,8 +2100,15 @@ async fn registry_nodes(
                 "region": n.region,
                 "reputation_score": (n.reputation_score * 1000.0).round() / 1000.0,
                 "reputation_tier": n.reputation_tier,
+                // PHP RegistryController::nodes includes the served models so the public
+                // /nodes listing shows what each node serves (parity, #385).
+                "models": n.models,
                 "probation": n.completed_tasks_count < 100,
                 "last_seen": serde_json::Value::Null,
+                // WQ-058 / ADR-017 REG-01 — public-listing opt-in. operator_url is exposed
+                // ONLY when the operator opted in (public_listing=true), else null.
+                "public_listing": n.public_listing,
+                "operator_url": listing_exposure(n.public_listing, &n.operator_url),
             })
         })
         .collect();
@@ -1051,7 +2126,23 @@ async fn registry_node_detail(
     State(st): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match st.repo.get(&id).await {
+    // PHP RegistryController::show validation parity — prefix is a UUID 8-hex prefix or a
+    // custom node name: ^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,35}$ (manual check; no regex dep).
+    let valid = (1..=36).contains(&id.len())
+        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'));
+    if !valid {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "REGISTRY-INVALID-PREFIX",
+                "message": "Prefix must be alphanumeric (max 36 chars)."
+            })),
+        );
+    }
+    match st.repo.node_by_prefix(&id).await {
         Some(n) => {
             // PHP uses node_id_prefix for UUID nodes (anonymize full UUID).
             let is_uuid = uuid::Uuid::parse_str(&n.node_id).is_ok();
@@ -1068,14 +2159,15 @@ async fn registry_node_detail(
             let signals = health::HealthSignals {
                 reachability: n.reachability_signal,
                 latency_ms: n.latency_estimate_ms.map(|ms| ms as f64),
-                // #385 Phase-B — real success ratio from persisted task counters.
-                tasks_total: n.completed_tasks_count as i64,
-                tasks_failed: n.tasks_failed as i64,
-                reputation: n.reputation_score,
             };
             let nh = health::score_node(&signals);
             let comp = health::components_of(&signals);
             let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+            // #463 — public operator handle (who hosts this node), resolved by operator_pubkey.
+            // operator_pubkey itself is directory-private and NEVER included in the response.
+            let operator_display_name =
+                operator_display_name_for(&st, n.operator_pubkey.as_deref()).await;
+            let operator_fingerprint = operator_fingerprint_for(n.operator_pubkey.as_deref());
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1094,8 +2186,6 @@ async fn registry_node_detail(
                             "liveness": 1.0,
                             "reachability": r3(comp.reachability),
                             "latency": r3(comp.latency),
-                            "success_rate": r3(comp.success_rate),
-                            "reputation": r3(comp.reputation),
                         },
                         "evaluated_at": chrono::Utc::now().to_rfc3339(),
                     },
@@ -1103,6 +2193,8 @@ async fn registry_node_detail(
                     "completed_tasks": n.completed_tasks_count,
                     "observed_latency_ms": n.latency_estimate_ms,
                     "exposure_mode": n.exposure_mode,
+                    "operator_display_name": operator_display_name,
+                    "operator_fingerprint": operator_fingerprint,
                     "last_seen": serde_json::Value::Null,
                 })),
             )
@@ -1124,20 +2216,409 @@ async fn registry_intents(State(st): State<AppState>) -> Json<serde_json::Value>
 }
 
 /// `GET /.well-known/did.json` — DID document for `did:web:iicp.network` (iicp-dir §3.11).
-/// The genesis key is provisioned out-of-band; this returns the structural document
-/// with an empty verificationMethod until the key is loaded (Phase 4 / genesis-key command).
-async fn did_document() -> Json<serde_json::Value> {
+///
+/// #442: when this directory has a signing key (IICP_GENESIS_ED25519_SECRET_KEY), it
+/// publishes the matching Ed25519 public key in verificationMethod[].publicKeyJwk — so a
+/// replica can resolve it (replica::seed_pubkey_hex_from_did) and VERIFY this seed's signed
+/// events. Without that, the seed signs but no replica could verify (empty doc → unsigned
+/// trust-poll mode). Empty verificationMethod when no key is configured.
+async fn did_document(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let verification_method = match st.signing_key.as_deref().and_then(seed_pubkey_jwk) {
+        Some(jwk) => vec![serde_json::json!({
+            "id": format!("{DIRECTORY_DID}#key-1"),
+            "type": "JsonWebKey2020",
+            "controller": DIRECTORY_DID,
+            "publicKeyJwk": jwk,
+        })],
+        None => vec![],
+    };
     Json(serde_json::json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
-        "id": "did:web:iicp.network",
-        "controller": "did:web:iicp.network",
-        "verificationMethod": [],
+        "id": DIRECTORY_DID,
+        "controller": DIRECTORY_DID,
+        "verificationMethod": verification_method,
         "service": [{
-            "id": "did:web:iicp.network#iicp-directory",
+            "id": format!("{DIRECTORY_DID}#iicp-directory"),
             "type": "IICPDirectory",
             "serviceEndpoint": "https://iicp.network/v1"
         }]
     }))
+}
+
+/// #442: build the Ed25519 `publicKeyJwk` (OKP/Ed25519, base64url `x`) for this directory's
+/// signing key, so a replica's `seed_pubkey_hex_from_did` resolves the verifying key. The
+/// libsodium 64-byte secret key is seed(32)‖public_key(32) → the pubkey is the last 32 bytes.
+fn seed_pubkey_jwk(secret_key_hex: &str) -> Option<serde_json::Value> {
+    use ct_codecs::{Base64UrlSafeNoPadding, Encoder};
+    let sk = hex::decode(secret_key_hex).ok()?;
+    if sk.len() != 64 {
+        return None;
+    }
+    let x = Base64UrlSafeNoPadding::encode_to_string(&sk[32..64]).ok()?;
+    Some(serde_json::json!({ "kty": "OKP", "crv": "Ed25519", "x": x }))
+}
+
+/// Directory Ed25519 public key as hex. The configured signing key is the
+/// libsodium 64-byte secret key: seed(32)‖public_key(32).
+fn directory_public_key_hex(secret_key_hex: &str) -> Option<String> {
+    let sk = hex::decode(secret_key_hex).ok()?;
+    if sk.len() != 64 {
+        return None;
+    }
+    Some(hex::encode(&sk[32..64]))
+}
+
+fn unix_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn b64url_json(payload: &serde_json::Value) -> Option<String> {
+    use ct_codecs::{Base64UrlSafeNoPadding, Encoder};
+    let json = serde_json::to_string(payload).ok()?;
+    Base64UrlSafeNoPadding::encode_to_string(json.as_bytes()).ok()
+}
+
+fn ed25519_sign_hex(secret_key_hex: &str, message: &[u8]) -> Option<String> {
+    use ed25519_compact::{KeyPair, Seed};
+    let sk_bytes = hex::decode(secret_key_hex).ok()?;
+    if sk_bytes.len() != 64 {
+        return None;
+    }
+    let seed_bytes: [u8; 32] = sk_bytes.get(..32)?.try_into().ok()?;
+    let kp = KeyPair::from_seed(Seed::new(seed_bytes));
+    let sig = kp.sk.sign(message, None);
+    Some(hex::encode(sig.as_ref()))
+}
+
+fn sign_domain_token(
+    secret_key_hex: &str,
+    domain: &str,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let b64_payload = b64url_json(payload)?;
+    let message = format!("{domain}{b64_payload}");
+    let sig_hex = ed25519_sign_hex(secret_key_hex, message.as_bytes())?;
+    Some(format!("{b64_payload}.{sig_hex}"))
+}
+
+/// `GET /api/v1/directory-key` — public key for consumer-token and relay-ticket verification.
+async fn directory_key(State(st): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    match st.signing_key.as_deref().and_then(directory_public_key_hex) {
+        Some(public_key) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "public_key": public_key, "algorithm": "ed25519" })),
+        ),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "not_configured",
+                    "message": "Consumer token signing key not configured on this directory."
+                }
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsumerTokenRequest {
+    target_node_id: String,
+    intent: String,
+}
+
+/// `POST /api/v1/consumer-token` — node-token authenticated short-lived token
+/// authorising the caller to send one intent class to a target node.
+async fn consumer_token_issue(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ConsumerTokenRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if req.target_node_id.trim().is_empty() || req.intent.trim().is_empty() {
+        return err_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "target_node_id and intent are required",
+        );
+    }
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return err_json(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing node_token",
+            )
+        }
+    };
+    let caller_node_id = match node_id_from_auth(&headers, &token) {
+        Some(id) => id,
+        None => {
+            return err_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "X-Node-Id header required (or use JWT)",
+            )
+        }
+    };
+    if !st.repo.verify_node_token(&caller_node_id, &token).await {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid node_token",
+        );
+    }
+    if st.repo.get(&req.target_node_id).await.is_none() {
+        return err_json(StatusCode::NOT_FOUND, "not_found", "Target node not found.");
+    }
+    let Some(secret) = st.signing_key.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "not_configured",
+                    "message": "Consumer token signing key not configured on this directory."
+                }
+            })),
+        );
+    };
+    let now = unix_now();
+    let exp = now + 300;
+    let payload = serde_json::json!({
+        "v": 1,
+        "iss": "https://iicp.network",
+        "sub": caller_node_id,
+        "aud": req.target_node_id,
+        "intent": req.intent,
+        "iat": now,
+        "exp": exp
+    });
+    let Some(issued) = sign_domain_token(secret, "iicp:consumer-token:v1\n", &payload) else {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_configured",
+            "Consumer token signing key not configured on this directory.",
+        );
+    };
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "token": issued,
+            "expires_at": exp,
+            "caller_node_id": caller_node_id,
+            "target_node_id": req.target_node_id,
+            "intent": req.intent
+        })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayTicketRequest {
+    #[serde(default)]
+    relay_node_id: Option<String>,
+}
+
+/// `POST /api/v1/relay/ticket` — node-token authenticated relay-bind ticket.
+async fn relay_ticket_issue(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<RelayTicketRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return err_json(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing node_token",
+            )
+        }
+    };
+    let worker_node_id = match node_id_from_auth(&headers, &token) {
+        Some(id) => id,
+        None => {
+            return err_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "X-Node-Id header required (or use JWT)",
+            )
+        }
+    };
+    if !st.repo.verify_node_token(&worker_node_id, &token).await {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid node_token",
+        );
+    }
+    let Some(secret) = st.signing_key.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "not_configured",
+                    "message": "Relay bind ticket signing key not configured on this directory."
+                }
+            })),
+        );
+    };
+    let relay_node_id = req
+        .relay_node_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "*".into());
+    let now = unix_now();
+    let exp = now + 120;
+    let payload = serde_json::json!({
+        "v": 1,
+        "typ": "relay-bind-ticket",
+        "iss": "https://iicp.network",
+        "sub": worker_node_id,
+        "aud": relay_node_id,
+        "iat": now,
+        "exp": exp
+    });
+    let Some(ticket) = sign_domain_token(secret, "iicp:relay-bind-ticket:v1\n", &payload) else {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_configured",
+            "Relay bind ticket signing key not configured on this directory.",
+        );
+    };
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "ticket": ticket,
+            "expires_at": exp,
+            "worker_node_id": worker_node_id,
+            "relay_node_id": relay_node_id,
+            "algorithm": "ed25519"
+        })),
+    )
+}
+
+/// `GET /api/v1/compliance-attestation` — compact signed Rust parity attestation.
+/// The PHP seed signs full REACH probe evidence. Rust can emit a minimal signed
+/// attestation when configured; without the signing key it fails closed.
+async fn compliance_attestation(
+    State(st): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(secret) = st.signing_key.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "attestation_unavailable",
+                    "message": "Attestation signing key not configured on this directory"
+                }
+            })),
+        );
+    };
+    let generated_at = chrono::Utc::now();
+    let valid_until = generated_at + chrono::Duration::seconds(900);
+    let document = serde_json::json!({
+        "endpoint": "https://iicp.network",
+        "spec_version": "iicp-dir v1.1.0",
+        "purpose": "compliance-attestation",
+        "probe_run_id": serde_json::Value::Null,
+        "probe_run_at": serde_json::Value::Null,
+        "passed_probes": [],
+        "failed_probes": [],
+        "generated_at": generated_at.to_rfc3339(),
+        "valid_until": valid_until.to_rfc3339()
+    });
+    let canonical = federation::canonical_json(&document);
+    let hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    };
+    let msg = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(canonical.as_bytes()).to_vec()
+    };
+    let Some(signature) = ed25519_sign_hex(secret, &msg) else {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "attestation_unavailable",
+            "Attestation signing key not configured on this directory",
+        );
+    };
+    let mut out = document;
+    out["attestation_hash"] = serde_json::json!(hash);
+    out["signature"] = serde_json::json!(signature);
+    out["signer_did"] = serde_json::json!(DIRECTORY_DID);
+    (StatusCode::OK, Json(out))
+}
+
+/// `GET /.well-known/iicp-replicas.json` (DIR-FED-19) — trusted-replica registry
+/// (schema v2, S.13 §6.4). Dynamic: reads the live replica list from the repository
+/// so newly joined replicas appear within one request of their join handshake.
+/// Static CDN-cacheable form (no dynamic freshness fields); clients SHOULD call
+/// `/api/v1/stats` on each replica for live last_seen_at / event_log_lag_ms.
+async fn iicp_replicas(State(st): State<AppState>) -> impl IntoResponse {
+    let replicas = st.repo.all_replicas().await;
+    let ts_now = ms_to_iso8601(now_ms_i64());
+    let entries: Vec<serde_json::Value> = replicas
+        .iter()
+        .map(
+            |(replica_id, did, endpoint, trust_tier, registered_at_ms)| {
+                serde_json::json!({
+                    "replica_id":    replica_id,
+                    "did":           did,
+                    "endpoint":      endpoint,
+                    "trust_tier":    trust_tier,
+                    "registered_at": ms_to_iso8601(*registered_at_ms),
+                })
+            },
+        )
+        .collect();
+    let body = serde_json::json!({
+        "@context":      "https://iicp.network/ns/replicas/v1",
+        "schema_version": "2",
+        "genesis_seed":  DIRECTORY_DID,
+        "replicas":      entries,
+        "updated_at":    ts_now,
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::Json(body),
+    )
+}
+
+/// Current Unix ms (used for `updated_at` in the replicas registry).
+fn now_ms_i64() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Convert Unix ms → ISO-8601 UTC string without external deps.
+fn ms_to_iso8601(ms: i64) -> String {
+    let s = (ms / 1000) as u64;
+    let days = s / 86400;
+    let time = s % 86400;
+    let (y, mo, d) = days_to_ymd(days);
+    let h = time / 3600;
+    let mi = (time % 3600) / 60;
+    let se = time % 60;
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}Z")
+}
+
+/// Gregorian date from a Unix day count (days since 1970-01-01). No external dep.
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // Era-based algorithm (Howard Hinnant, chrono-style)
+    days += 719468; // shift to 0000-03-01 epoch
+    let era = days / 146097;
+    let doe = days % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 // ── peers (iicp-dir §3.5) ────────────────────────────────────────────────────
@@ -1394,7 +2875,8 @@ async fn conformance_verify(
 
 /// `GET /v1/probe` — SSRF-guarded node reachability check (PHP ProbeController parity).
 /// Blocks private/loopback/RFC-1918 IPs with 422 {error: "private_address"}.
-/// DIR-PROBE-01/02 REACH MUST probes verify this block before actual TCP probe.
+/// For public targets, performs DNS resolution + a 5s TCP reachability probe and
+/// reports latency_ms on success.
 async fn probe_node(Query(p): Query<ProbeParams>) -> (StatusCode, Json<serde_json::Value>) {
     let host = p.host.trim();
     if host.is_empty() || p.port < 1024 {
@@ -1405,7 +2887,7 @@ async fn probe_node(Query(p): Query<ProbeParams>) -> (StatusCode, Json<serde_jso
             ),
         );
     }
-    // SSRF guard: block private/loopback IPs without DNS resolution (DNS-rebinding safe).
+    // SSRF guard: block private/loopback IPs before any network activity.
     if is_private_host(host) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1414,14 +2896,28 @@ async fn probe_node(Query(p): Query<ProbeParams>) -> (StatusCode, Json<serde_jso
             ),
         );
     }
-    // Full TCP probe is an operator concern — for now return reachable:false with no latency.
-    // PHP ProbeController does an actual HTTP probe; this stub blocks SSRF and returns safely.
-    (
-        StatusCode::OK,
-        Json(
-            serde_json::json!({"reachable": false, "latency_ms": null, "error": "probe_not_implemented"}),
+
+    match probe_node_host(host, p.port).await {
+        Ok((reachable, latency_ms)) => {
+            if reachable {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"reachable": true, "latency_ms": latency_ms})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::json!({"reachable": false, "latency_ms": null, "error": "unreachable"}),
+                    ),
+                )
+            }
+        }
+        Err(error) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"reachable": false, "latency_ms": null, "error": error})),
         ),
-    )
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1432,14 +2928,49 @@ struct ProbeParams {
     port: u16,
 }
 
-/// Returns true if the host is a private/loopback address that must be blocked for SSRF.
+async fn probe_node_host(host: &str, port: u16) -> Result<(bool, Option<u64>), &'static str> {
+    let addrs = resolve_probe_addresses(host, port)?;
+    for addr in addrs {
+        let start = std::time::Instant::now();
+        let probe = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await;
+        if probe.is_ok_and(|r| r.is_ok()) {
+            return Ok((true, Some(start.elapsed().as_millis() as u64)));
+        }
+    }
+    Ok((false, None))
+}
+
+fn resolve_probe_addresses(
+    host: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, &'static str> {
+    let mut addrs = Vec::new();
+    for socket in (host, port)
+        .to_socket_addrs()
+        .map_err(|_| "unresolved_host")?
+    {
+        if is_private_host(&socket.ip().to_string()) {
+            return Err("unroutable_address");
+        }
+        addrs.push(socket);
+    }
+    if addrs.is_empty() {
+        return Err("unresolved_host");
+    }
+    Ok(addrs)
+}
+
 fn is_private_host(host: &str) -> bool {
     let h = host.trim_matches(|c| c == '[' || c == ']');
     is_loopback_or_unspecified(h) || is_rfc1918_v4(h) || is_ipv6_private(h)
 }
 
 fn is_loopback_or_unspecified(h: &str) -> bool {
-    h.starts_with("127.") || h == "0.0.0.0" || h == "::1"
+    h.starts_with("127.") || h == "0.0.0.0" || h == "::1" || h == "localhost" || h == "::"
 }
 
 fn is_rfc1918_v4(h: &str) -> bool {
@@ -1474,27 +3005,148 @@ async fn root_info() -> Json<serde_json::Value> {
     }))
 }
 
-/// `GET /v1/credits/quote` (iicp-dir §6.4). Unauthenticated pricing estimate.
-/// Returns the average credit_cost_multiplier for nodes serving the given intent.
+#[derive(Debug, serde::Deserialize)]
+struct QuoteParams {
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    min_reputation: Option<f64>,
+}
+
+/// Pure quote computation (WQ-057): derive the credit estimate from the candidate nodes'
+/// `credit_cost_multiplier` list. `base_blocks = ceil(max_tokens / 1000)`; estimated uses the
+/// average multiplier, min/max the cheapest/dearest. No candidates → base rate (×1.0), 0 nodes.
+/// Extracted pure so the math is unit-tested in-process (PHP CreditsController::quote parity).
+struct QuoteEstimate {
+    estimated: f64,
+    min: f64,
+    max: f64,
+    price_per_1000: f64,
+    nodes_quoted: u32,
+}
+
+fn compute_quote(max_tokens: u64, multipliers: &[f64]) -> QuoteEstimate {
+    let base_blocks = max_tokens.div_ceil(1000) as f64;
+    let r4 = |x: f64| (x * 10000.0).round() / 10000.0;
+    if multipliers.is_empty() {
+        let c = r4(base_blocks);
+        return QuoteEstimate {
+            estimated: c,
+            min: c,
+            max: c,
+            price_per_1000: 1.0,
+            nodes_quoted: 0,
+        };
+    }
+    let min_m = multipliers.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_m = multipliers
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let avg_m = multipliers.iter().sum::<f64>() / multipliers.len() as f64;
+    QuoteEstimate {
+        estimated: r4(base_blocks * avg_m),
+        min: r4(base_blocks * min_m),
+        max: r4(base_blocks * max_m),
+        price_per_1000: r4(avg_m),
+        nodes_quoted: multipliers.len() as u32,
+    }
+}
+
+/// `GET /v1/credits/quote` (iicp-dir §6.4 / S.12 §2.1, PHP CreditsController::quote parity).
+/// Node-token authenticated consumer pre-flight: estimates the credit cost for `max_tokens`
+/// at `intent` across candidate nodes, and returns the consumer's balance +
+/// `balance_sufficient` so the proxy can decide local-vs-remote before dispatch.
 async fn credits_quote(
     State(st): State<AppState>,
-    Query(p): Query<DiscoverParams>,
-) -> Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+    Query(p): Query<QuoteParams>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Auth (mirror credits_summary): node_token bearer identifies the consumer.
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::json!({ "error": { "code": "unauthorized", "message": "missing node_token" } }),
+                ),
+            )
+        }
+    };
+    let node_id = match node_id_from_auth(&headers, &token) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(
+                    serde_json::json!({ "error": { "code": "validation_error", "message": "X-Node-Id header required (or use JWT)" } }),
+                ),
+            )
+        }
+    };
+    if !st.repo.verify_node_token(&node_id, &token).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(
+                serde_json::json!({ "error": { "code": "unauthorized", "message": "invalid node_token" } }),
+            ),
+        );
+    }
+
+    // §8.3: 422 if intent or max_tokens missing / max_tokens not positive.
     let intent = p.intent.as_deref().unwrap_or("");
-    let multiplier = st.repo.credit_quote(intent).await;
+    let max_tokens = p.max_tokens.unwrap_or(0);
+    if intent.is_empty() || max_tokens == 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                serde_json::json!({ "error": { "code": "validation_error", "message": "intent and max_tokens are required (max_tokens > 0)" } }),
+            ),
+        );
+    }
+
+    let min_rep = p.min_reputation.unwrap_or(0.0).clamp(0.0, 1.0);
+    let multipliers = st.repo.quote_multipliers(intent, min_rep).await;
+    let est = compute_quote(max_tokens, &multipliers);
+    let effective =
+        st.repo
+            .effective_credit_balance(&node_id)
+            .await
+            .unwrap_or(repo::EffectiveCreditBalance {
+                consumer_balance: 0.0,
+                effective_balance: 0.0,
+                balance_scope: "node",
+                operator_wallet_balance: None,
+            });
+    let balance_sufficient = effective.effective_balance >= est.estimated;
     let quote_id = format!("q_{}", &uuid::Uuid::new_v4().to_string()[..12]);
     let expires_at = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::seconds(60))
         .map(|t| t.to_rfc3339())
         .unwrap_or_default();
-    // Simplified quote (no max_tokens input → no per-token estimate). PHP-compatible fields.
-    Json(serde_json::json!({
-        "quote_id": quote_id,
-        "intent": intent,
-        "price_per_1000_tokens": multiplier,   // PHP field name
-        "currency": "iicp_credits",            // PHP uses plural
-        "quote_expires_at": expires_at,
-    }))
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "quote_id": quote_id,
+            "estimated_credits": est.estimated,
+            "min_credits": est.min,
+            "max_credits": est.max,
+            "price_per_1000_tokens": est.price_per_1000,
+            "nodes_quoted": est.nodes_quoted,
+            "quote_expires_at": expires_at,
+            "currency": "iicp_credits",
+            // S.12 §2.1 pre-flight — proxy uses these to choose local vs remote.
+            "consumer_balance": effective.consumer_balance,
+            "effective_balance": effective.effective_balance,
+            "balance_scope": effective.balance_scope,
+            "operator_wallet_balance": effective.operator_wallet_balance,
+            "balance_sufficient": balance_sufficient,
+        })),
+    )
 }
 
 // ── telemetry/probe (REACH integration) ──────────────────────────────────────
@@ -1676,10 +3328,45 @@ fn node_id_from_auth(headers: &axum::http::HeaderMap, token: &str) -> Option<Str
 }
 
 fn reject(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    err_json(StatusCode::UNPROCESSABLE_ENTITY, code, message)
+}
+
+/// Structured error with an explicit status (PHP parity: `{error:{code,message}}`).
+fn err_json(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
     (
-        StatusCode::UNPROCESSABLE_ENTITY,
+        status,
         Json(serde_json::json!({ "error": { "code": code, "message": message } })),
     )
+}
+
+fn sdk_adoption_json(nodes: &[crate::types::Node]) -> serde_json::Value {
+    let mut by_language: BTreeMap<String, u32> = BTreeMap::new();
+    let mut by_version: BTreeMap<String, u32> = BTreeMap::new();
+    for n in nodes {
+        let lang = n
+            .sdk_language
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let version = n
+            .sdk_version
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        *by_language.entry(lang).or_insert(0) += 1;
+        *by_version.entry(version).or_insert(0) += 1;
+    }
+    serde_json::json!({
+        "total_active": nodes.len(),
+        "by_language": by_language,
+        "by_version": by_version,
+    })
 }
 
 /// `/v1/stats` (iicp-dir §3.9b). Returns live active_node count when backed by MySQL;
@@ -1694,20 +3381,73 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
     // #373/VPS-gated active probing, which the Rust directory does not perform). The
     // scoring algorithm itself is byte-for-byte the PHP NodeHealthService.
     let provider_set = st.repo.active_nodes().await;
+    let sdk_adoption = sdk_adoption_json(&provider_set);
     let healths: Vec<health::NodeHealth> = provider_set
         .iter()
         .map(|n| {
             health::score_node(&health::HealthSignals {
                 reachability: n.reachability_signal,
                 latency_ms: n.latency_estimate_ms.map(|ms| ms as f64),
-                // #385 Phase-B — real success ratio from persisted task counters.
-                tasks_total: n.completed_tasks_count as i64,
-                tasks_failed: n.tasks_failed as i64,
-                reputation: n.reputation_score,
             })
         })
         .collect();
     let mesh = health::mesh_health(&healths);
+    // ADR-048 (#374): federation-aware mesh_health — resolve each node by majority-vote
+    // across evaluators over the union of replicated HEALTH snapshots, so any replica
+    // reports the same fleet aggregate. Null until HEALTH events have been applied
+    // (federation active); the single-directory mesh_health above stays authoritative.
+    let fed_rows = st.repo.all_health_observations().await;
+    let mesh_health_federated = if fed_rows.is_empty() {
+        serde_json::Value::Null
+    } else {
+        let obs: Vec<health::HealthObservation> = fed_rows
+            .into_iter()
+            .map(
+                |(node_id, evaluator_did, score, evaluated_at_ms)| health::HealthObservation {
+                    node_id,
+                    evaluator_did,
+                    score,
+                    evaluated_at_ms,
+                },
+            )
+            .collect();
+        let f = health::federated_mesh_health(&obs);
+        serde_json::json!({
+            "score": f.score,
+            "label": f.label,
+            "mean": f.mean,
+            "p10": f.p10,
+            "distribution": {
+                "healthy": f.distribution.healthy,
+                "degraded": f.distribution.degraded,
+                "impaired": f.distribution.impaired,
+                "critical": f.distribution.critical,
+                "offline": f.distribution.offline
+            },
+            "sample": f.sample,
+            "contested": f.contested,
+            "unconfirmed": f.unconfirmed,
+            "basis": "federated_union",
+            "window": "replicated"
+        })
+    };
+    // PHP StatsController parity: probe aggregates + directory_health (ADR-044).
+    let (probe_active_count, probe_regions) = st.repo.probe_active_count_and_regions().await;
+    let agg24 = st.repo.probe_aggregate_24h().await;
+    let top_failures = st.repo.probe_top_failures().await;
+    let top_failures_json: Vec<serde_json::Value> = top_failures
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "test_id": f.test_id,
+                "passed": f.passed,
+                "failed": f.failed,
+                "total": f.total,
+                "fail_rate": f.fail_rate,
+            })
+        })
+        .collect();
+    let directory_health = compute_directory_health(&agg24);
     // PHP StatsController credit_schedule static data (§8.3 pre-flight).
     let credit_schedule = serde_json::json!({
         "formula": "ceil(output_tokens / tokens_per_credit) × tier_weight × node_multiplier",
@@ -1726,7 +3466,23 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
             "stale_active_nodes": 0u32,  // DIR-STATS-02: Rust NodeLifecycle background task prunes stale rows
             "uptime_seconds": START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0),
         },
-        "probes": { "last_probe_at": last_probe_at },
+        "probes": {
+            "active_count": probe_active_count,
+            "regions": probe_regions,
+            "aggregate_24h": {
+                "discover_p50_ms": agg24.discover_p50_ms,
+                "discover_p95_ms": agg24.discover_p95_ms,
+                "heartbeat_p50_ms": agg24.heartbeat_p50_ms,
+                "reachability_pct": agg24.reachability_pct,
+                "task_success_rate_pct": agg24.task_success_rate_pct,
+            },
+            "conformance_24h": {
+                "passed": agg24.conformance_passed,
+                "failed": agg24.conformance_failed,
+                "top_failures": top_failures_json,
+            },
+            "last_probe_at": last_probe_at,
+        },
         "credit_schedule": credit_schedule,
         "mesh_health": {
             "score": mesh.score,
@@ -1743,12 +3499,223 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
             "sample": mesh.sample,
             "basis": "active_provider_nodes",
             "window": "live"
-        }
+        },
+        "mesh_health_federated": mesh_health_federated,
+        "directory_health": directory_health,
+        "sdk_adoption": sdk_adoption,
     }))
+}
+
+/// ADR-044 directory_health score — matches PHP StatsController::directoryHealth().
+/// Formula: 0.6 × discover_latency_score + 0.4 × conformance_pass_fraction.
+/// Returns `label: "unavailable"` when no probe data has been ingested yet.
+fn compute_directory_health(agg: &crate::repo::ProbeAggregate24h) -> serde_json::Value {
+    let p50 = agg.discover_p50_ms;
+    let passed = agg.conformance_passed;
+    let failed = agg.conformance_failed;
+
+    if p50.is_none() && passed == 0 && failed == 0 {
+        return serde_json::json!({
+            "score": serde_json::Value::Null,
+            "label": "unavailable",
+            "components": serde_json::Value::Null,
+            "probe_reachability_pct": agg.reachability_pct,
+            "window": "24h",
+        });
+    }
+
+    let lat_score = p50
+        .map(|v| (1.0 - (v - 50.0) / 450.0).max(0.0).min(1.0))
+        .unwrap_or(0.5);
+    let total = passed + failed;
+    let conf_score = if total > 0 {
+        passed as f64 / total as f64
+    } else {
+        1.0
+    };
+    let score = ((0.6 * lat_score + 0.4 * conf_score) * 1000.0).round() / 1000.0;
+
+    let label = if score >= 0.85 {
+        "healthy"
+    } else if score >= 0.65 {
+        "degraded"
+    } else if score >= 0.40 {
+        "impaired"
+    } else {
+        "critical"
+    };
+
+    serde_json::json!({
+        "score": score,
+        "label": label,
+        "components": {
+            "discover_latency": (lat_score * 1000.0).round() / 1000.0,
+            "conformance": (conf_score * 1000.0).round() / 1000.0,
+        },
+        "discover_p50_ms": p50,
+        "probe_reachability_pct": agg.reachability_pct,
+        "window": "24h",
+    })
 }
 
 /// `GET /v1/bootstrap` (iicp-dir §3.7). Returns recently-active nodes for peer discovery.
 /// No intent filter — any available, recently-seen node qualifies.
+#[derive(Debug, Deserialize)]
+struct EventsParams {
+    #[serde(default)]
+    since_seq: Option<i64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// `GET /v1/events` (#442, S.13 §3.4) — serve this directory's signed event log so a
+/// replica (PHP or Rust) can tail it from `since_seq`. Mirrors the PHP seed's endpoint
+/// shape that `replica::fetch_events` consumes: `{events:[…], next_seq, has_more}` with each
+/// event carrying its Ed25519 `sig` + `signer_did` (this dir's DID).
+async fn events(
+    State(st): State<AppState>,
+    Query(q): Query<EventsParams>,
+) -> Json<serde_json::Value> {
+    let since_seq = q.since_seq.unwrap_or(0);
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let rows = st.repo.events_since(since_seq, limit).await;
+    let next_seq = rows.last().map(|r| r.seq).unwrap_or(since_seq);
+    let has_more = rows.len() as u32 == limit;
+    let events: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "event_id": r.event_id,
+                "event_type": r.event_type,
+                "seq": r.seq,
+                "ts_ms": r.ts_ms,
+                "node_id": r.node_id,
+                "payload": r.payload,
+                "prev_hash": r.prev_hash,
+                "sig": r.sig,
+                "signer_did": DIRECTORY_DID,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "events": events, "next_seq": next_seq, "has_more": has_more }))
+}
+
+/// `GET /v1/snapshot` (#442, S.13) — full-state bootstrap: all nodes + their capabilities,
+/// so a replica can prime its state in one request before tailing /v1/events. Mirrors the
+/// PHP SnapshotController shape (the Rust replica's apply_snapshot consumes node fields +
+/// capabilities[].{node_id,intent}).
+async fn snapshot(State(st): State<AppState>) -> Json<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let records = st.repo.snapshot_records().await;
+    let log = st.repo.events_since(0, 1_000_000).await;
+    let snapshot_seq = log.last().map(|e| e.seq).unwrap_or(0);
+    let genesis_hash = log.first().map(|e| {
+        hex::encode(Sha256::digest(
+            crate::federation::canonical_json(&e.payload).as_bytes(),
+        ))
+    });
+    let mut nodes = Vec::with_capacity(records.len());
+    let mut capabilities = Vec::new();
+    for r in &records {
+        let n = &r.node;
+        nodes.push(serde_json::json!({
+            "node_id": n.node_id,
+            "endpoint": n.endpoint,
+            "region": n.region,
+            "available": n.available,
+            "reputation_score": n.reputation_score,
+            "load": n.load,
+            "active_jobs": n.active_jobs,
+            "exposure_mode": n.exposure_mode,
+            "cip_policy": n.cip_policy,
+            "pricing": n.pricing,
+        }));
+        for intent in &r.intents {
+            capabilities.push(serde_json::json!({ "node_id": n.node_id, "intent": intent }));
+        }
+    }
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Json(serde_json::json!({
+        "schema_version": 1,
+        "snapshot_seq": snapshot_seq,
+        "snapshot_ts_ms": ts_ms,
+        "genesis_hash": genesis_hash,
+        "nodes": nodes,
+        "capabilities": capabilities,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplicaRegisterRequest {
+    did: String,
+    endpoint: String,
+    #[serde(default)]
+    #[allow(dead_code)] // accepted for PHP parity; trust starts 'low' regardless (§7.1)
+    trust_tier_request: Option<String>,
+}
+
+/// `POST /v1/replicas/register` (#442, ADR-013 §7) — seed-side replica handshake. A replica
+/// announces its DID + endpoint; the seed records it (idempotent on DID, stable replica_id),
+/// emits a signed REPLICA_REGISTERED event so other replicas mirror it, and returns the
+/// bootstrap cursor + genesis hash. Mirrors PHP ReplicasController::register (trust_tier
+/// always 'low' on first registration). Light validation here; full DID-document resolution
+/// + endpoint reachability are a hardening follow-up.
+async fn replicas_register(
+    State(st): State<AppState>,
+    Json(req): Json<ReplicaRegisterRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !req.did.starts_with("did:web:") {
+        return reject("validation_error", "did must be a did:web identifier");
+    }
+    if !(req.endpoint.starts_with("https://") || req.endpoint.starts_with("http://")) {
+        return reject("validation_error", "endpoint must be an http(s) URL");
+    }
+    let endpoint = req.endpoint.trim_end_matches('/').to_string();
+    // Idempotent on DID (DIR-FED-13): reuse the existing replica_id, else mint one.
+    let existing = st
+        .repo
+        .all_replicas()
+        .await
+        .into_iter()
+        .find(|(_, d, _, _, _)| d == &req.did);
+    let (replica_id, is_new) = match existing {
+        Some((rid, _, _, _, _)) => (rid, false),
+        None => (uuid::Uuid::new_v4().to_string(), true),
+    };
+    st.repo
+        .upsert_replica(&replica_id, &req.did, &endpoint, "low")
+        .await;
+    if is_new {
+        // Mirror the new replica to other replicas via a signed REPLICA_REGISTERED event.
+        emit_event(
+            &st,
+            "REPLICA_REGISTERED",
+            &replica_id,
+            serde_json::json!({ "did": req.did, "endpoint": endpoint, "trust_tier": "low" }),
+        )
+        .await;
+    }
+    let genesis_hash = st.repo.events_since(0, 1).await.first().map(|e| {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            crate::federation::canonical_json(&e.payload).as_bytes(),
+        ))
+    });
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "replica_id": replica_id,
+            "since_seq": 0,
+            "genesis_hash": genesis_hash,
+            "trust_tier": "low",
+            "did_acknowledged": true,
+        })),
+    )
+}
+
 async fn bootstrap(State(st): State<AppState>) -> Json<serde_json::Value> {
     let raw = st.repo.bootstrap(5).await;
     let count = raw.len() as u32;
@@ -1794,9 +3761,9 @@ async fn deregister(
         );
     }
     if st.repo.deregister(&req.node_id).await {
-        // PHP emits DEREGISTER event before deletion (spec §3.4 — signed event log prereq).
-        // Log it to node_events for federation traceability (Phase 6).
-        st.repo.log_event(&req.node_id, "DEREGISTER", "{}").await;
+        // #442 — emit a SIGNED DEREGISTER event (was an unsigned log_event) so replicas
+        // mirror the removal over /v1/events. No-op when unsigned (no key configured).
+        emit_event(&st, "DEREGISTER", &req.node_id, serde_json::json!({})).await;
         (
             StatusCode::OK,
             Json(serde_json::json!({ "deregistered": true })),
@@ -1851,11 +3818,43 @@ async fn main() {
         &repo,
     )));
     tokio::spawn(background::run_probe_nodes_loop(Arc::clone(&repo)));
+    tokio::spawn(background::run_expire_credits_loop(Arc::clone(&repo))); // WQ-056: 90d TTL credit sink
 
-    let state = AppState { repo, env };
+    // #385/#437 — when IICP_REPLICA_MODE=true, federate: tail the Genesis Seed's
+    // signed event log and mirror its state so this instance serves as a replica.
+    // Capture the seed URL first: it both drives the sync loop and the write-gate
+    // (DIR-FED-18) so the replica 307-redirects writes to the seed.
+    let replica_seed_url: Option<String> = match replica::ReplicaConfig::from_env() {
+        Some(cfg) => {
+            eprintln!(
+                "[replica] IICP_REPLICA_MODE active — federating from seed {} (writes 307→seed)",
+                cfg.seed_url
+            );
+            let seed = cfg.seed_url.clone();
+            tokio::spawn(replica::run_replica_sync(Arc::clone(&repo), cfg));
+            Some(seed)
+        }
+        None => None,
+    };
+
+    // #442: load this directory's Ed25519 signing key (libsodium 128-hex). When set, the
+    // register/deregister write paths emit signed events onto /v1/events (become a seed).
+    let signing_key = std::env::var("IICP_GENESIS_ED25519_SECRET_KEY")
+        .ok()
+        .filter(|k| k.len() == 128);
+    let state = AppState {
+        repo,
+        env,
+        signing_key,
+        register_rate: new_register_rate(),
+    };
+    let router = match replica_seed_url {
+        Some(seed) => app(state).layer(middleware::from_fn_with_state(seed, replica_write_gate)),
+        None => app(state),
+    };
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("iicp-directory-rs {VERSION} listening on {addr}");
-    axum::serve(listener, app(state)).await.expect("serve");
+    axum::serve(listener, router).await.expect("serve");
 }
 
 #[cfg(test)]
@@ -1908,6 +3907,14 @@ mod tests {
                 // Relay-reachable test node (0.5) — matches the documented mesh_health
                 // expectation and PHP reachabilityScore relay tier (#385).
                 reachability_signal: 0.5,
+                operator_pubkey: None,
+                operator_display_name: None,
+                operator_fingerprint: None,
+                operator_verified: false,
+                operator_trust_tier: None,
+                public_listing: false,
+                operator_url: None,
+                health_models: None,
             },
             intents: vec![chat.into()],
             node_token: None,
@@ -1917,6 +3924,8 @@ mod tests {
         AppState {
             repo: Arc::new(InMemoryRepo::new(vec![mk("a", 0.9), mk("b", 0.5)])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         }
     }
 
@@ -1927,6 +3936,164 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    fn test_state_with_signing_key() -> AppState {
+        let mut st = test_state();
+        // libsodium 64-byte secret key: seed(0x11*32) || public key from the KAT
+        // in federation.rs. This is the same key shape the PHP directory uses.
+        st.signing_key = Some(format!(
+            "{}{}",
+            "11".repeat(32),
+            "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+        ));
+        st
+    }
+
+    #[tokio::test]
+    async fn api_v1_aliases_cover_live_php_paths() {
+        let state = test_state();
+        for (method, uri) in [
+            ("GET", "/api/v1/stats"),
+            ("GET", "/api/v1/metrics"),
+            ("GET", "/api/v1/discover?intent=urn:iicp:intent:llm:chat:v1"),
+            ("GET", "/api/v1/bootstrap"),
+            ("GET", "/api/v1/events"),
+            ("GET", "/api/v1/snapshot"),
+            ("GET", "/api/v1/registry/nodes"),
+            ("GET", "/api/v1/registry/intents"),
+            ("GET", "/api/v1/registry/stats"),
+            (
+                "GET",
+                "/api/v1/credits/quote?intent=urn:iicp:intent:llm:chat:v1&max_tokens=1",
+            ),
+            ("GET", "/api/v1/conformance/badges"),
+            ("GET", "/api/v1/probe?endpoint=https://example.com"),
+        ] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", "Bearer test-token")
+                .header("x-node-id", "a")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app(state.clone()).oneshot(req).await.unwrap();
+            assert_ne!(resp.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_api_v1_contains_live_php_compatibility_fields() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let node = &v["nodes"][0];
+        for field in [
+            "cx_public_key",
+            "key_ready",
+            "privacy_routing_status",
+            "auto_update",
+            "backend_stability",
+            "trust_progress",
+            "route_evidence",
+            "routing_hint",
+            "sdk_status",
+            "sdk_baseline_version",
+            "capability_summary",
+            "browser_usable",
+            "directory_observed_reachable",
+            "performance",
+            "input_modalities",
+        ] {
+            assert!(
+                node.as_object().unwrap().contains_key(field),
+                "missing live compatibility field {field}"
+            );
+        }
+        assert_eq!(node["sdk_baseline_version"], SDK_BASELINE_VERSION);
+        assert_eq!(node["privacy_routing_status"], "transitional");
+        assert_eq!(node["browser_usable"], true);
+    }
+
+    #[tokio::test]
+    async fn directory_key_and_signed_token_endpoints_work_with_seed_key() {
+        let state = test_state_with_signing_key();
+        let key_resp = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/directory-key")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(key_resp.status(), StatusCode::OK);
+        let key_body: serde_json::Value =
+            serde_json::from_slice(&key_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            key_body["public_key"],
+            "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+        );
+
+        let req_body = serde_json::json!({
+            "target_node_id": "b",
+            "intent": "urn:iicp:intent:llm:chat:v1"
+        });
+        let token_resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consumer-token")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .header("x-node-id", "a")
+                    .body(axum::body::Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token_resp.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&token_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["caller_node_id"], "a");
+        assert_eq!(body["target_node_id"], "b");
+        assert!(body["token"].as_str().unwrap().contains('.'));
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_endpoint_returns_signed_ticket() {
+        let req_body = serde_json::json!({"relay_node_id": "relay-eu"});
+        let resp = app(test_state_with_signing_key())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/relay/ticket")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .header("x-node-id", "a")
+                    .body(axum::body::Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["worker_node_id"], "a");
+        assert_eq!(body["relay_node_id"], "relay-eu");
+        assert_eq!(body["algorithm"], "ed25519");
+        assert!(body["ticket"].as_str().unwrap().contains('.'));
     }
 
     #[tokio::test]
@@ -1947,6 +4114,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replica_write_gate_307s_writes_and_passes_reads() {
+        // DIR-FED-18: in replica mode, writes 307→seed; reads pass through.
+        let seed = "http://seed-directory:8080".to_string();
+        let gated = || {
+            app(test_state()).layer(middleware::from_fn_with_state(
+                seed.clone(),
+                replica_write_gate,
+            ))
+        };
+
+        // POST write → 307 to seed, path preserved.
+        let resp = gated()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/register")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 307, "writes must redirect in replica mode");
+        assert_eq!(
+            resp.headers().get("location").unwrap(),
+            "http://seed-directory:8080/v1/register"
+        );
+        assert_eq!(
+            resp.headers().get("x-iicp-redirect-reason").unwrap(),
+            "replica_mode"
+        );
+
+        // GET read → passes through (not a redirect).
+        let resp = gated()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/registry/nodes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            307,
+            "reads must pass through in replica mode"
+        );
+    }
+
+    #[tokio::test]
     async fn stats_matches_spec_shape() {
         let resp = app(test_state())
             .oneshot(
@@ -1962,6 +4178,477 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v["server"]["version"].is_string());
         assert!(v["mesh_health"]["label"].is_string());
+        // ADR-048 (#374): federation aggregate null until HEALTH events applied.
+        assert!(v["mesh_health_federated"].is_null());
+        assert!(v["sdk_adoption"].is_object());
+        assert!(v["sdk_adoption"]["total_active"].is_number());
+        assert_eq!(
+            v["sdk_adoption"]["total_active"],
+            v["server"]["active_nodes"]
+        );
+        assert!(v["sdk_adoption"]["by_language"].is_object());
+        assert!(v["sdk_adoption"]["by_version"].is_object());
+    }
+
+    #[tokio::test]
+    async fn stats_includes_sdk_adoption_distribution() {
+        let state = test_state();
+        let before = sdk_adoption_json(&state.repo.active_nodes().await);
+        let count = |v: &serde_json::Value, section: &str, key: &str| -> i64 {
+            v[section][key].as_i64().unwrap_or(0)
+        };
+        let total_before = before["total_active"].as_i64().unwrap_or(0);
+        let rust_before = count(&before, "by_language", "rust");
+        let python_before = count(&before, "by_language", "python");
+        let v0763_before = count(&before, "by_version", "0.7.63");
+        let v0762_before = count(&before, "by_version", "0.7.62");
+
+        for (id, endpoint, lang, version) in [
+            ("rust-a", "https://1.1.1.1", "rust", "0.7.63"),
+            ("rust-b", "https://1.0.0.1", "rust", "0.7.63"),
+            ("py-a", "https://8.8.8.8", "python", "0.7.62"),
+        ] {
+            let body = serde_json::json!({
+                "node_id": id,
+                "endpoint": endpoint,
+                "region": "eu-central",
+                "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+                "nat_type": "full_cone",
+                "transport_method": "upnp_mapped",
+                "sdk_language": lang,
+                "sdk_version": version
+            });
+            let resp = app(state.clone())
+                .oneshot(post_register(body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 201);
+        }
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/stats")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let after = &v["sdk_adoption"];
+        assert_eq!(after["total_active"].as_i64().unwrap(), total_before + 3);
+        assert_eq!(count(after, "by_language", "rust"), rust_before + 2);
+        assert_eq!(count(after, "by_language", "python"), python_before + 1);
+        assert_eq!(count(after, "by_version", "0.7.63"), v0763_before + 2);
+        assert_eq!(count(after, "by_version", "0.7.62"), v0762_before + 1);
+    }
+
+    #[tokio::test]
+    async fn stats_probe_shape_includes_active_count_aggregate_conformance_directory_health() {
+        // Behavior test: /v1/stats must expose the full PHP StatsController probe shape.
+        // Fails if any of these keys are absent — regression guard for the parity gap.
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/stats")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // probes shape (PHP StatsController::probeStats parity)
+        assert!(
+            v["probes"]["active_count"].is_number(),
+            "probes.active_count missing"
+        );
+        assert!(v["probes"]["regions"].is_array(), "probes.regions missing");
+        assert!(
+            v["probes"]["aggregate_24h"].is_object(),
+            "probes.aggregate_24h missing"
+        );
+        assert!(
+            v["probes"]["conformance_24h"].is_object(),
+            "probes.conformance_24h missing"
+        );
+        assert!(
+            v["probes"]["conformance_24h"]["top_failures"].is_array(),
+            "conformance_24h.top_failures missing"
+        );
+        // directory_health (ADR-044 §3.9b parity)
+        assert!(
+            v["directory_health"].is_object(),
+            "directory_health missing"
+        );
+        assert!(
+            v["directory_health"]["label"].is_string(),
+            "directory_health.label missing"
+        );
+        assert!(
+            v["directory_health"]["window"].as_str() == Some("24h"),
+            "directory_health.window wrong"
+        );
+    }
+
+    #[test]
+    fn directory_health_score_unavailable_when_no_probe_data() {
+        // Behavior: with no probe data (all zeros / None), score=null label="unavailable".
+        let agg = crate::repo::ProbeAggregate24h::default();
+        let h = compute_directory_health(&agg);
+        assert_eq!(
+            h["label"], "unavailable",
+            "expected unavailable with no probe data"
+        );
+        assert!(
+            h["score"].is_null(),
+            "score should be null when no probe data"
+        );
+    }
+
+    #[test]
+    fn directory_health_score_healthy_when_fast_and_conformant() {
+        // p50=50ms (perfect latency) + all passed → latScore=1.0, confScore=1.0 → 1.0 → healthy
+        let agg = crate::repo::ProbeAggregate24h {
+            discover_p50_ms: Some(50.0),
+            conformance_passed: 100,
+            conformance_failed: 0,
+            ..Default::default()
+        };
+        let h = compute_directory_health(&agg);
+        assert_eq!(h["label"], "healthy");
+        let score = h["score"].as_f64().unwrap();
+        assert!(
+            (score - 1.0).abs() < 0.001,
+            "score should be ~1.0, got {score}"
+        );
+    }
+
+    #[test]
+    fn directory_health_score_critical_when_slow_and_half_failing() {
+        // p50=500ms (latScore=0.0) + 50% fail rate (confScore=0.5) → 0.4×0.5=0.2 → critical
+        let agg = crate::repo::ProbeAggregate24h {
+            discover_p50_ms: Some(500.0),
+            conformance_passed: 50,
+            conformance_failed: 50,
+            ..Default::default()
+        };
+        let h = compute_directory_health(&agg);
+        assert_eq!(h["label"], "critical");
+        let score = h["score"].as_f64().unwrap();
+        assert!(
+            score < 0.40,
+            "score should be below 0.40 (critical), got {score}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_serves_signed_log() {
+        // #442 slice 3: GET /v1/events serves the signed log in the shape replica::fetch_events
+        // expects, with each event carrying its Ed25519 sig + signer_did.
+        let pubkey = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let key = format!("{}{}", "11".repeat(32), pubkey);
+        let state = test_state();
+        let repo = state.repo.clone();
+        repo.append_signed_event(
+            &key,
+            "REGISTER",
+            "n1",
+            &serde_json::json!({"endpoint": "http://x"}),
+        )
+        .await;
+        repo.append_signed_event(&key, "DEREGISTER", "n1", &serde_json::json!({}))
+            .await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/events?since_seq=0")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = v["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 2);
+        assert_eq!(v["next_seq"], 2);
+        assert_eq!(events[0]["event_type"], "REGISTER");
+        assert_eq!(events[0]["seq"], 1);
+        assert!(
+            events[0]["sig"].is_string(),
+            "events must carry their signature"
+        );
+        assert_eq!(events[0]["signer_did"], "did:web:iicp.network");
+    }
+
+    #[tokio::test]
+    async fn federation_endpoints_served_under_api_v1() {
+        // #442: a replica (PHP ReplicaStartCommand / Rust fetch_events) polls
+        // {seed}/api/v1/events + /api/v1/snapshot — so a Rust seed MUST serve those paths,
+        // not just /v1/*. Without the aliases, federation FROM a Rust seed 404s.
+        for path in ["/api/v1/events", "/api/v1/snapshot"] {
+            let resp = app(test_state())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "{path} must be reachable for cross-flavour federation"
+            );
+        }
+        // POST /api/v1/replicas/register handshake reachable under /api/v1 too.
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/replicas/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"did": "did:web:r.example", "endpoint": "https://r.example"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+
+    #[tokio::test]
+    async fn did_document_publishes_signing_pubkey_for_verification() {
+        // #442: a Rust seed signs events; the DID doc must publish its pubkey so a replica
+        // (seed_pubkey_hex_from_did) can resolve it and VERIFY those signatures. Closes the
+        // loop with federation::sign_event/verify_event.
+        let pubkey = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let mut state = test_state();
+        state.signing_key = Some(format!("{}{}", "11".repeat(32), pubkey));
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/.well-known/did.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["verificationMethod"].as_array().unwrap().len(), 1);
+        // The replica's resolver extracts exactly the seed's signing pubkey from this doc.
+        assert_eq!(
+            crate::replica::seed_pubkey_hex_from_did(&v),
+            Some(pubkey.to_string()),
+            "a replica must resolve the Rust seed's verifying key from its DID document"
+        );
+    }
+
+    #[tokio::test]
+    async fn did_document_empty_verification_method_without_key() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/.well-known/did.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert!(v["verificationMethod"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_nodes_and_capabilities() {
+        // #442 slice 6: GET /v1/snapshot returns all nodes + capabilities for replica
+        // bootstrap (test_state seeds nodes a,b serving llm:chat).
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/snapshot")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["schema_version"], 1);
+        let nodes = v["nodes"].as_array().expect("nodes array");
+        assert_eq!(nodes.len(), 2);
+        assert!(
+            nodes[0]["endpoint"].is_string(),
+            "snapshot nodes carry endpoints"
+        );
+        let caps = v["capabilities"].as_array().expect("capabilities array");
+        assert!(
+            caps.iter()
+                .any(|c| c["intent"] == "urn:iicp:intent:llm:chat:v1"),
+            "capabilities carry the served intent so a replica's discover can serve it"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicas_register_handshake() {
+        // #442 slice 7: a replica announces did+endpoint → seed records it (idempotent on DID)
+        // + emits a signed REPLICA_REGISTERED event.
+        let pubkey = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let mut state = test_state();
+        state.signing_key = Some(format!("{}{}", "11".repeat(32), pubkey));
+        let repo = state.repo.clone();
+        let post = |b: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/replicas/register")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(b.to_string()))
+                .unwrap()
+        };
+        let body = serde_json::json!({"did": "did:web:replica.example", "endpoint": "https://replica.example"});
+
+        let r1 = app(state.clone())
+            .oneshot(post(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), 201);
+        let v1: serde_json::Value =
+            serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let rid1 = v1["replica_id"].as_str().unwrap().to_string();
+        assert_eq!(v1["trust_tier"], "low");
+        assert_eq!(v1["did_acknowledged"], true);
+
+        // Idempotent on DID → same replica_id, no duplicate row.
+        let r2 = app(state.clone())
+            .oneshot(post(body.clone()))
+            .await
+            .unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v2["replica_id"].as_str().unwrap(), rid1);
+        assert_eq!(repo.all_replicas().await.len(), 1);
+
+        // REPLICA_REGISTERED emitted exactly once (on first registration).
+        let events = repo.events_since(0, 100).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "REPLICA_REGISTERED")
+                .count(),
+            1
+        );
+
+        // Bad DID → 422.
+        let r3 = app(state)
+            .oneshot(post(
+                serde_json::json!({"did": "nope", "endpoint": "https://x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), 422);
+    }
+
+    // DIR-FED-19: /.well-known/iicp-replicas.json dynamic endpoint
+    #[tokio::test]
+    async fn iicp_replicas_json_empty_before_any_replicas() {
+        let state = test_state();
+        let req = axum::http::Request::builder()
+            .uri("/.well-known/iicp-replicas.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["schema_version"], "2");
+        assert_eq!(v["genesis_seed"], "did:web:iicp.network");
+        assert!(v["replicas"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn iicp_replicas_json_includes_registered_replicas() {
+        // After a replica registers via POST /v1/replicas/register, it must appear in
+        // /.well-known/iicp-replicas.json with all DIR-FED-19 required fields present.
+        let state = test_state();
+        let post_body = serde_json::json!({"did": "did:web:replica.example", "endpoint": "https://replica.example"});
+        let post_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/replicas/register")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(post_body.to_string()))
+            .unwrap();
+        app(state.clone()).oneshot(post_req).await.unwrap();
+
+        let get_req = axum::http::Request::builder()
+            .uri("/.well-known/iicp-replicas.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(state).oneshot(get_req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let entries = v["replicas"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "registered replica must appear in the registry"
+        );
+        let entry = &entries[0];
+        // All DIR-FED-19 required fields must be present and non-null.
+        assert_eq!(entry["did"], "did:web:replica.example");
+        assert_eq!(entry["endpoint"], "https://replica.example");
+        assert_eq!(entry["trust_tier"], "low");
+        assert!(entry["replica_id"].is_string());
+        assert!(entry["registered_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn stats_federated_present_once_health_applied() {
+        // ADR-048 (#374): three evaluators agree node-x is healthy → majority aggregate
+        // surfaces under mesh_health_federated (the single-directory mesh_health is unchanged).
+        let state = test_state();
+        let repo = state.repo.clone();
+        for e in ["e1", "e2", "e3"] {
+            repo.upsert_health_observation(
+                "node-x",
+                &format!("did:web:{e}"),
+                0.90,
+                1_700_000_000_000,
+            )
+            .await;
+        }
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/stats")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["mesh_health_federated"]["sample"], 1);
+        assert_eq!(v["mesh_health_federated"]["basis"], "federated_union");
+        // 1 node in the union < MIN_MESH_SAMPLE(3) → insufficient_sample (aggregate label
+        // floor); the per-node majority resolution still produced the 0.90 score.
+        assert_eq!(v["mesh_health_federated"]["label"], "insufficient_sample");
+        assert_eq!(v["mesh_health_federated"]["score"], 0.9);
+        assert_eq!(v["mesh_health_federated"]["contested"], 0);
     }
 
     #[tokio::test]
@@ -1992,10 +4679,29 @@ mod tests {
             v["nodes"][0]["cip_policy"].is_object(),
             "cip_policy must be present in NODELIST"
         );
-        // #400 — discover field parity with PHP: credit_cost_multiplier / pricing_model / attested.
-        assert_eq!(v["nodes"][0]["credit_cost_multiplier"], 1.0);
-        assert_eq!(v["nodes"][0]["pricing_model"], "per_token");
-        assert_eq!(v["nodes"][0]["attested"], false);
+        // #400/#562 — PHP live shape exposes pricing details inside `pricing`,
+        // not as raw Rust-internal top-level fields.
+        assert_eq!(v["nodes"][0]["pricing"]["credit_cost_multiplier"], 1.0);
+        assert_eq!(v["nodes"][0]["pricing"]["pricing_model"], "per_token");
+        assert_eq!(v["nodes"][0]["pricing"]["attested"], false);
+        for internal_field in [
+            "completed_tasks_count",
+            "tasks_failed",
+            "credit_cost_multiplier",
+            "pricing_model",
+            "attested",
+            "operator_verified",
+            "operator_trust_tier",
+            "health_models",
+        ] {
+            assert!(
+                !v["nodes"][0]
+                    .as_object()
+                    .unwrap()
+                    .contains_key(internal_field),
+                "discover must not expose Rust-internal field {internal_field}"
+            );
+        }
         // #397 — transport derived server-side (test_state endpoints are https://…).
         assert_eq!(v["nodes"][0]["transport"], serde_json::json!(["https"]));
     }
@@ -2005,7 +4711,7 @@ mod tests {
         let st = test_state();
         // Register a node that supplies Phase 5 registration fields.
         let body = serde_json::json!({
-            "endpoint": "https://p5.example.com",
+            "endpoint": "https://1.1.1.1",
             "region": "eu-central",
             "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["llama3"],
                                "quantization": "q4_k_m", "inference_engine": "llama.cpp"}],
@@ -2061,7 +4767,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|n| n["endpoint"] == "https://p5.example.com")
+            .find(|n| n["endpoint"] == "https://1.1.1.1")
             .expect("registered node must appear in discover");
         assert_eq!(node["relay_capable"], true);
         assert_eq!(node["sdk_language"], "python");
@@ -2069,7 +4775,565 @@ mod tests {
         assert_eq!(node["models"][0], "llama3");
         assert_eq!(node["quantization"][0], "q4_k_m");
         assert_eq!(node["inference_engine"][0], "llama.cpp");
-        assert_eq!(node["address_family"], "hostname");
+        assert_eq!(node["address_family"], "ipv4");
+    }
+
+    /// Signs a fresh operator→node delegation for `node_id` (test key seed 0x09*32).
+    fn signed_delegation(node_id: &str, not_after: u64) -> (serde_json::Value, String) {
+        signed_delegation_with_seed(node_id, not_after, 9)
+    }
+
+    fn signed_delegation_with_seed(
+        node_id: &str,
+        not_after: u64,
+        seed: u8,
+    ) -> (serde_json::Value, String) {
+        use ct_codecs::{Base64, Encoder};
+        use ed25519_compact::{KeyPair, Seed};
+        let kp = KeyPair::from_seed(Seed::new([seed; 32]));
+        let op_pub = Base64::encode_to_string(&kp.pk[..]).unwrap();
+        let msg = delegation::canonical_bytes(node_id, &op_pub, not_after);
+        let sig = Base64::encode_to_string(&kp.sk.sign(&msg, None)[..]).unwrap();
+        (
+            serde_json::json!({
+                "node_id": node_id, "operator_pub": op_pub,
+                "not_after": not_after, "sig": sig,
+            }),
+            op_pub,
+        )
+    }
+
+    // ADR-045 Phase A (#407/#385) — a valid ed25519 operator→node delegation presented
+    // at register MUST bind the verified operator identity. Fails without the register-path
+    // wiring (the node would stay operator_verified=false).
+    #[tokio::test]
+    async fn register_with_valid_operator_delegation_binds_identity() {
+        let st = test_state();
+        let node_id = "op-fleet-node-1";
+        let (del, op_pub) = signed_delegation(node_id, delegation::now_unix() + 3600);
+        let body = serde_json::json!({
+            "node_id": node_id,
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "direct",
+            "operator_delegation": del,
+        });
+        let resp = app(st.clone()).oneshot(post_register(body)).await.unwrap();
+        assert_eq!(resp.status(), 201);
+        let node = st.repo.get(node_id).await.expect("node stored");
+        assert!(node.operator_verified);
+        assert_eq!(node.operator_pubkey.as_deref(), Some(op_pub.as_str()));
+        assert_eq!(node.operator_trust_tier.as_deref(), Some("did_key"));
+    }
+
+    // #463/#310/#464 (#385 parity with PHP OperatorRecordTest) — a verified delegation +
+    // operator_display_name upserts the operators record; node detail serves display_name
+    // but NEVER operator_pubkey; display_name is mutable via a delegated re-register.
+    #[tokio::test]
+    async fn register_upserts_operator_and_serves_display_name_not_pubkey() {
+        use http_body_util::BodyExt;
+        let st = test_state();
+        let node_id = "op-fleet-node-dn";
+        let (del, op_pub) = signed_delegation(node_id, delegation::now_unix() + 3600);
+        let mk = |del: serde_json::Value, name: &str| {
+            serde_json::json!({
+                "node_id": node_id,
+                "endpoint": "https://1.1.1.1",
+                "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+                "nat_type": "full_cone", "transport_method": "direct",
+                "operator_delegation": del,
+                "operator_display_name": name,
+                "operator_created_at": "2026-06-05T12:00:00Z",
+                "operator_integrity_hash": "a".repeat(64),
+            })
+        };
+        let resp = app(st.clone())
+            .oneshot(post_register(mk(del, "Rebel One")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        assert_eq!(
+            st.repo.operator_display_name(&op_pub).await.as_deref(),
+            Some("Rebel One")
+        );
+
+        // Node detail serves display_name but MUST NOT leak operator_pubkey.
+        let detail = app(st.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/registry/nodes/{node_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), 200);
+        let bytes = detail.into_body().collect().await.unwrap().to_bytes();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["operator_display_name"], "Rebel One");
+        assert_eq!(
+            v["operator_fingerprint"],
+            public_operator_fingerprint(&op_pub)
+        );
+        assert!(
+            !raw.contains(&op_pub),
+            "node detail must not expose operator_pubkey"
+        );
+        assert!(!raw.contains("operator_pubkey"));
+
+        // Mutable: a delegated re-register with a new name updates the one operator record.
+        let (del2, _) = signed_delegation(node_id, delegation::now_unix() + 3600);
+        app(st.clone())
+            .oneshot(post_register(mk(del2, "New Name")))
+            .await
+            .unwrap();
+        assert_eq!(
+            st.repo.operator_display_name(&op_pub).await.as_deref(),
+            Some("New Name")
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_includes_operator_display_name_and_fingerprint_never_key() {
+        use http_body_util::BodyExt;
+        let st = test_state();
+        let node_id = "op-fleet-discover";
+        let (del, op_pub) = signed_delegation(node_id, delegation::now_unix() + 3600);
+        let body = serde_json::json!({
+            "node_id": node_id,
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["m"]}],
+            "nat_type": "full_cone", "transport_method": "direct",
+            "operator_delegation": del,
+            "operator_display_name": "ZeroKelvinMoralist",
+        });
+        assert_eq!(
+            app(st.clone())
+                .oneshot(post_register(body))
+                .await
+                .unwrap()
+                .status(),
+            201
+        );
+
+        let resp = app(st.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1&limit=50")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let node = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node_id"] == node_id)
+            .expect("registered node appears in discover");
+        assert_eq!(node["operator_display_name"], "ZeroKelvinMoralist");
+        assert_eq!(
+            node["operator_fingerprint"],
+            public_operator_fingerprint(&op_pub)
+        );
+        assert!(!raw.contains(&op_pub));
+        assert!(!raw.contains("operator_pubkey"));
+    }
+
+    #[tokio::test]
+    async fn display_name_cannot_be_claimed_by_different_verified_operator() {
+        use http_body_util::BodyExt;
+        let st = test_state();
+        let (del_a, _) = signed_delegation_with_seed("op-name-a", delegation::now_unix() + 3600, 9);
+        let first = serde_json::json!({
+            "node_id": "op-name-a",
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "direct",
+            "operator_delegation": del_a,
+            "operator_display_name": "Mesh Pioneer",
+        });
+        assert_eq!(
+            app(st.clone())
+                .oneshot(post_register(first))
+                .await
+                .unwrap()
+                .status(),
+            201
+        );
+
+        let (del_b, _) =
+            signed_delegation_with_seed("op-name-b", delegation::now_unix() + 3600, 10);
+        let duplicate = serde_json::json!({
+            "node_id": "op-name-b",
+            "endpoint": "https://1.1.1.2",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "direct",
+            "operator_delegation": del_b,
+            "operator_display_name": " mesh   pioneer ",
+        });
+        let resp = app(st.clone())
+            .oneshot(post_register(duplicate))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "operator_display_name is already claimed by another verified operator (IICP-E051)"
+        );
+        assert!(st.repo.get("op-name-b").await.is_none());
+    }
+
+    // ── #460 operator-signed rename (PHP OperatorRenameTest parity #385) ──────────
+
+    fn rename_keypair(seed: u8) -> (String, ed25519_compact::KeyPair) {
+        use ct_codecs::{Base64, Encoder};
+        use ed25519_compact::{KeyPair, Seed};
+        let kp = KeyPair::from_seed(Seed::new([seed; 32]));
+        (Base64::encode_to_string(&kp.pk[..]).unwrap(), kp)
+    }
+
+    fn sign_rename(kp: &ed25519_compact::KeyPair, op_pub: &str, name: &str, ts: i64) -> String {
+        use ct_codecs::{Base64, Encoder};
+        let msg = delegation::canonical_rename_bytes(name, op_pub, ts);
+        Base64::encode_to_string(&kp.sk.sign(&msg, None)[..]).unwrap()
+    }
+
+    fn post_rename(body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/operator/rename")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn operator_signed_rename_updates_display_name() {
+        let st = test_state();
+        let (op_pub, kp) = rename_keypair(21);
+        st.repo
+            .upsert_operator(&op_pub, Some("Old Name"), None, None)
+            .await;
+        let ts = delegation::now_unix() as i64;
+        let resp = app(st.clone())
+            .oneshot(post_rename(serde_json::json!({
+                "operator_pub": op_pub, "display_name": "New Name", "ts": ts,
+                "sig": sign_rename(&kp, &op_pub, "New Name", ts),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            st.repo.operator_display_name(&op_pub).await.as_deref(),
+            Some("New Name")
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_rename_bad_signature_rejected() {
+        let st = test_state();
+        let (op_pub, _kp) = rename_keypair(22);
+        st.repo
+            .upsert_operator(&op_pub, Some("Old"), None, None)
+            .await;
+        let ts = delegation::now_unix() as i64;
+        // A signature from a DIFFERENT key — valid length, wrong signer.
+        let (_, other) = rename_keypair(99);
+        let resp = app(st.clone())
+            .oneshot(post_rename(serde_json::json!({
+                "operator_pub": op_pub, "display_name": "Hijacked", "ts": ts,
+                "sig": sign_rename(&other, &op_pub, "Hijacked", ts),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            st.repo.operator_display_name(&op_pub).await.as_deref(),
+            Some("Old")
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_rename_stale_timestamp_rejected() {
+        let st = test_state();
+        let (op_pub, kp) = rename_keypair(23);
+        st.repo
+            .upsert_operator(&op_pub, Some("Old"), None, None)
+            .await;
+        let ts = delegation::now_unix() as i64 - 3600; // way outside the ±300s window
+        let resp = app(st.clone())
+            .oneshot(post_rename(serde_json::json!({
+                "operator_pub": op_pub, "display_name": "New", "ts": ts,
+                "sig": sign_rename(&kp, &op_pub, "New", ts),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn operator_rename_unknown_operator_is_404() {
+        let st = test_state();
+        let (op_pub, kp) = rename_keypair(24); // never upserted into operators
+        let ts = delegation::now_unix() as i64;
+        let resp = app(st.clone())
+            .oneshot(post_rename(serde_json::json!({
+                "operator_pub": op_pub, "display_name": "Ghost", "ts": ts,
+                "sig": sign_rename(&kp, &op_pub, "Ghost", ts),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    // #310/#463 (PHP LeaderboardTest parity) — the founders board orders by ordinal, serves
+    // the public display_name + recognition state, excludes non-founders, and NEVER leaks
+    // operator_pubkey; an unknown/uncomputed board is 404.
+    #[tokio::test]
+    async fn founders_leaderboard_orders_by_ordinal_and_hides_pubkey() {
+        use http_body_util::BodyExt;
+        let st = test_state();
+        for (pk, name, ord, tier, badge) in [
+            ("PUBKEY_C", "Third", 3, "founders_1000", "founder"),
+            ("PUBKEY_A", "First", 1, "genesis_50", "genesis"),
+            ("PUBKEY_B", "Second", 2, "founders_500", "founder"),
+        ] {
+            st.repo.upsert_operator(pk, Some(name), None, None).await;
+            st.repo
+                .set_operator_recognition(pk, ord, Some(tier), Some(badge))
+                .await;
+        }
+        // A non-founder (no ordinal) must not appear.
+        st.repo
+            .upsert_operator("PUBKEY_X", Some("Latecomer"), None, None)
+            .await;
+
+        let get = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let resp = app(st.clone())
+            .oneshot(get("/v1/leaderboards/founders"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let raw = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["count"], 3);
+        assert_eq!(v["entries"][0]["place"], 1);
+        assert_eq!(v["entries"][0]["display_name"], "First");
+        assert_eq!(v["entries"][0]["ordinal"], 1);
+        assert_eq!(v["entries"][2]["display_name"], "Third");
+        assert!(!raw.contains("PUBKEY_A"), "must not expose operator_pubkey");
+        assert!(!raw.contains("operator_pubkey"));
+        assert!(!raw.contains("Latecomer"), "non-founder must be excluded");
+
+        // Boards needing rank_score (not yet computed) → 404, not a fabricated list.
+        let resp404 = app(st.clone())
+            .oneshot(get("/v1/leaderboards/living_mesh_lords"))
+            .await
+            .unwrap();
+        assert_eq!(resp404.status(), 404);
+    }
+
+    // Provisional founders (PHP LeaderboardTest parity): an operator with a genuine served
+    // node but no ordinal yet appears in `pending` with a projected ordinal + days remaining;
+    // an operator with no served node (name squatter) does NOT.
+    #[tokio::test]
+    async fn founders_leaderboard_pending_shows_provisional_operators() {
+        use http_body_util::BodyExt;
+        let st = test_state();
+        // Locked founder #1.
+        st.repo
+            .upsert_operator("PUBKEY_ONE", Some("Founder"), None, None)
+            .await;
+        st.repo
+            .set_operator_recognition("PUBKEY_ONE", 1, Some("genesis_50"), Some("first_10"))
+            .await;
+        // Provisional: register a node with a verified operator delegation (genuine served node).
+        let node_id = "pending-node-1";
+        let (del, _op_pub) = signed_delegation(node_id, delegation::now_unix() + 3600);
+        let body = serde_json::json!({
+            "node_id": node_id,
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "direct",
+            "operator_delegation": del,
+            "operator_display_name": "Challenger",
+        });
+        let resp = app(st.clone()).oneshot(post_register(body)).await.unwrap();
+        assert_eq!(resp.status(), 201);
+        // Name squatter: operator record exists, no node.
+        st.repo
+            .upsert_operator("PUBKEY_SQUAT", Some("NameSquatter"), None, None)
+            .await;
+
+        let get = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let resp = app(st.clone())
+            .oneshot(get("/v1/leaderboards/founders"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let raw = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["pending"][0]["display_name"], "Challenger");
+        assert_eq!(v["pending"][0]["projected_ordinal"], 2); // after locked #1
+        assert_eq!(v["pending"][0]["days_remaining"], 30); // just appeared
+        assert_eq!(v["pending"][0]["provisional"], true);
+        assert!(!raw.contains("NameSquatter"), "no served node → not listed");
+        assert!(!raw.contains("PUBKEY_"), "must not expose operator_pubkey");
+    }
+
+    // An expired (or otherwise invalid) delegation is fail-safe: the node registers
+    // successfully but stays unverified — no false operator binding.
+    #[tokio::test]
+    async fn register_with_expired_operator_delegation_stays_unverified() {
+        let st = test_state();
+        let node_id = "op-fleet-node-2";
+        let (del, _op_pub) = signed_delegation(node_id, 1_000); // long expired
+        let body = serde_json::json!({
+            "node_id": node_id,
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "direct",
+            "operator_delegation": del,
+        });
+        let resp = app(st.clone()).oneshot(post_register(body)).await.unwrap();
+        assert_eq!(resp.status(), 201);
+        let node = st.repo.get(node_id).await.expect("node stored");
+        assert!(!node.operator_verified);
+        assert_eq!(node.operator_pubkey, None);
+    }
+
+    // WQ-057 — GET /v1/credits/quote (PHP parity): authenticated pre-flight; the estimate
+    // math is the pure compute_quote, the candidate scoping is quote_multipliers.
+    #[test]
+    fn listing_exposure_serves_operator_url_only_when_opted_in() {
+        // WQ-058 #404 (ADR-017 REG-01): respect the opt-out — operator_url is served only
+        // when public_listing=true. Fails if the registry leaks an opted-out operator's URL.
+        let url = Some("https://op.example".to_string());
+        assert_eq!(
+            super::listing_exposure(true, &url),
+            serde_json::json!("https://op.example")
+        );
+        assert_eq!(
+            super::listing_exposure(false, &url),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            super::listing_exposure(true, &None),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn credits_quote_compute_empty_uses_base_rate() {
+        // WQ-057 #404: no candidates → base rate (×1.0), 0 nodes quoted.
+        let q = super::compute_quote(2000, &[]);
+        assert_eq!(q.nodes_quoted, 0);
+        assert_eq!(q.estimated, 2.0); // base_blocks=2 × 1.0
+        assert_eq!(q.price_per_1000, 1.0);
+    }
+
+    #[test]
+    fn credits_quote_compute_uses_min_max_avg() {
+        // WQ-057 #404: min/max from cheapest/dearest multiplier, estimated from the average.
+        let q = super::compute_quote(2000, &[1.0, 2.0, 3.0]);
+        assert_eq!(q.nodes_quoted, 3);
+        assert_eq!(q.min, 2.0); // base 2 × 1.0
+        assert_eq!(q.max, 6.0); // base 2 × 3.0
+        assert_eq!(q.estimated, 4.0); // base 2 × avg 2.0
+        assert_eq!(q.price_per_1000, 2.0);
+    }
+
+    #[test]
+    fn credits_quote_compute_ceils_partial_block() {
+        // ceil(500/1000) = 1 block (PHP parity).
+        assert_eq!(super::compute_quote(500, &[1.0]).estimated, 1.0);
+    }
+
+    #[tokio::test]
+    async fn credits_quote_requires_node_token() {
+        // WQ-057 #404: the quote is an authenticated consumer pre-flight (PHP parity) —
+        // no bearer → 401, not an anonymous price.
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/credits/quote?intent=urn:iicp:intent:llm:chat:v1&max_tokens=1000")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn credits_summary_zero_ledger_reconciles() {
+        // (see preceding doc — summary reconciles to all-zero with no ledger)
+        let st = test_state();
+        let body = serde_json::json!({
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "direct"
+        });
+        let reg = app(st.clone()).oneshot(post_register(body)).await.unwrap();
+        assert_eq!(reg.status(), 201);
+        let rb: serde_json::Value =
+            serde_json::from_slice(&reg.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let node_id = rb["node_id"].as_str().unwrap().to_string();
+        let token = rb["node_token"].as_str().unwrap().to_string();
+
+        let resp = app(st)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/credits/summary")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("X-Node-Id", &node_id)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["node_id"], node_id);
+        assert_eq!(v["total_earned"], 0.0);
+        assert_eq!(v["total_spent"], 0.0);
+        assert_eq!(v["reconciles"], true);
+        assert_eq!(v["tokens_per_credit"], 1000);
     }
 
     #[tokio::test]
@@ -2090,9 +5354,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_relay_available_false_when_no_relay_capable_nodes() {
+        // Behavior: relay_available=false when no discovered node has relay_capable=true.
+        // test_state() nodes have relay_capable=None (falsy) → relay_available=false.
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["relay_available"], false,
+            "relay_available should be false with no relay nodes"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_relay_available_true_when_relay_capable_node_present() {
+        // Behavior: relay_available=true when ≥1 discovered node has relay_capable=true.
+        let st = test_state();
+        // Register a relay-capable node via HTTP then heartbeat it.
+        let reg = app(st.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/register")
+                    .header("content-type", "application/json")
+                    .header("app-env", "local")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "endpoint": "https://1.1.1.1",
+                            "region": "eu",
+                            "relay_capable": true,
+                            "nat_type": "full_cone",
+                            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reg.status(), 201);
+        let rb: serde_json::Value =
+            serde_json::from_slice(&reg.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let token = rb["node_token"].as_str().unwrap().to_string();
+        let _ = app(st.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::from(r#"{"load":0.1,"available":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = app(st)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["relay_available"], true,
+            "relay_available should be true when relay node registered"
+        );
+    }
+
+    #[tokio::test]
     async fn register_valid_returns_201_ack() {
         let body = serde_json::json!({
-            "endpoint": "https://node.example.com",
+            "endpoint": "https://1.1.1.1",
             "region": "eu-central",
             "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
             "nat_type": "full_cone", "transport_method": "upnp_mapped"
@@ -2110,9 +5456,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_emits_signed_event_to_log() {
+        // #442: with a signing key configured, POST /v1/register emits a signed REGISTER
+        // event onto the log (so a replica can mirror this node over /v1/events).
+        let pubkey = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let mut state = test_state();
+        state.signing_key = Some(format!("{}{}", "11".repeat(32), pubkey));
+        let repo = state.repo.clone();
+
+        let body = serde_json::json!({
+            "endpoint": "https://1.1.1.1",
+            "region": "eu-central",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["m1"]}],
+            "nat_type": "full_cone", "transport_method": "upnp_mapped"
+        });
+        let resp = app(state).oneshot(post_register(body)).await.unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let events = repo.events_since(0, 100).await;
+        assert_eq!(events.len(), 1, "register must emit exactly one event");
+        let ev = &events[0];
+        assert_eq!(ev.event_type, "REGISTER");
+        // capabilities ride along (#438) so a replica's discover can serve the node.
+        assert_eq!(
+            ev.payload["capabilities"][0]["intent"],
+            "urn:iicp:intent:llm:chat:v1"
+        );
+        // the emitted event is signed and verifies under the configured key, and the first
+        // event chains from GENESIS_ROOT (#458).
+        let sig = ev.sig.as_ref().expect("event must be signed");
+        assert_eq!(
+            ev.prev_hash.as_deref(),
+            Some(crate::federation::GENESIS_ROOT),
+            "first event's prev_hash is GENESIS_ROOT"
+        );
+        let msg = crate::federation::event_message(
+            &ev.event_id,
+            &ev.event_type,
+            ev.seq,
+            ev.ts_ms,
+            &ev.payload,
+            ev.prev_hash
+                .as_deref()
+                .unwrap_or(crate::federation::GENESIS_ROOT),
+        );
+        assert!(crate::federation::verify_event(pubkey, sig, &msg));
+    }
+
+    #[tokio::test]
+    async fn register_without_key_emits_nothing() {
+        // No signing key (default test_state) → no events emitted (unsigned-mode parity).
+        let state = test_state();
+        let repo = state.repo.clone();
+        let body = serde_json::json!({
+            "endpoint": "https://1.1.1.1", "region": "eu-central",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "upnp_mapped"
+        });
+        let resp = app(state).oneshot(post_register(body)).await.unwrap();
+        assert_eq!(resp.status(), 201);
+        assert!(repo.events_since(0, 100).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credit_award_emits_signed_event() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let pubkey = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let mut state = test_state();
+        state.signing_key = Some(format!("{}{}", "11".repeat(32), pubkey));
+        let repo = state.repo.clone();
+
+        // 1. register a node → obtain node_token + node_hmac_key from the ACK.
+        let reg = serde_json::json!({
+            "endpoint": "https://1.1.1.1", "region": "eu-central",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "upnp_mapped"
+        });
+        let r1 = app(state.clone())
+            .oneshot(post_register(reg))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), 201);
+        let b1 = r1.into_body().collect().await.unwrap().to_bytes();
+        let v1: serde_json::Value = serde_json::from_slice(&b1).unwrap();
+        let node_id = v1["node_id"].as_str().unwrap().to_string();
+        let token = v1["node_token"].as_str().unwrap().to_string();
+        let hmac_key = v1["node_hmac_key"].as_str().unwrap().to_string();
+
+        // 2. sign a valid CIP receipt and POST /v1/credits/award.
+        let nonce = "nonce-abcdefghijklmnopqrstuvwxyz123456"; // >= 32 chars
+        let canonical = format!(
+            "{}:{}:{}:{}:{}:{}",
+            "task-1", 1000u64, "", "", nonce, "hash-1"
+        );
+        let mut mac = HmacSha256::new_from_slice(hmac_key.as_bytes()).unwrap();
+        mac.update(canonical.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        let award = serde_json::json!({
+            "node_id": node_id, "task_id": "task-1", "tokens_used": 1000,
+            "nonce": nonce, "response_hash": "hash-1", "signature": sig, "amount": 1.0
+        });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/credits/award")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(award.to_string()))
+            .unwrap();
+        let r2 = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(r2.status(), 201, "credit award must succeed");
+
+        // 3. a signed CREDIT_AWARD event was emitted with the new balance.
+        let events = repo.events_since(0, 100).await;
+        let credit = events
+            .iter()
+            .find(|e| e.event_type == "CREDIT_AWARD")
+            .expect("CREDIT_AWARD event emitted");
+        assert_eq!(credit.payload["new_balance"], 1.0);
+        assert!(credit.sig.is_some(), "CREDIT_AWARD must be signed");
+    }
+
+    #[tokio::test]
+    async fn credit_award_excludes_same_querying_node() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let state = test_state();
+        let repo = state.repo.clone();
+
+        let reg = serde_json::json!({
+            "endpoint": "https://1.1.1.1", "region": "eu-central",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone", "transport_method": "upnp_mapped"
+        });
+        let r1 = app(state.clone())
+            .oneshot(post_register(reg))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), 201);
+        let b1 = r1.into_body().collect().await.unwrap().to_bytes();
+        let v1: serde_json::Value = serde_json::from_slice(&b1).unwrap();
+        let node_id = v1["node_id"].as_str().unwrap().to_string();
+        let token = v1["node_token"].as_str().unwrap().to_string();
+        let hmac_key = v1["node_hmac_key"].as_str().unwrap().to_string();
+
+        let nonce = "nonce-abcdefghijklmnopqrstuvwxyz123456";
+        let canonical = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            "task-1", 1000u64, "", "", nonce, "hash-1", node_id
+        );
+        let mut mac = HmacSha256::new_from_slice(hmac_key.as_bytes()).unwrap();
+        mac.update(canonical.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        let award = serde_json::json!({
+            "node_id": node_id,
+            "querying_node_id": node_id,
+            "task_id": "task-1",
+            "tokens_used": 1000,
+            "nonce": nonce,
+            "response_hash": "hash-1",
+            "signature": sig,
+            "amount": 1.0
+        });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/credits/award")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(award.to_string()))
+            .unwrap();
+        let r2 = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(r2.status(), 200, "self-query exclusion is net-zero success");
+        let body = r2.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["excluded"], true);
+        assert_eq!(v["attribution"], "self_node");
+        assert_eq!(v["awarded"], 0.0);
+        assert!(
+            repo.events_since(0, 100)
+                .await
+                .iter()
+                .all(|e| e.event_type != "CREDIT_AWARD"),
+            "excluded self-query must not emit a CREDIT_AWARD event"
+        );
+    }
+
+    #[tokio::test]
     async fn register_bad_intent_is_422() {
         let body = serde_json::json!({
-            "endpoint": "https://node.example.com",
+            "endpoint": "https://1.1.1.1",
             "capabilities": [{"intent": "not-a-urn"}]
         });
         let resp = app(test_state())
@@ -2142,7 +5678,7 @@ mod tests {
     async fn register_unknown_nat_not_declared_reachable() {
         // RT-04: unknown nat_type → public_reachable=false (probe pending), not auto-true.
         let body = serde_json::json!({
-            "endpoint": "https://node.example.com",
+            "endpoint": "https://1.1.1.1",
             "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
             "nat_type": "unknown", "transport_method": "direct"
         });
@@ -2245,12 +5781,14 @@ mod tests {
         let st = AppState {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         };
         let router = app(st);
         let body = |id: &str| {
             serde_json::json!({
                 "node_id": id,
-                "endpoint": "https://recover.example.com",
+                "endpoint": "https://1.1.1.1",
                 "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
             })
         };
@@ -2310,11 +5848,13 @@ mod tests {
         let st = AppState {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         };
         let router = app(st);
         let body = serde_json::json!({
             "node_id": "rr-test",
-            "endpoint": "https://rr.example.com",
+            "endpoint": "https://1.1.1.1",
             "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
         });
 
@@ -2359,6 +5899,8 @@ mod tests {
         let st = AppState {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         };
         let router = app(st);
 
@@ -2366,7 +5908,7 @@ mod tests {
         let reg = router
             .clone()
             .oneshot(post_register(serde_json::json!({
-                "endpoint": "https://live.example.com",
+                "endpoint": "https://1.1.1.1",
                 "region": "eu-central",
                 "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
             })))
@@ -2420,6 +5962,78 @@ mod tests {
         assert_eq!(resp.status(), 422);
     }
 
+    // ALIGN/#385 parity (#404): min_reputation out of [0,1] MUST 422 — including NEGATIVE
+    // values (PHP validates min:0 AND max:1). Fails against the old `mr > 1.0`-only check.
+    #[tokio::test]
+    async fn discover_min_reputation_out_of_range_is_422() {
+        let intent = "urn:iicp:intent:llm:chat:v1";
+        for mr in ["-0.5", "1.5"] {
+            let resp = app(test_state())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/v1/discover?intent={intent}&min_reputation={mr}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 422, "min_reputation={mr} must be rejected");
+        }
+        // A valid in-range value is accepted (200).
+        let ok = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/discover?intent={intent}&min_reputation=0.5"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+    }
+
+    // IICP-E034 registration rate-limit window logic (#404, W-033 parity). Fails if the
+    // window reset / in-window increment is wrong (which would break the 60/60s limit).
+    #[test]
+    fn register_rate_step_increments_in_window_and_resets_after_ttl() {
+        let ttl = super::REGISTER_RATE_TTL_MS;
+        // First hit in a fresh window → count 1, start = now.
+        assert_eq!(super::register_rate_step(None, 1_000, ttl), (1, 1_000));
+        // Second hit within the window → increment, same window start.
+        assert_eq!(
+            super::register_rate_step(Some((1, 1_000)), 1_500, ttl),
+            (2, 1_000)
+        );
+        // A hit after the TTL elapsed → new window resets to 1.
+        assert_eq!(
+            super::register_rate_step(Some((60, 1_000)), 1_000 + ttl + 1, ttl),
+            (1, 1_000 + ttl + 1)
+        );
+        // Boundary: exactly at TTL is still "expired" (>= ttl) → reset.
+        assert_eq!(
+            super::register_rate_step(Some((5, 1_000)), 1_000 + ttl, ttl),
+            (1, 1_000 + ttl)
+        );
+    }
+
+    // IICP-E050 (#529) re-registration endpoint-ownership matrix (PHP NodeRegistry parity).
+    // Mirrors the RegisterTest matrix shipped for the PHP directory.
+    #[test]
+    fn e050_endpoint_change_ownership_matrix() {
+        // Same endpoint → ordinary refresh, always allowed (downlevel re-register).
+        assert!(super::endpoint_change_allowed(false, false, true));
+        assert!(super::endpoint_change_allowed(false, false, false));
+        // Endpoint change WITH token ownership → allowed even if the old endpoint is alive
+        // (an owner legitimately rotating a live tunnel).
+        assert!(super::endpoint_change_allowed(true, true, true));
+        // Endpoint change, NO token, old endpoint dead → allowed (migration-safe rotation
+        // for downlevel clients that don't send current_node_token yet).
+        assert!(super::endpoint_change_allowed(true, false, false));
+        // Endpoint change, NO token, old endpoint still alive → REJECTED (hijack attempt:
+        // pointing a victim's node_id at a live different endpoint).
+        assert!(!super::endpoint_change_allowed(true, false, true));
+    }
+
     #[tokio::test]
     async fn stats_returns_active_node_count() {
         // test_state has 2 available nodes → active_count() = 2.
@@ -2436,14 +6050,15 @@ mod tests {
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["server"]["active_nodes"], 2);
-        // ADR-044 mesh_health computed over the 2 active nodes (iter-1957).
-        // Each: reachability 0.5 + latency neutral 0.5 + success neutral 0.5 + reputation 0.8
-        // = 0.30*0.5 + 0.25*0.5 + 0.25*0.5 + 0.20*0.8 = 0.56 → 56 → "impaired".
+        // ADR-044 / #492 mesh_health over 2 active nodes.
+        // #492 formula: W_REACHABILITY=0.70, W_LATENCY=0.30 (success/reputation removed).
+        // Each test node: reachability_signal=0.5 (relay tier), latency=None→0.5 neutral.
+        // score = 0.70*0.5 + 0.30*0.5 = 0.50 → 50 → "impaired".
         let mh = &v["mesh_health"];
         assert_eq!(mh["sample"], 2);
         assert_eq!(mh["label"], "insufficient_sample"); // 2 < MIN_MESH_SAMPLE
-        assert_eq!(mh["score"], 0.56);
-        assert_eq!(mh["mean"], 0.56);
+        assert_eq!(mh["score"], 0.5);
+        assert_eq!(mh["mean"], 0.5);
         assert_eq!(mh["distribution"]["impaired"], 2);
         assert_eq!(mh["basis"], "active_provider_nodes");
     }
@@ -2635,6 +6250,12 @@ mod tests {
                 node.get("endpoint").is_none(),
                 "registry must not expose endpoint"
             );
+            // #385 parity: PHP includes the served `models` in the public listing. #404 —
+            // fails if the field regresses (it was absent before the parity fix).
+            assert!(
+                node["models"].is_array(),
+                "registry listing must include a models array (PHP parity)"
+            );
         }
     }
 
@@ -2676,21 +6297,19 @@ mod tests {
         // success signal can be computed.
         let st = test_state();
         // a/b exist in test_state; heartbeat node "a" with 7 ok + 3 failed.
-        let new = st.repo.heartbeat("a", 0.1, true, 0, 10, 3, 0.0).await;
+        let new = st.repo.heartbeat("a", 0.1, true, 0, 10, 3, 0.0, None).await;
         assert!(new.is_some());
         let n = st.repo.get("a").await.expect("node a");
         assert_eq!(n.completed_tasks_count, 10, "tasks_total += success+failed");
         assert_eq!(n.tasks_failed, 3, "tasks_failed persisted, not dropped");
-        // success ratio 70% → success_score == 0.0 boundary (health.rs).
+        // #492: health no longer uses success/reputation — endpoint-only formula.
+        // 0.70*1.0 + 0.30*0.5(no latency) = 0.85 → 85 → healthy.
         let h = health::score_node(&health::HealthSignals {
             reachability: 1.0,
             latency_ms: None,
-            tasks_total: n.completed_tasks_count as i64,
-            tasks_failed: n.tasks_failed as i64,
-            reputation: 1.0,
         });
-        // 0.30*1 + 0.25*0.5(no latency) + 0.25*0.0(70%) + 0.20*1 = 0.625 → 63
-        assert_eq!(h.score, 63);
+        assert_eq!(h.score, 85);
+        assert_eq!(h.label, "healthy");
     }
 
     #[tokio::test]
@@ -2698,7 +6317,7 @@ mod tests {
         // #401 / AL2 — Rust must reject out-of-enum exposure_mode (PHP parity),
         // not silently accept it.
         let body = serde_json::json!({
-            "endpoint": "https://x.example.com",
+            "endpoint": "https://1.1.1.1",
             "region": "eu-central",
             "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["m"]}],
             "exposure_mode": "totally_bogus"
@@ -2760,6 +6379,34 @@ mod tests {
             response_hash: "hash99".into(),
             signature: sig,
             amount: 0.1,
+            querying_node_id: None,
+        };
+        assert!(verify_cip_receipt(&req, key));
+    }
+
+    #[test]
+    fn verify_cip_receipt_includes_querying_node_id_when_present() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let key = "secret";
+        let canonical = "task1:100:::nonce42:hash99:q1";
+        let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap();
+        mac.update(canonical.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+
+        let req = CreditAwardRequest {
+            node_id: "n1".into(),
+            task_id: "task1".into(),
+            tokens_used: 100,
+            cip_parent_task_id: String::new(),
+            cip_session_key: String::new(),
+            nonce: "nonce42".into(),
+            response_hash: "hash99".into(),
+            signature: sig,
+            amount: 0.1,
+            querying_node_id: Some("q1".into()),
         };
         assert!(verify_cip_receipt(&req, key));
     }
@@ -2776,6 +6423,7 @@ mod tests {
             response_hash: "hash99".into(),
             signature: "deadbeef".into(),
             amount: 0.1,
+            querying_node_id: None,
         };
         assert!(!verify_cip_receipt(&req, "key"));
     }
@@ -2845,6 +6493,8 @@ mod tests {
         let st = AppState {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         };
         for bad_id in &[
             "",
@@ -2855,10 +6505,12 @@ mod tests {
             let resp = app(AppState {
                 repo: Arc::new(InMemoryRepo::new(vec![])),
                 env: Env::Production,
+                signing_key: None,
+                register_rate: new_register_rate(),
             })
             .oneshot(post_register(serde_json::json!({
                 "node_id": bad_id,
-                "endpoint": "https://test.example.com",
+                "endpoint": "https://1.1.1.1",
                 "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
             })))
             .await
@@ -2880,11 +6532,13 @@ mod tests {
         let st = AppState {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         };
         let resp = app(st)
             .oneshot(post_register(serde_json::json!({
                 "node_id": "my-custom-node-1",
-                "endpoint": "https://test.example.com",
+                "endpoint": "https://1.1.1.1",
                 "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
             })))
             .await
@@ -2902,10 +6556,12 @@ mod tests {
         let st = AppState {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         };
         let resp = app(st)
             .oneshot(post_register(serde_json::json!({
-                "endpoint": "https://ack-test.example.com",
+                "endpoint": "https://1.1.1.1",
                 "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
             })))
             .await
@@ -2977,6 +6633,8 @@ mod tests {
         let st = AppState {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
+            signing_key: None,
+            register_rate: new_register_rate(),
         };
         let body = serde_json::json!({
             "node_id": "self-node",
@@ -3096,5 +6754,153 @@ mod tests {
     fn get_client_ip_fallback_unknown() {
         let h = axum::http::HeaderMap::new();
         assert_eq!(get_client_ip(&h), "unknown");
+    }
+
+    // #494 behavior tests — fail without the health_models heartbeat wiring.
+
+    /// heartbeat with health_models stores the list on the node.
+    /// Fails if the heartbeat impl ignores the health_models parameter.
+    #[tokio::test]
+    async fn heartbeat_stores_health_models_when_provided() {
+        let st = test_state();
+        st.repo
+            .heartbeat(
+                "a",
+                0.1,
+                true,
+                0,
+                0,
+                0,
+                0.0,
+                Some(vec!["llama3:latest".into(), "qwen2.5:0.5b".into()]),
+            )
+            .await;
+        let n = st.repo.get("a").await.expect("node a");
+        assert_eq!(
+            n.health_models.as_deref(),
+            Some(["llama3:latest".to_string(), "qwen2.5:0.5b".to_string()].as_slice()),
+            "#494: health_models must be stored on heartbeat"
+        );
+    }
+
+    /// heartbeat with None leaves health_models untouched (backward compat).
+    /// Fails if None overwrites an existing health_models list.
+    #[tokio::test]
+    async fn heartbeat_none_health_models_preserves_existing_list() {
+        let st = test_state();
+        // First heartbeat sets the list.
+        st.repo
+            .heartbeat("a", 0.1, true, 0, 0, 0, 0.0, Some(vec!["model-x".into()]))
+            .await;
+        // Second heartbeat with None must NOT clear it.
+        st.repo.heartbeat("a", 0.2, true, 0, 0, 0, 0.0, None).await;
+        let n = st.repo.get("a").await.expect("node a");
+        assert_eq!(
+            n.health_models.as_deref(),
+            Some(["model-x".to_string()].as_slice()),
+            "#494: None health_models must not overwrite an existing list (backward compat)"
+        );
+    }
+
+    /// discover ?model= filter uses health_models when present.
+    /// Fails if the discover handler ignores the model query parameter.
+    #[tokio::test]
+    async fn discover_model_filter_uses_health_models() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1&model=not-loaded")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        // test_state nodes have no health_models and no static models[] matching "not-loaded"
+        // → both fall back to models[] (empty) → 0 results returned.
+        assert_eq!(
+            v["count"], 0,
+            "#494: ?model= filter must exclude nodes that do not serve the requested model"
+        );
+    }
+
+    /// discover without ?model= must exclude nodes with health_models=[] (explicitly empty).
+    /// Fails without the health_models=[] blanket-exclusion fix — DIR-TRUST-01 parity (#494).
+    #[tokio::test]
+    async fn discover_excludes_node_with_empty_health_models_unfiltered() {
+        let chat = "urn:iicp:intent:llm:chat:v1";
+        let node_with_empty_health = NodeRecord {
+            node: types::Node {
+                node_id: "empty-health".into(),
+                endpoint: "https://1.1.1.1".into(),
+                region: "eu".into(),
+                score: 0.9,
+                available: true,
+                load: 0.0,
+                active_jobs: 0,
+                max_concurrent: 4,
+                reputation_score: 0.8,
+                latency_estimate_ms: None,
+                completed_tasks_count: 0,
+                health_label: Some("healthy".into()),
+                exposure_mode: Some("direct_ipv4".into()),
+                reputation_tier: Some("gold".into()),
+                transport_endpoint: None,
+                cip_conformance_level: Some("CIP-None".into()),
+                models: vec!["qwen2.5:0.5b".into()],
+                pricing: None,
+                nat_type: None,
+                transport_method: None,
+                relay_capable: None,
+                sdk_language: None,
+                sdk_version: None,
+                address_family: None,
+                cip_policy: Some(
+                    serde_json::json!({"allow_remote_inference":false,"allow_tool_execution":false,"allow_file_access":false,"pricing_credits_per_1000":null}),
+                ),
+                quantization: vec![],
+                inference_engine: vec![],
+                public_key: None,
+                transport_metadata: None,
+                credit_cost_multiplier: 1.0,
+                pricing_model: Some("per_token".into()),
+                attested: false,
+                tasks_failed: 0,
+                transport: vec![],
+                reachability_signal: 1.0,
+                operator_pubkey: None,
+                operator_display_name: None,
+                operator_fingerprint: None,
+                operator_verified: false,
+                operator_trust_tier: None,
+                public_listing: false,
+                operator_url: None,
+                health_models: Some(vec![]), // explicitly empty — no models loaded
+            },
+            intents: vec![chat.into()],
+            node_token: None,
+            node_hmac_key: Some("test-hmac-key".into()),
+            proxy_token: None,
+        };
+        let mut st = test_state();
+        st.repo = Arc::new(InMemoryRepo::new(vec![node_with_empty_health]));
+        let resp = app(st)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(
+            v["count"], 0,
+            "#494: node with health_models=[] must be excluded from unfiltered discover (DIR-TRUST-01)"
+        );
     }
 }

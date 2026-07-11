@@ -9,8 +9,10 @@ use async_trait::async_trait;
 use sqlx::{mysql::MySqlPoolOptions, MySql, Pool};
 
 use crate::repo::{
-    AuditResult, ConformanceBadge, CreditError, CreditTransaction, DiscoverQuery, IntentSummary,
-    NodeRecord, NodeRepository, ProbeResult, ProxyObservation, RegistryStats,
+    operator_fingerprint, AuditResult, ConformanceBadge, CreditError, CreditSummary,
+    CreditTransaction, DiscoverQuery, EffectiveCreditBalance, EventRow, FounderEntry,
+    IntentSummary, NodeRecord, NodeRepository, OperatorWalletSummary, PendingFounderEntry,
+    ProbeResult, ProxyObservation, RegistryStats, WalletDebitResult,
 };
 use crate::reputation;
 use crate::types::Node;
@@ -118,6 +120,27 @@ struct NodeRow {
     public_reachable: bool,
     #[sqlx(default)]
     relay_capable: bool,
+    // #531 adoption telemetry — SDK provenance reported at registration.
+    #[sqlx(default)]
+    sdk_language: Option<String>,
+    #[sqlx(default)]
+    sdk_version: Option<String>,
+    // ADR-045 Phase A (#407) — verified operator identity binding (PHP parity, #385).
+    #[sqlx(default)]
+    operator_pubkey: Option<String>,
+    #[sqlx(default)]
+    operator_verified: bool,
+    #[sqlx(default)]
+    operator_trust_tier: Option<String>,
+    // WQ-058 / ADR-017 REG-01 — operator public-listing opt-in + advertised URL.
+    #[sqlx(default)]
+    public_listing: bool,
+    #[sqlx(default)]
+    operator_url: Option<String>,
+    // #494 — runtime model list from the node's last heartbeat. JSON-encoded array.
+    // null = not yet reported (backward compat); []/"[]" = no models live.
+    #[sqlx(default)]
+    health_models: Option<String>,
 }
 
 fn tier_from_score(s: f64) -> String {
@@ -132,6 +155,18 @@ fn tier_from_score(s: f64) -> String {
     } else {
         "bronze".into()
     }
+}
+
+/// Pure idle-determination for the 90-day TTL credit sink (the rule the sweep applies).
+///
+/// A node is "idle" — its unspent balance forfeit — when its newest earn's `expires_at`
+/// is strictly in the past AND it still holds a positive balance. A node with no earn rows
+/// carrying a TTL (`max_earn_expires_at_unix == None`) is NOT swept: its TTL is
+/// indeterminable, so we never expire on a guess (matches the PHP `expireIdleNodeCredits`
+/// which keys off determinable earn TTLs). Extracted as a pure fn so the rule is unit-tested
+/// in-process (the SQL sweep in `expire_idle_node_credits` encodes the same predicate).
+fn credit_ttl_idle(max_earn_expires_at_unix: Option<i64>, balance: f64, now_unix: i64) -> bool {
+    matches!(max_earn_expires_at_unix, Some(exp) if exp < now_unix) && balance > 0.0
 }
 
 impl From<NodeRow> for Node {
@@ -164,8 +199,8 @@ impl From<NodeRow> for Node {
             transport_method: None,
             // #385 — relay_capable now persisted (PHP discover emits it; NodeScorer:221).
             relay_capable: Some(r.relay_capable),
-            sdk_language: None,
-            sdk_version: None,
+            sdk_language: r.sdk_language,
+            sdk_version: r.sdk_version,
             address_family: None, // set at query time by detect_address_family
             cip_policy: Some(serde_json::json!({
                 "allow_remote_inference": false, "allow_tool_execution": false,
@@ -191,6 +226,20 @@ impl From<NodeRow> for Node {
                 r.public_reachable,
                 r.relay_capable,
             ),
+            // ADR-045 Phase A (#407/#385) — verified operator identity binding, persisted
+            // (migration 005); `#[sqlx(default)]` keeps SELECTs that omit the columns safe.
+            operator_pubkey: r.operator_pubkey,
+            operator_display_name: None,
+            operator_fingerprint: None,
+            operator_verified: r.operator_verified,
+            operator_trust_tier: r.operator_trust_tier,
+            public_listing: r.public_listing,
+            operator_url: r.operator_url,
+            // #494 — decode JSON-encoded health_models from DB (null → None, "[]" → Some([])).
+            health_models: r
+                .health_models
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
         }
     }
 }
@@ -284,8 +333,10 @@ impl NodeRepository for MySqlRepo {
         let _ = sqlx::query(
             r#"INSERT INTO nodes
                  (id, endpoint, region, available, relay_capable, node_token_hash, node_hmac_key,
-                  proxy_token_hash, max_concurrent, tokens_per_min, reputation_score, status)
-               VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active')
+                  proxy_token_hash, max_concurrent, tokens_per_min, reputation_score, status,
+                  operator_pubkey, operator_verified, operator_trust_tier,
+                  public_listing, operator_url)
+               VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?)
                ON DUPLICATE KEY UPDATE
                  endpoint           = VALUES(endpoint),
                  region             = VALUES(region),
@@ -294,7 +345,14 @@ impl NodeRepository for MySqlRepo {
                  status             = 'active',
                  node_token_hash    = VALUES(node_token_hash),
                  node_hmac_key      = VALUES(node_hmac_key),
-                 proxy_token_hash   = VALUES(proxy_token_hash)
+                 proxy_token_hash   = VALUES(proxy_token_hash),
+                 -- ADR-045 Phase A (#407/#385) — re-register rebinds the operator identity.
+                 operator_pubkey     = VALUES(operator_pubkey),
+                 operator_verified   = VALUES(operator_verified),
+                 operator_trust_tier = VALUES(operator_trust_tier),
+                 -- WQ-058 / ADR-017 REG-01 — re-register updates the public-listing opt-in.
+                 public_listing      = VALUES(public_listing),
+                 operator_url        = VALUES(operator_url)
                  -- reputation_score intentionally NOT updated (ADR-026 anti-laundering)"#,
         )
         .bind(&rec.node.node_id)
@@ -306,6 +364,11 @@ impl NodeRepository for MySqlRepo {
         .bind(&proxy_hash)
         .bind(rec.node.max_concurrent)
         .bind(reputation::STARTING_SCORE as f32)
+        .bind(&rec.node.operator_pubkey)
+        .bind(rec.node.operator_verified)
+        .bind(&rec.node.operator_trust_tier)
+        .bind(rec.node.public_listing)
+        .bind(&rec.node.operator_url)
         .execute(&self.pool)
         .await;
 
@@ -340,6 +403,7 @@ impl NodeRepository for MySqlRepo {
         tasks_delta: u32,
         tasks_failed_delta: u32,
         delta: f64,
+        health_models: Option<Vec<String>>,
     ) -> Option<f64> {
         // RT-01b (#381): fetch velocity window alongside score.
         let row: Option<(f32, f32, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
@@ -383,12 +447,18 @@ impl NodeRepository for MySqlRepo {
 
         let new_score = reputation::apply_delta(old_score_f32 as f64, effective_delta);
 
+        // #494 — encode health_models as JSON when the SDK reported a live list.
+        let health_models_json: Option<String> = health_models
+            .as_ref()
+            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".to_string()));
+
         let _ = sqlx::query(
-            "UPDATE nodes SET load = ?, available = ?, active_jobs = ?, \
+            "UPDATE nodes SET `load` = ?, available = ?, active_jobs = ?, \
              reputation_score = ?, tasks_total = tasks_total + ?, \
              tasks_failed = tasks_failed + ?, \
              rep_hourly_gain = ?, \
              rep_hourly_window_start = CASE WHEN ? = 1 THEN NOW() ELSE rep_hourly_window_start END, \
+             health_models = COALESCE(?, health_models), \
              status = 'active', last_seen = NOW() WHERE id = ?",
         )
         .bind(load as f32)
@@ -399,6 +469,7 @@ impl NodeRepository for MySqlRepo {
         .bind(tasks_failed_delta)
         .bind(new_hourly_gain as f32)
         .bind(reset_window as i32)
+        .bind(health_models_json)
         .bind(node_id)
         .execute(&self.pool)
         .await;
@@ -409,13 +480,40 @@ impl NodeRepository for MySqlRepo {
     /// Fetch a single node by id for the node-detail endpoint (iicp-dir §3.4.x).
     async fn get(&self, node_id: &str) -> Option<Node> {
         let row: Option<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, load, active_jobs,
+            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable
+                      public_reachable, relay_capable,
+                      operator_pubkey, operator_verified, operator_trust_tier
                FROM nodes WHERE id = ?"#,
         )
         .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        row.map(Node::from)
+    }
+
+    async fn node_by_prefix(&self, prefix: &str) -> Option<Node> {
+        // PHP RegistryController::show parity — exact id OR id-prefix (UUID 8-hex prefix or
+        // custom name), AVAILABLE only, exact match preferred. The website resolves node
+        // detail by 8-hex prefix, so exact-only get() would 404 those.
+        let row: Option<NodeRow> = sqlx::query_as(
+            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
+                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
+                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable,
+                      operator_pubkey, operator_verified, operator_trust_tier
+               FROM nodes
+               WHERE (id = ? OR id LIKE CONCAT(?, '%')) AND available = 1
+               ORDER BY (id = ?) DESC
+               LIMIT 1"#,
+        )
+        .bind(prefix)
+        .bind(prefix)
+        .bind(prefix)
         .fetch_optional(&self.pool)
         .await
         .ok()
@@ -441,10 +539,10 @@ impl NodeRepository for MySqlRepo {
     /// Bootstrap: return recently-seen active nodes sorted by last_seen desc (iicp-dir §3.7).
     async fn bootstrap(&self, limit: usize) -> Vec<Node> {
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, load, active_jobs,
+            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable
+                      public_reachable, relay_capable, sdk_language, sdk_version
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -463,7 +561,7 @@ impl NodeRepository for MySqlRepo {
     /// as `bootstrap`/`active_count`, no LIMIT.
     async fn active_nodes(&self) -> Vec<Node> {
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, load, active_jobs,
+            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
                       public_reachable, relay_capable
@@ -519,7 +617,7 @@ impl NodeRepository for MySqlRepo {
         // Build the NOT IN clause dynamically — known_ids is caller-bounded (max 20).
         if known_ids.is_empty() {
             let rows: Vec<NodeRow> = sqlx::query_as(
-                r#"SELECT id, endpoint, region, reputation_score, available, load, active_jobs,
+                r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                           max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                           credit_cost_multiplier, pricing_model, attested, tasks_failed,
                       public_reachable, relay_capable
@@ -539,7 +637,7 @@ impl NodeRepository for MySqlRepo {
         // Fetch all candidates and filter in Rust to avoid dynamic SQL binding complexity.
         // known_ids is bounded (max 20) so this is safe — no unbounded IN clause.
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, load, active_jobs,
+            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
                       public_reachable, relay_capable
@@ -563,17 +661,35 @@ impl NodeRepository for MySqlRepo {
     /// Expire stale nodes — mark available=0 and status='dormant' for nodes whose
     /// last_seen is older than 90 seconds. Called every 60s by the background task.
     /// Mirrors PHP `ExpireStaleNodes` command; returns count of nodes affected.
-    async fn expire_stale(&self) -> u32 {
-        let result = sqlx::query(
-            "UPDATE nodes \
-             SET available = 0, status = 'dormant', dormant_since = NOW() \
+    async fn expire_stale(&self) -> Vec<String> {
+        // Fetch IDs before updating so EVICT events can be emitted per node (#508).
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM nodes \
              WHERE status = 'active' \
                AND last_seen IS NOT NULL \
                AND last_seen < NOW() - INTERVAL 90 SECOND",
         )
-        .execute(&self.pool)
-        .await;
-        result.map(|r| r.rows_affected() as u32).unwrap_or(0)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        if ids.is_empty() {
+            return vec![];
+        }
+
+        let id_list: Vec<&str> = ids.iter().map(|(id,)| id.as_str()).collect();
+        let placeholders = id_list.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE nodes SET available = 0, status = 'dormant', dormant_since = NOW() \
+             WHERE id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in &id_list {
+            q = q.bind(*id);
+        }
+        let _ = q.execute(&self.pool).await;
+
+        ids.into_iter().map(|(id,)| id).collect()
     }
 
     /// Reputation decay — apply -0.005 per pass (hourly), floor 0.30.
@@ -589,18 +705,22 @@ impl NodeRepository for MySqlRepo {
         result.map(|r| r.rows_affected() as u32).unwrap_or(0)
     }
 
-    /// Public node listing (ADR-017 opt-in registry, iicp-dir §3.10a).
-    /// Endpoint is NOT returned — public_listing=1 nodes only.
+    /// Public node listing (ADR-017 registry, iicp-dir §3.10a). Mirrors the PHP
+    /// `RegistryController::index` filter: active + available nodes (NOT gated on
+    /// `public_listing` — that flag only controls `operator_url` exposure, REG-01).
+    /// A node registered via the federation event log (`last_seen` still NULL) counts
+    /// as active, so replicated nodes surface here. Endpoint is NOT returned.
     async fn list_public(&self, offset: u64, limit: usize) -> Vec<Node> {
         let cap = limit.min(100) as u32;
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, load, active_jobs,
+            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable
+                      public_reachable, relay_capable, public_listing, operator_url
                FROM nodes
-               WHERE public_listing = 1
-               ORDER BY reputation_score DESC
+               WHERE available = 1
+                 AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
+               ORDER BY last_seen DESC
                LIMIT ? OFFSET ?"#,
         )
         .bind(cap)
@@ -677,13 +797,173 @@ impl NodeRepository for MySqlRepo {
 
     /// Credit balance from the denormalized nodes.credit_balance column (W-042 D1prime).
     async fn credit_balance(&self, node_id: &str) -> Option<f64> {
-        let row: Option<(f64,)> = sqlx::query_as("SELECT credit_balance FROM nodes WHERE id = ?")
-            .bind(node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten();
+        // CAST AS DOUBLE: credit_balance is DECIMAL(15,4); sqlx cannot decode DECIMAL
+        // straight into f64, so the bare SELECT errored → None → spurious 404 on every
+        // credits endpoint. The cast yields a DOUBLE that decodes cleanly. (#456)
+        let row: Option<(f64,)> =
+            sqlx::query_as("SELECT CAST(credit_balance AS DOUBLE) FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
         row.map(|(b,)| b)
+    }
+
+    async fn credit_summary(&self, node_id: &str) -> Option<CreditSummary> {
+        let balance = self.credit_balance(node_id).await?;
+        // CAST AS DOUBLE so the DECIMAL(15,4) sum decodes straight into f64 (matches the
+        // credit_balance read path); COALESCE handles the no-rows NULL → 0.
+        let earned: (f64,) = sqlx::query_as(
+            "SELECT CAST(COALESCE(SUM(amount), 0) AS DOUBLE) FROM credit_transactions \
+             WHERE node_id = ? AND type = 'credit'",
+        )
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0,));
+        let spent: (f64,) = sqlx::query_as(
+            "SELECT CAST(COALESCE(SUM(amount), 0) AS DOUBLE) FROM credit_transactions \
+             WHERE node_id = ? AND type = 'debit'",
+        )
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0,));
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM credit_transactions WHERE node_id = ?")
+                .bind(node_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or((0,));
+        Some(CreditSummary {
+            balance,
+            total_earned: earned.0,
+            total_spent: spent.0,
+            tx_count: count.0 as u64,
+        })
+    }
+
+    async fn operator_wallet(&self, node_id: &str) -> Option<(f64, u32)> {
+        // #466 v1 — resolve the node's operator_pubkey; null wallet if unbound. Mirrors PHP
+        // CreditsController::operatorWallet (keyed on operator_pubkey presence, not verified).
+        let op: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT operator_pubkey FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let operator_pubkey = op.and_then(|(p,)| p).filter(|p| !p.is_empty())?;
+
+        // Aggregate balance + count over the operator's non-archived nodes. CAST AS DOUBLE so
+        // the DECIMAL(15,4) sum decodes into f64 (same fix as credit_balance/credit_summary).
+        let agg: (f64, i64) = sqlx::query_as(
+            "SELECT CAST(COALESCE(SUM(credit_balance), 0) AS DOUBLE), COUNT(*) \
+             FROM nodes WHERE operator_pubkey = ? AND status != 'archived'",
+        )
+        .bind(&operator_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0, 0));
+        Some((agg.0, agg.1 as u32))
+    }
+
+    async fn operator_wallet_summary(&self, node_id: &str) -> Option<OperatorWalletSummary> {
+        let op: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT operator_pubkey FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let operator_pubkey = op.and_then(|(p,)| p).filter(|p| !p.is_empty())?;
+
+        let agg: (f64, i64) = sqlx::query_as(
+            "SELECT CAST(COALESCE(SUM(credit_balance), 0) AS DOUBLE), COUNT(*) \
+             FROM nodes WHERE operator_pubkey = ? AND status != 'archived'",
+        )
+        .bind(&operator_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0, 0));
+
+        let earned: (f64,) = sqlx::query_as(
+            "SELECT CAST(COALESCE(SUM(ct.amount), 0) AS DOUBLE) \
+             FROM credit_transactions ct JOIN nodes n ON n.id = ct.node_id \
+             WHERE n.operator_pubkey = ? AND n.status != 'archived' AND ct.type = 'credit'",
+        )
+        .bind(&operator_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0,));
+        let spent: (f64,) = sqlx::query_as(
+            "SELECT CAST(COALESCE(SUM(ct.amount), 0) AS DOUBLE) \
+             FROM credit_transactions ct JOIN nodes n ON n.id = ct.node_id \
+             WHERE n.operator_pubkey = ? AND n.status != 'archived' AND ct.type = 'debit'",
+        )
+        .bind(&operator_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0,));
+        let tx_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM credit_transactions ct JOIN nodes n ON n.id = ct.node_id \
+             WHERE n.operator_pubkey = ? AND n.status != 'archived'",
+        )
+        .bind(&operator_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0,));
+
+        Some(OperatorWalletSummary {
+            total_balance: agg.0,
+            total_earned: earned.0,
+            total_spent: spent.0,
+            tx_count: tx_count.0 as u64,
+            node_count: agg.1 as u32,
+            reconciles: (agg.0 - (earned.0 - spent.0)).abs() < 0.0001,
+            operator_fingerprint: operator_fingerprint(&operator_pubkey),
+        })
+    }
+
+    async fn effective_credit_balance(&self, node_id: &str) -> Option<EffectiveCreditBalance> {
+        let consumer_balance = self.credit_balance(node_id).await?;
+        let op: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT operator_pubkey FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let Some(operator_pubkey) = op.and_then(|(p,)| p).filter(|p| !p.is_empty()) else {
+            return Some(EffectiveCreditBalance {
+                consumer_balance,
+                effective_balance: consumer_balance,
+                balance_scope: "node",
+                operator_wallet_balance: None,
+            });
+        };
+
+        let wallet: (f64,) = sqlx::query_as(
+            "SELECT CAST(COALESCE(SUM(n.credit_balance), 0) AS DOUBLE) \
+             FROM nodes n WHERE n.operator_pubkey = ? AND n.status != 'archived' \
+             AND n.credit_balance > 0 AND ( \
+               EXISTS (SELECT 1 FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NULL) \
+               OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) IS NULL \
+               OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) > NOW() \
+             )",
+        )
+        .bind(&operator_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0,));
+
+        Some(EffectiveCreditBalance {
+            consumer_balance,
+            effective_balance: wallet.0,
+            balance_scope: "operator_wallet",
+            operator_wallet_balance: Some(wallet.0),
+        })
     }
 
     /// Archive dormant nodes older than `days_threshold` days.
@@ -776,9 +1056,11 @@ impl NodeRepository for MySqlRepo {
             return Err(CreditError::NonceReplay);
         }
 
+        // WQ-056 / billing §11: an earn stamps the credit TTL horizon (NOW() + 90 DAY).
+        // The nightly run_expire_credits_loop sweeps nodes whose newest earn is past TTL.
         sqlx::query(
-            "INSERT INTO credit_transactions (node_id, amount, type, task_id, nonce, reason) \
-             VALUES (?, ?, 'credit', ?, ?, 'cip_award')",
+            "INSERT INTO credit_transactions (node_id, amount, type, task_id, nonce, reason, expires_at) \
+             VALUES (?, ?, 'credit', ?, ?, 'cip_award', NOW() + INTERVAL 90 DAY)",
         )
         .bind(node_id)
         .bind(amount)
@@ -797,15 +1079,260 @@ impl NodeRepository for MySqlRepo {
 
         tx.commit().await.map_err(|_| CreditError::DbError)?;
 
-        // Fetch updated balance.
-        let row: Option<(f64,)> = sqlx::query_as("SELECT credit_balance FROM nodes WHERE id = ?")
-            .bind(node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten();
+        // Fetch updated balance. CAST AS DOUBLE — credit_balance is DECIMAL(15,4) and sqlx
+        // cannot decode DECIMAL straight into f64, so a bare SELECT errored → None → the award
+        // (already committed above) wrongly returned CreditError → 500, and the signed
+        // CREDIT_AWARD event was never emitted (#459 bug A). Same fix as credit_balance().
+        let row: Option<(f64,)> =
+            sqlx::query_as("SELECT CAST(credit_balance AS DOUBLE) FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
         row.map(|(b,)| Ok(b))
             .unwrap_or(Err(CreditError::NodeNotFound))
+    }
+
+    async fn debit_for_consumer(
+        &self,
+        consumer_node_id: &str,
+        amount: f64,
+        task_id: &str,
+        reason: &str,
+    ) -> WalletDebitResult {
+        let op: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT operator_pubkey FROM nodes WHERE id = ?")
+                .bind(consumer_node_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+
+        let Some(operator_pubkey) = op.and_then(|(p,)| p).filter(|p| !p.is_empty()) else {
+            let Ok(mut tx) = self.pool.begin().await else {
+                return WalletDebitResult {
+                    debited: false,
+                    spent: 0.0,
+                    scope: "node",
+                    reason: Some("db_error"),
+                    debit_count: 0,
+                };
+            };
+            let updated = sqlx::query(
+                "UPDATE nodes SET credit_balance = credit_balance - ? \
+                 WHERE id = ? AND credit_balance + 0.0001 >= ?",
+            )
+            .bind(amount)
+            .bind(consumer_node_id)
+            .bind(amount)
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .unwrap_or(false);
+            if !updated {
+                let _ = tx.rollback().await;
+                return WalletDebitResult {
+                    debited: false,
+                    spent: 0.0,
+                    scope: "node",
+                    reason: Some("insufficient_balance"),
+                    debit_count: 0,
+                };
+            }
+            let inserted = sqlx::query(
+                "INSERT INTO credit_transactions (node_id, amount, type, task_id, reason) \
+                 VALUES (?, ?, 'debit', ?, ?)",
+            )
+            .bind(consumer_node_id)
+            .bind(amount)
+            .bind(task_id)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await
+            .is_ok();
+            if inserted && tx.commit().await.is_ok() {
+                return WalletDebitResult {
+                    debited: true,
+                    spent: amount,
+                    scope: "node",
+                    reason: None,
+                    debit_count: 1,
+                };
+            }
+            return WalletDebitResult {
+                debited: false,
+                spent: 0.0,
+                scope: "node",
+                reason: Some("db_error"),
+                debit_count: 0,
+            };
+        };
+
+        let Ok(mut tx) = self.pool.begin().await else {
+            return WalletDebitResult {
+                debited: false,
+                spent: 0.0,
+                scope: "operator_wallet",
+                reason: Some("db_error"),
+                debit_count: 0,
+            };
+        };
+
+        let candidates: Vec<(String, f64, Option<i64>)> = sqlx::query_as(
+            "SELECT n.id, CAST(n.credit_balance AS DOUBLE), \
+                    UNIX_TIMESTAMP((SELECT MIN(ct.expires_at) FROM credit_transactions ct \
+                                    WHERE ct.node_id = n.id AND ct.type = 'credit' \
+                                      AND ct.expires_at IS NOT NULL AND ct.expires_at > NOW())) AS horizon \
+             FROM nodes n WHERE n.operator_pubkey = ? AND n.status != 'archived' \
+             AND n.credit_balance > 0 AND ( \
+               EXISTS (SELECT 1 FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NULL) \
+               OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) IS NULL \
+               OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) > NOW() \
+             ) ORDER BY horizon IS NULL, horizon, n.id FOR UPDATE",
+        )
+        .bind(&operator_pubkey)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_default();
+
+        let available: f64 = candidates.iter().map(|(_, balance, _)| *balance).sum();
+        if available + 0.0001 < amount {
+            let _ = tx.rollback().await;
+            return WalletDebitResult {
+                debited: false,
+                spent: 0.0,
+                scope: "operator_wallet",
+                reason: Some("insufficient_operator_wallet_balance"),
+                debit_count: 0,
+            };
+        }
+
+        let mut remaining = amount;
+        let mut debit_count = 0_u32;
+        for (node_id, balance, _) in candidates {
+            if remaining <= 0.00005 {
+                break;
+            }
+            let take = remaining.min(balance);
+            let tx_reason = if node_id == consumer_node_id {
+                reason.to_string()
+            } else {
+                format!(
+                    "{reason}:operator_wallet:consumer={}",
+                    &consumer_node_id[..consumer_node_id.len().min(8)]
+                )
+            };
+            let ok_update =
+                sqlx::query("UPDATE nodes SET credit_balance = credit_balance - ? WHERE id = ?")
+                    .bind(take)
+                    .bind(&node_id)
+                    .execute(&mut *tx)
+                    .await
+                    .is_ok();
+            let ok_insert = sqlx::query(
+                "INSERT INTO credit_transactions (node_id, amount, type, task_id, reason) \
+                 VALUES (?, ?, 'debit', ?, ?)",
+            )
+            .bind(&node_id)
+            .bind(take)
+            .bind(task_id)
+            .bind(tx_reason)
+            .execute(&mut *tx)
+            .await
+            .is_ok();
+            if !ok_update || !ok_insert {
+                let _ = tx.rollback().await;
+                return WalletDebitResult {
+                    debited: false,
+                    spent: 0.0,
+                    scope: "operator_wallet",
+                    reason: Some("db_error"),
+                    debit_count: 0,
+                };
+            }
+            remaining -= take;
+            debit_count += 1;
+        }
+
+        if remaining <= 0.0001 && tx.commit().await.is_ok() {
+            WalletDebitResult {
+                debited: true,
+                spent: amount,
+                scope: "operator_wallet",
+                reason: None,
+                debit_count,
+            }
+        } else {
+            WalletDebitResult {
+                debited: false,
+                spent: 0.0,
+                scope: "operator_wallet",
+                reason: Some("db_error"),
+                debit_count: 0,
+            }
+        }
+    }
+
+    async fn expire_idle_node_credits(&self) -> (u64, f64) {
+        // WQ-056 / billing §11.3 — the 90-day TTL sink. Idle = a node whose newest earn's
+        // expires_at is past AND credit_balance > 0 (see credit_ttl_idle). Sweep: zero the
+        // balance + write one ttl_expire debit per node. Idempotent (a swept node is at 0,
+        // so a re-run finds nothing); a fresh earn resets the TTL forward, removing it.
+        // Fetch candidates (balance > 0) with their newest-earn TTL + the DB's own clock
+        // (both as unix seconds, so there is no Rust↔DB clock skew), then apply the
+        // load-bearing pure predicate `credit_ttl_idle` to decide. UNIX_TIMESTAMP(NULL)
+        // → NULL → None (a node with no determinable earn TTL is never swept).
+        let candidates: Vec<(String, f64, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT n.id, CAST(n.credit_balance AS DOUBLE), \
+                    UNIX_TIMESTAMP((SELECT MAX(ct.expires_at) FROM credit_transactions ct \
+                                    WHERE ct.node_id = n.id AND ct.type = 'credit')), \
+                    UNIX_TIMESTAMP() \
+             FROM nodes n \
+             WHERE n.credit_balance > 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut expired_nodes: u64 = 0;
+        let mut expired_credits: f64 = 0.0;
+        for (node_id, balance, max_earn_expires_unix, now_unix) in candidates {
+            if !credit_ttl_idle(max_earn_expires_unix, balance, now_unix) {
+                continue;
+            }
+            let Ok(mut tx) = self.pool.begin().await else {
+                continue;
+            };
+            // Re-read + zero under the transaction; insert the ttl_expire debit for the
+            // swept amount (mirrors the PHP expire row; preserves balance==earned−debits).
+            let ok = sqlx::query(
+                "UPDATE nodes SET credit_balance = 0 WHERE id = ? AND credit_balance > 0",
+            )
+            .bind(&node_id)
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .unwrap_or(false);
+            if !ok {
+                let _ = tx.rollback().await;
+                continue;
+            }
+            let inserted = sqlx::query(
+                "INSERT INTO credit_transactions (node_id, amount, type, reason) \
+                 VALUES (?, ?, 'debit', 'ttl_expire')",
+            )
+            .bind(&node_id)
+            .bind(balance)
+            .execute(&mut *tx)
+            .await
+            .is_ok();
+            if inserted && tx.commit().await.is_ok() {
+                expired_nodes += 1;
+                expired_credits += balance;
+            }
+        }
+        (expired_nodes, expired_credits)
     }
 
     async fn credit_transactions(
@@ -998,8 +1525,8 @@ impl NodeRepository for MySqlRepo {
             let level = if p.level.is_empty() { "info" } else { &p.level };
             let result = sqlx::query(
                 "INSERT INTO iicp_telemetry_probes \
-                 (run_id, probe_id, probe_type, test_id, level, passed, latency_ms, detail) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (run_id, probe_id, probe_type, test_id, level, passed, latency_ms, detail, node_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&p.run_id)
             .bind(&p.probe_id)
@@ -1009,6 +1536,7 @@ impl NodeRepository for MySqlRepo {
             .bind(p.passed)
             .bind(p.latency_ms)
             .bind(p.detail.as_deref())
+            .bind(p.node_id.as_deref()) // #373 — per-node attribution (null for infra probes)
             .execute(&self.pool)
             .await;
             if result.is_ok() {
@@ -1019,21 +1547,20 @@ impl NodeRepository for MySqlRepo {
         count
     }
 
-    async fn credit_quote(&self, intent: &str) -> f64 {
-        let row: Option<(f64,)> = sqlx::query_as(
-            r#"SELECT COALESCE(AVG(n.credit_cost_multiplier), 1.0)
+    async fn quote_multipliers(&self, intent: &str, min_reputation: f64) -> Vec<f64> {
+        let rows: Vec<(f64,)> = sqlx::query_as(
+            r#"SELECT CAST(n.credit_cost_multiplier AS DOUBLE)
                FROM nodes n
                INNER JOIN capabilities c ON c.node_id = n.id
-               WHERE c.intent = ? AND n.available = 1
+               WHERE c.intent = ? AND n.available = 1 AND n.reputation_score >= ?
                  AND (n.last_seen IS NULL OR n.last_seen >= NOW() - INTERVAL 90 SECOND)"#,
         )
         .bind(intent)
-        .fetch_optional(&self.pool)
+        .bind(min_reputation)
+        .fetch_all(&self.pool)
         .await
-        .ok()
-        .flatten();
-        row.and_then(|(v,)| if v.is_nan() { None } else { Some(v) })
-            .unwrap_or(1.0)
+        .unwrap_or_default();
+        rows.into_iter().map(|(m,)| m).collect()
     }
 
     /// ProxyTokenAuth: verify bearer token against nodes.proxy_token_hash via bcrypt.
@@ -1186,6 +1713,403 @@ impl NodeRepository for MySqlRepo {
         self.list_badges(Some(tier)).await.into_iter().next()
     }
 
+    async fn upsert_health_observation(
+        &self,
+        node_id: &str,
+        evaluator_did: &str,
+        score: f64,
+        evaluated_at_ms: i64,
+    ) -> bool {
+        // Monotonic staleness rule (ADR-048): an older evaluated_at_ms never overwrites a
+        // newer stored snapshot. The IF/GREATEST guards make a stale replay a no-op (0 rows
+        // affected → false); a fresh insert is 1, a newer update is 2 → both true.
+        let result = sqlx::query(
+            "INSERT INTO node_health_observations \
+                (node_id, evaluator_did, score, evaluated_at_ms, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NOW(), NOW()) \
+             ON DUPLICATE KEY UPDATE \
+                score = IF(VALUES(evaluated_at_ms) > evaluated_at_ms, VALUES(score), score), \
+                evaluated_at_ms = GREATEST(evaluated_at_ms, VALUES(evaluated_at_ms)), \
+                updated_at = IF(VALUES(evaluated_at_ms) > evaluated_at_ms, NOW(), updated_at)",
+        )
+        .bind(node_id)
+        .bind(evaluator_did)
+        .bind(score)
+        .bind(evaluated_at_ms)
+        .execute(&self.pool)
+        .await;
+        result.map(|r| r.rows_affected() > 0).unwrap_or(false)
+    }
+
+    async fn all_health_observations(&self) -> Vec<(String, String, f64, i64)> {
+        sqlx::query_as(
+            "SELECT node_id, evaluator_did, score, CAST(evaluated_at_ms AS SIGNED) \
+             FROM node_health_observations",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn set_reputation_score(&self, node_id: &str, score: f64) -> bool {
+        // #441: absolute set from a REPUTATION_DECAY event (clamped to [0,1], like the seed).
+        sqlx::query("UPDATE nodes SET reputation_score = ? WHERE id = ?")
+            .bind(score.clamp(0.0, 1.0))
+            .bind(node_id)
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .unwrap_or(false)
+    }
+
+    async fn set_credit_balance(&self, node_id: &str, balance: f64) -> bool {
+        // #441: absolute set from a CREDIT_AWARD event (the seed already computed new_balance).
+        sqlx::query("UPDATE nodes SET credit_balance = ? WHERE id = ?")
+            .bind(balance)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .unwrap_or(false)
+    }
+
+    async fn upsert_replica(
+        &self,
+        replica_id: &str,
+        did: &str,
+        endpoint: &str,
+        trust_tier: &str,
+    ) -> bool {
+        // #441: upsert by DID (mirrors PHP Replica::updateOrCreate(['did'=>...])). The replica
+        // didn't issue the token, so replica_token_hash stays ''. 90-day expiry like PHP.
+        sqlx::query(
+            "INSERT INTO replicas \
+                (replica_id, did, endpoint, trust_tier, replica_token_hash, expires_at, last_seen_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, '', NOW() + INTERVAL 90 DAY, NOW(), NOW(), NOW()) \
+             ON DUPLICATE KEY UPDATE \
+                replica_id = VALUES(replica_id), endpoint = VALUES(endpoint), \
+                trust_tier = VALUES(trust_tier), last_seen_at = NOW(), updated_at = NOW()",
+        )
+        .bind(replica_id)
+        .bind(did)
+        .bind(endpoint)
+        .bind(trust_tier)
+        .execute(&self.pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+    }
+
+    async fn all_replicas(&self) -> Vec<(String, String, String, String, i64)> {
+        // UNIX_TIMESTAMP returns NULL when created_at is NULL; fall back to 0.
+        sqlx::query_as(
+            "SELECT replica_id, did, endpoint, trust_tier, \
+             CAST(COALESCE(UNIX_TIMESTAMP(created_at) * 1000, 0) AS SIGNED) \
+             FROM replicas",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn append_signed_event(
+        &self,
+        secret_key_hex: &str,
+        event_type: &str,
+        node_id: &str,
+        payload: &serde_json::Value,
+    ) -> Option<i64> {
+        // Next monotonic seq (parity with PHP NodeEventLogger: max(seq)+1).
+        // CAST AS SIGNED: seq is BIGINT UNSIGNED; sqlx's strict decode fails decoding an
+        // unsigned column into i64, and the `.ok()?` silently swallowed it → early-return
+        // None → NO event ever persisted (the signed event log stayed empty). (#459 bug C)
+        // Next monotonic seq + the predecessor's signature, for the hash-chain (#458). The
+        // tip row (MAX(seq)) is the immediate predecessor; its signature seeds this event's
+        // prev_hash. NULL/empty (no prior signed event) → chain starts at GENESIS_ROOT.
+        let (max_seq, prev_sig): (i64, Option<String>) = sqlx::query_as(
+            "SELECT CAST(COALESCE(MAX(seq), 0) AS SIGNED), \
+             (SELECT signature FROM node_events ORDER BY seq DESC LIMIT 1) FROM node_events",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .ok()?;
+        let seq = max_seq + 1;
+        let prev_hash = crate::federation::prev_hash_from(prev_sig.as_deref());
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let sig = crate::federation::sign_event(
+            secret_key_hex,
+            &event_id,
+            event_type,
+            seq,
+            ts_ms,
+            payload,
+            &prev_hash,
+        );
+        sqlx::query(
+            "INSERT INTO node_events (event_id, seq, event_type, node_id, ts_ms, payload, prev_hash, signature) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&event_id)
+        .bind(seq)
+        .bind(event_type)
+        .bind(node_id)
+        .bind(ts_ms)
+        .bind(payload.to_string())
+        .bind(&prev_hash)
+        .bind(&sig)
+        .execute(&self.pool)
+        .await
+        .ok()?;
+        Some(seq)
+    }
+
+    async fn upsert_operator(
+        &self,
+        operator_pubkey: &str,
+        display_name: Option<&str>,
+        attested_created_at: Option<&str>,
+        integrity_hash: Option<&str>,
+    ) {
+        // First insert pins integrity_hash + the directory-observed first_seen_ms (authoritative
+        // for founder ordinals); a later (delegated, key-proven) register updates only the
+        // mutable display_name. Fail-safe — errors are swallowed (never abort registration).
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
+                .bind(operator_pubkey)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if exists.is_some() {
+            if let Some(dn) = display_name {
+                let _ = sqlx::query(
+                    "UPDATE operators SET display_name = ?, updated_at = NOW() WHERE operator_pubkey = ?",
+                )
+                .bind(dn)
+                .bind(operator_pubkey)
+                .execute(&self.pool)
+                .await;
+            }
+            return;
+        }
+        let first_seen_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let _ = sqlx::query(
+            "INSERT INTO operators (operator_pubkey, display_name, attested_created_at, \
+             operator_integrity_hash, first_seen_ms, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, NOW(), NOW())",
+        )
+        .bind(operator_pubkey)
+        .bind(display_name)
+        .bind(attested_created_at)
+        .bind(integrity_hash)
+        .bind(first_seen_ms)
+        .execute(&self.pool)
+        .await;
+    }
+
+    async fn operator_display_name(&self, operator_pubkey: &str) -> Option<String> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT display_name FROM operators WHERE operator_pubkey = ? LIMIT 1")
+                .bind(operator_pubkey)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        row.and_then(|r| r.0)
+    }
+
+    async fn operator_display_name_claimed_by_other(
+        &self,
+        operator_pubkey: &str,
+        normalized_display_name: &str,
+    ) -> bool {
+        // MySQL LOWER(TRIM(REGEXP_REPLACE())) parity with PHP's whitespace-folded comparison.
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM operators \
+             WHERE operator_pubkey <> ? AND display_name IS NOT NULL \
+             AND LOWER(TRIM(REGEXP_REPLACE(display_name, '[[:space:]]+', ' '))) = ? \
+             LIMIT 1",
+        )
+        .bind(operator_pubkey)
+        .bind(normalized_display_name)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        row.is_some()
+    }
+
+    async fn rename_operator(&self, operator_pubkey: &str, display_name: &str) -> bool {
+        // Existence check first (never create here) — and so a rename to the SAME name
+        // still returns true (MySQL UPDATE reports 0 rows_affected when unchanged).
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
+                .bind(operator_pubkey)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if exists.is_none() {
+            return false;
+        }
+        let _ = sqlx::query(
+            "UPDATE operators SET display_name = ?, updated_at = NOW() WHERE operator_pubkey = ?",
+        )
+        .bind(display_name)
+        .bind(operator_pubkey)
+        .execute(&self.pool)
+        .await;
+        true
+    }
+
+    async fn set_operator_recognition(
+        &self,
+        operator_pubkey: &str,
+        ordinal: i64,
+        tier: Option<&str>,
+        badge: Option<&str>,
+    ) {
+        let _ = sqlx::query(
+            "UPDATE operators SET ordinal = ?, tier = ?, badge = ?, updated_at = NOW() \
+             WHERE operator_pubkey = ?",
+        )
+        .bind(ordinal)
+        .bind(tier)
+        .bind(badge)
+        .bind(operator_pubkey)
+        .execute(&self.pool)
+        .await;
+    }
+
+    async fn list_founders(&self, limit: u32) -> Vec<FounderEntry> {
+        let rows: Vec<(Option<String>, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT display_name, CAST(ordinal AS SIGNED), tier, badge FROM operators \
+             WHERE ordinal IS NOT NULL ORDER BY ordinal ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(display_name, ordinal, tier, badge)| FounderEntry {
+                display_name,
+                ordinal,
+                tier,
+                badge,
+            })
+            .collect()
+    }
+
+    /// Provisional founders (board `pending` section): operators with no ordinal whose
+    /// genuine served node passes the same trailing-24h gate the PHP lock-in detector uses
+    /// (operator_verified + public_reachable + active/available OR seen within 24h).
+    async fn list_pending_founders(&self, limit: u32) -> Vec<PendingFounderEntry> {
+        let rows: Vec<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT o.display_name, CAST(o.first_seen_ms AS SIGNED) FROM operators o \
+             WHERE o.ordinal IS NULL AND o.first_seen_ms IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM nodes n \
+                           WHERE n.operator_pubkey = o.operator_pubkey \
+                             AND n.public_reachable = 1 AND n.operator_verified = 1 \
+                             AND ((n.status = 'active' AND n.available = 1) \
+                                  OR n.last_seen >= NOW() - INTERVAL 1 DAY)) \
+             ORDER BY o.first_seen_ms ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(display_name, first_seen_ms)| PendingFounderEntry {
+                display_name,
+                first_seen_ms,
+            })
+            .collect()
+    }
+
+    async fn events_since(&self, since_seq: i64, limit: u32) -> Vec<EventRow> {
+        // CAST payload to CHAR — sqlx is built without the `json` feature here, so the JSON
+        // column is read as text and parsed with serde_json.
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT CAST(seq AS SIGNED), event_id, event_type, node_id, \
+                        CAST(ts_ms AS SIGNED), CAST(payload AS CHAR), prev_hash, signature \
+                 FROM node_events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(since_seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(
+                |(seq, event_id, event_type, node_id, ts_ms, payload, prev_hash, sig)| EventRow {
+                    seq,
+                    event_id,
+                    event_type,
+                    node_id,
+                    ts_ms,
+                    payload: payload
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or(serde_json::Value::Null),
+                    prev_hash,
+                    sig,
+                },
+            )
+            .collect()
+    }
+
+    async fn snapshot_records(&self) -> Vec<NodeRecord> {
+        // All nodes (the active_nodes row-map without the liveness WHERE) + their intents.
+        let rows: Vec<NodeRow> = sqlx::query_as(
+            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
+                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
+                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable
+               FROM nodes"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        let caps: Vec<(String, String)> =
+            sqlx::query_as("SELECT node_id, intent FROM capabilities")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+        let mut intents: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (nid, intent) in caps {
+            intents.entry(nid).or_default().push(intent);
+        }
+        rows.into_iter()
+            .map(|r| {
+                let node = Node::from(r);
+                let node_intents = intents.get(&node.node_id).cloned().unwrap_or_default();
+                NodeRecord {
+                    node,
+                    intents: node_intents,
+                    node_token: None,
+                    node_hmac_key: None,
+                    proxy_token: None,
+                }
+            })
+            .collect()
+    }
+
     async fn rotate_reputation_windows(&self) -> u32 {
         // Reset rolling window for nodes where recent_window_start < NOW() - 90 days.
         // Snapshot current rolling fields to reputation_score history is implicit — the
@@ -1307,6 +2231,115 @@ impl NodeRepository for MySqlRepo {
         .await;
     }
 
+    async fn probe_active_count_and_regions(&self) -> (i64, Vec<String>) {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM probe_tokens \
+             WHERE last_seen_at IS NOT NULL \
+               AND last_seen_at >= NOW() - INTERVAL 2 HOUR",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0,));
+
+        let regions: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT region FROM probe_tokens \
+             WHERE region IS NOT NULL \
+               AND last_seen_at IS NOT NULL \
+               AND last_seen_at >= NOW() - INTERVAL 2 HOUR \
+             ORDER BY region",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        (count.0, regions.into_iter().map(|(r,)| r).collect())
+    }
+
+    async fn probe_aggregate_24h(&self) -> crate::repo::ProbeAggregate24h {
+        // Read most-recent value per metric for window='24h' from iicp_telemetry_aggregates.
+        let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
+            "SELECT t1.metric, t1.value \
+             FROM iicp_telemetry_aggregates t1 \
+             INNER JOIN ( \
+                 SELECT metric, MAX(computed_at) AS max_at \
+                 FROM iicp_telemetry_aggregates \
+                 WHERE window = '24h' \
+                 GROUP BY metric \
+             ) t2 ON t1.metric = t2.metric AND t1.computed_at = t2.max_at \
+             WHERE t1.window = '24h'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut agg = crate::repo::ProbeAggregate24h::default();
+        for (metric, value) in rows {
+            match metric.as_str() {
+                "discover_p50_ms" => agg.discover_p50_ms = value,
+                "discover_p95_ms" => agg.discover_p95_ms = value,
+                "heartbeat_p50_ms" => agg.heartbeat_p50_ms = value,
+                "reachability_pct" => agg.reachability_pct = value,
+                "conformance_passed" => agg.conformance_passed = value.unwrap_or(0.0) as i64,
+                "conformance_failed" => agg.conformance_failed = value.unwrap_or(0.0) as i64,
+                _ => {}
+            }
+        }
+
+        // task_success_rate_pct: PHP D2-READ — sum tasks_total/tasks_failed across all nodes.
+        let totals: Option<(Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT SUM(tasks_total), SUM(tasks_failed) FROM nodes")
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if let Some((total, failed)) = totals {
+            let total = total.unwrap_or(0);
+            let failed = failed.unwrap_or(0);
+            if total > 0 {
+                agg.task_success_rate_pct =
+                    Some((((total - failed) as f64 / total as f64) * 1000.0).round() / 10.0);
+            }
+        }
+
+        agg
+    }
+
+    async fn probe_top_failures(&self) -> Vec<crate::repo::TopFailure> {
+        let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT test_id, \
+                    SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) AS passed, \
+                    SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) AS failed, \
+                    COUNT(*) AS total \
+             FROM iicp_telemetry_probes \
+             WHERE probed_at >= NOW() - INTERVAL 24 HOUR \
+               AND test_id IS NOT NULL \
+             GROUP BY test_id \
+             HAVING SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) > 0 \
+             ORDER BY failed DESC \
+             LIMIT 5",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        rows.into_iter()
+            .map(|(test_id, passed, failed, total)| {
+                let fail_rate = if total > 0 {
+                    (failed as f64 / total as f64 * 10000.0).round() / 10000.0
+                } else {
+                    0.0
+                };
+                crate::repo::TopFailure {
+                    test_id,
+                    passed,
+                    failed,
+                    total,
+                    fail_rate,
+                }
+            })
+            .collect()
+    }
+
     /// Free credit allocation gate: two-tier guard (RT-02b, #380).
     /// 1. Per-node_id gate on nodes.free_credit_last_allocation_at (6h window).
     /// 2. Per-source-IP gate on credit_ip_gates.last_allocation_at (6h window).
@@ -1367,10 +2400,38 @@ impl NodeRepository for MySqlRepo {
 
 #[cfg(test)]
 mod tests {
-    use super::median_outlier_weight;
+    use super::{credit_ttl_idle, median_outlier_weight};
 
     fn s(vals: &[f64]) -> Vec<(f64,)> {
         vals.iter().map(|&v| (v,)).collect()
+    }
+
+    // WQ-056 / billing §11.3 — the idle-determination rule the TTL sweep applies.
+    // #404 behavior tests: each fails if the predicate (the "fix") is wrong/absent.
+    const NOW: i64 = 1_780_000_000;
+
+    #[test]
+    fn ttl_idle_expired_earn_with_balance_is_swept() {
+        // newest earn expired 1 day ago + positive balance → idle (forfeit).
+        assert!(credit_ttl_idle(Some(NOW - 86_400), 40.0, NOW));
+    }
+
+    #[test]
+    fn ttl_idle_fresh_earn_is_not_swept() {
+        // newest earn TTL still in the future → active, even with a balance.
+        assert!(!credit_ttl_idle(Some(NOW + 86_400), 40.0, NOW));
+    }
+
+    #[test]
+    fn ttl_idle_zero_balance_is_not_swept() {
+        // expired TTL but nothing to forfeit → not idle (keeps the sweep idempotent).
+        assert!(!credit_ttl_idle(Some(NOW - 86_400), 0.0, NOW));
+    }
+
+    #[test]
+    fn ttl_idle_no_earn_rows_is_not_swept() {
+        // no determinable earn TTL → never expire on a guess (matches PHP).
+        assert!(!credit_ttl_idle(None, 40.0, NOW));
     }
 
     #[test]

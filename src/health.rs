@@ -24,19 +24,19 @@
 //! algorithm here is complete and identical to PHP; only the *inputs* are
 //! Phase-A until the signal-collection layer is ported.
 
-/// Component weights — sum to 1.0 (PHP `W_*` constants). Reachability leads
-/// because an unreachable node cannot serve regardless of other signals.
-const W_REACHABILITY: f64 = 0.30;
-const W_LATENCY: f64 = 0.25;
-const W_SUCCESS: f64 = 0.25;
-const W_REPUTATION: f64 = 0.20;
+/// Component weights — sum to 1.0 (PHP `W_*` constants). Reachability dominates
+/// because an unreachable node cannot serve regardless of latency. Reputation is
+/// intentionally absent: health reflects operational liveness, not earned task
+/// history (#492 / ADR-044).
+const W_REACHABILITY: f64 = 0.70;
+const W_LATENCY: f64 = 0.30;
 
 /// Below this many active nodes a single mesh number is not meaningful
 /// (PHP `MIN_MESH_SAMPLE`).
 const MIN_MESH_SAMPLE: u32 = 3;
 
 /// Per-node input signals, each already normalised to [0, 1] except the raw
-/// task counts and optional latency (milliseconds).
+/// latency (milliseconds).
 #[derive(Debug, Clone)]
 pub struct HealthSignals {
     /// Reachability in [0, 1]. 1.0 = directly reachable, 0.5 = relay-only,
@@ -44,12 +44,6 @@ pub struct HealthSignals {
     pub reachability: f64,
     /// Observed/estimated round-trip latency in ms. `None` → no measurement.
     pub latency_ms: Option<f64>,
-    /// Total completed tasks in the scoring window (`<= 0` → no data).
-    pub tasks_total: i64,
-    /// Failed tasks in the same window.
-    pub tasks_failed: i64,
-    /// Reputation score in [0, 1] (clamped).
-    pub reputation: f64,
 }
 
 /// Per-node health vector: integer score (0–100) + ADR-044 label.
@@ -66,19 +60,15 @@ pub struct NodeHealth {
 pub struct Components {
     pub reachability: f64,
     pub latency: f64,
-    pub success_rate: f64,
-    pub reputation: f64,
 }
 
-/// Compute the four weighted component sub-scores from a node's signals.
+/// Compute the two weighted component sub-scores from a node's signals.
 /// `score_node` derives the composite from exactly these values, so the
 /// detail endpoint's breakdown and the mesh score can never disagree.
 pub fn components_of(s: &HealthSignals) -> Components {
     Components {
         reachability: s.reachability.clamp(0.0, 1.0),
         latency: latency_score(s.latency_ms),
-        success_rate: success_score(s.tasks_total, s.tasks_failed),
-        reputation: s.reputation.clamp(0.0, 1.0),
     }
 }
 
@@ -118,16 +108,6 @@ fn latency_score(latency_ms: Option<f64>) -> f64 {
     }
 }
 
-/// Success component: 100% → 1.0, ≤ 70% → 0.0; no completed tasks → neutral 0.5
-/// (PHP `successScore`).
-fn success_score(tasks_total: i64, tasks_failed: i64) -> f64 {
-    if tasks_total <= 0 {
-        return 0.5;
-    }
-    let pct = ((tasks_total - tasks_failed) as f64 / tasks_total as f64) * 100.0;
-    ((pct - 70.0) / 30.0).clamp(0.0, 1.0)
-}
-
 /// #385 Phase-B reachability fallback — byte-for-byte parity with PHP
 /// `NodeHealthService::reachabilityScore()` self-attested branch: a directly
 /// reachable node scores 1.0; otherwise a relay-capable node scores 0.5; an
@@ -159,10 +139,7 @@ fn label(score: u32) -> &'static str {
 /// nodes are excluded upstream and counted as `offline` separately.
 pub fn score_node(s: &HealthSignals) -> NodeHealth {
     let c = components_of(s);
-    let score01 = W_REACHABILITY * c.reachability
-        + W_LATENCY * c.latency
-        + W_SUCCESS * c.success_rate
-        + W_REPUTATION * c.reputation;
+    let score01 = W_REACHABILITY * c.reachability + W_LATENCY * c.latency;
     let score = (score01 * 100.0).round() as u32;
     NodeHealth {
         score,
@@ -233,6 +210,202 @@ pub fn mesh_health(healths: &[NodeHealth]) -> MeshHealth {
     }
 }
 
+// ── ADR-048 (#374): federation-aware mesh_health ───────────────────────────────
+//
+// The per-node health vector travels directory-to-directory in the signed event log
+// as a HEALTH event; every replica stores per-(node, evaluator) snapshots and resolves
+// each node's canonical health by MAJORITY-VOTE across evaluators, then aggregates over
+// the union of known nodes. This MUST be byte-for-byte equivalent to the PHP
+// `FederatedMeshHealthResolver` so any replica reports the same federation aggregate.
+//
+// The items below carry `#[allow(dead_code)]`: the pure resolver + tests land in this
+// apply_event(HEALTH) storage + /v1/stats wiring now live (slice 5); resolver is wired.
+
+/// Distinct evaluator DIDs required before a majority is "confirmed" (PHP `QUORUM`).
+pub const HEALTH_QUORUM: usize = 3;
+
+/// A per-node, per-evaluator health snapshot replicated via the HEALTH event — mirror of
+/// the PHP `node_health_observations` row. `score` is on the [0,1] wire scale.
+#[derive(Debug, Clone)]
+pub struct HealthObservation {
+    pub node_id: String,
+    pub evaluator_did: String,
+    pub score: f64,
+    pub evaluated_at_ms: i64,
+}
+
+/// One node's canonical health after applying the conflict/staleness rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedNode {
+    pub score: f64,
+    pub label: String,
+    /// majority | most_recent | unconfirmed | none
+    pub resolution: String,
+    pub evaluators: usize,
+    pub contested: bool,
+}
+
+/// Federation-wide aggregate over the union of nodes (PHP `federatedMeshHealth`).
+#[derive(Debug, Clone)]
+pub struct FederatedMeshHealth {
+    pub score: f64,
+    pub label: String,
+    pub mean: Option<f64>,
+    pub p10: Option<f64>,
+    pub distribution: Distribution,
+    pub sample: u32,
+    pub contested: u32,
+    pub unconfirmed: u32,
+}
+
+/// ADR-044 label for a [0,1] score (PHP `labelForScore((int) round(score*100))`).
+fn label01(score: f64) -> &'static str {
+    label((score * 100.0).round() as u32)
+}
+
+/// Nearest-rank percentile over a pre-sorted slice of [0,1] floats (PHP `percentile`).
+fn percentile_f64(sorted: &[f64], p: u32) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let rank = ((p as f64 / 100.0) * n as f64).ceil() as i64;
+    let idx = (rank - 1).clamp(0, n as i64 - 1) as usize;
+    sorted[idx]
+}
+
+/// Resolve one node's canonical health from its per-evaluator snapshots.
+///
+/// Each evaluator casts one vote (its snapshot); votes are bucketed by ADR-044 label.
+/// A strict-majority label wins (canonical score = median of that bucket). No majority →
+/// most-recent by `evaluated_at_ms` (contested). Fewer than `HEALTH_QUORUM` distinct
+/// evaluators → freshest single snapshot (unconfirmed). Mirrors PHP `resolveNode`.
+pub fn resolve_node(obs: &[HealthObservation]) -> ResolvedNode {
+    // One vote per distinct evaluator_did (the storage layer keeps a single row per
+    // evaluator, but counting distinct DIDs is the spec-correct quorum quantity).
+    let evaluators = obs
+        .iter()
+        .map(|o| o.evaluator_did.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if evaluators == 0 {
+        return ResolvedNode {
+            score: 0.0,
+            label: "unavailable".to_string(),
+            resolution: "none".to_string(),
+            evaluators: 0,
+            contested: false,
+        };
+    }
+
+    let freshest = obs.iter().max_by_key(|o| o.evaluated_at_ms).unwrap();
+
+    if evaluators < HEALTH_QUORUM {
+        let score = round3(freshest.score);
+        return ResolvedNode {
+            score,
+            label: label01(score).to_string(),
+            resolution: "unconfirmed".to_string(),
+            evaluators,
+            contested: false,
+        };
+    }
+
+    // Bucket votes by label. A strict majority (> half) can be reached by at most one
+    // bucket, so iteration order is irrelevant to the outcome.
+    let mut buckets: std::collections::HashMap<&'static str, Vec<f64>> =
+        std::collections::HashMap::new();
+    for o in obs {
+        buckets.entry(label01(o.score)).or_default().push(o.score);
+    }
+    let needed = evaluators / 2 + 1;
+
+    if let Some((_, scores)) = buckets.iter().find(|(_, v)| v.len() >= needed) {
+        let mut s = scores.clone();
+        s.sort_by(|a, b| a.total_cmp(b));
+        let median = round3(percentile_f64(&s, 50));
+        return ResolvedNode {
+            score: median,
+            label: label01(median).to_string(),
+            resolution: "majority".to_string(),
+            evaluators,
+            contested: false,
+        };
+    }
+
+    let score = round3(freshest.score);
+    ResolvedNode {
+        score,
+        label: label01(score).to_string(),
+        resolution: "most_recent".to_string(),
+        evaluators,
+        contested: true,
+    }
+}
+
+/// Federation-wide mesh_health over the union of nodes with any HEALTH observation
+/// (PHP `federatedMeshHealth`). Pure function of the snapshots → identical across replicas.
+pub fn federated_mesh_health(obs: &[HealthObservation]) -> FederatedMeshHealth {
+    if obs.is_empty() {
+        return FederatedMeshHealth {
+            score: 0.0,
+            label: "unavailable".to_string(),
+            mean: None,
+            p10: None,
+            distribution: Distribution::default(),
+            sample: 0,
+            contested: 0,
+            unconfirmed: 0,
+        };
+    }
+
+    let mut groups: std::collections::HashMap<&str, Vec<HealthObservation>> =
+        std::collections::HashMap::new();
+    for o in obs {
+        groups
+            .entry(o.node_id.as_str())
+            .or_default()
+            .push(o.clone());
+    }
+
+    let resolved: Vec<ResolvedNode> = groups.values().map(|v| resolve_node(v)).collect();
+    let mut scores: Vec<f64> = resolved.iter().map(|r| r.score).collect();
+    scores.sort_by(|a, b| a.total_cmp(b));
+    let sample = scores.len() as u32;
+    let median = percentile_f64(&scores, 50);
+    let avg = scores.iter().sum::<f64>() / sample as f64;
+
+    let mut dist = Distribution::default();
+    for r in &resolved {
+        match r.label.as_str() {
+            "healthy" => dist.healthy += 1,
+            "degraded" => dist.degraded += 1,
+            "impaired" => dist.impaired += 1,
+            "critical" => dist.critical += 1,
+            "offline" => dist.offline += 1,
+            _ => {}
+        }
+    }
+
+    FederatedMeshHealth {
+        score: round3(median),
+        label: if sample < MIN_MESH_SAMPLE {
+            "insufficient_sample".to_string()
+        } else {
+            label01(median).to_string()
+        },
+        mean: Some(round3(avg)),
+        p10: Some(round3(percentile_f64(&scores, 10))),
+        distribution: dist,
+        sample,
+        contested: resolved.iter().filter(|r| r.contested).count() as u32,
+        unconfirmed: resolved
+            .iter()
+            .filter(|r| r.resolution == "unconfirmed")
+            .count() as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,15 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn success_score_boundaries() {
-        assert_eq!(success_score(0, 0), 0.5); // no data → neutral
-        assert_eq!(success_score(10, 0), 1.0); // 100%
-        assert_eq!(success_score(10, 3), 0.0); // 70% → 0
-        assert_eq!(success_score(10, 5), 0.0); // 50% clamped to 0
-        assert!((success_score(100, 15) - (85.0 - 70.0) / 30.0).abs() < 1e-9); // 85% → 0.5
-    }
-
-    #[test]
     fn label_thresholds() {
         assert_eq!(label(100), "healthy");
         assert_eq!(label(85), "healthy");
@@ -290,27 +454,34 @@ mod tests {
         let h = score_node(&HealthSignals {
             reachability: 1.0,
             latency_ms: Some(50.0),
-            tasks_total: 10,
-            tasks_failed: 0,
-            reputation: 1.0,
         });
         assert_eq!(h.score, 100);
         assert_eq!(h.label, "healthy");
     }
 
+    // #492 — brand-new reachable node with no task history (latency unknown → neutral 0.5)
+    // must score ≥ 85 (healthy). Old formula: 0.30 + 0.35 = 0.65 → 65 → degraded.
+    // New formula: 0.70*1.0 + 0.30*0.5 = 0.85 → 85 → healthy.
     #[test]
-    fn score_node_weighting() {
-        // reachability=1, latency neutral(0.5), success neutral(0.5), reputation=0.8
-        // = 0.30*1 + 0.25*0.5 + 0.25*0.5 + 0.20*0.8 = 0.30+0.125+0.125+0.16 = 0.71 → 71
+    fn new_reachable_node_with_no_task_history_is_healthy() {
         let h = score_node(&HealthSignals {
             reachability: 1.0,
             latency_ms: None,
-            tasks_total: 0,
-            tasks_failed: 0,
-            reputation: 0.8,
         });
-        assert_eq!(h.score, 71);
-        assert_eq!(h.label, "degraded");
+        assert_eq!(h.score, 85);
+        assert_eq!(h.label, "healthy");
+    }
+
+    #[test]
+    fn score_node_weighting() {
+        // reachability=1, latency neutral(0.5), endpoint-only formula
+        // = 0.70*1 + 0.30*0.5 = 0.85 → 85
+        let h = score_node(&HealthSignals {
+            reachability: 1.0,
+            latency_ms: None,
+        });
+        assert_eq!(h.score, 85);
+        assert_eq!(h.label, "healthy");
     }
 
     #[test]
@@ -318,17 +489,12 @@ mod tests {
         let s = HealthSignals {
             reachability: 0.5,
             latency_ms: Some(50.0),
-            tasks_total: 0,
-            tasks_failed: 0,
-            reputation: 0.9,
         };
         let c = components_of(&s);
         assert_eq!(c.reachability, 0.5);
         assert_eq!(c.latency, 1.0);
-        assert_eq!(c.success_rate, 0.5); // no task data
-        assert_eq!(c.reputation, 0.9);
-        // composite = 0.30*0.5 + 0.25*1.0 + 0.25*0.5 + 0.20*0.9 = 0.15+0.25+0.125+0.18 = 0.705 → 71
-        assert_eq!(score_node(&s).score, 71);
+        // composite = 0.70*0.5 + 0.30*1.0 = 0.35+0.30 = 0.65 → 65
+        assert_eq!(score_node(&s).score, 65);
     }
 
     #[test]
@@ -392,5 +558,82 @@ mod tests {
         assert_eq!(m.label, "healthy"); // 3 >= MIN_MESH_SAMPLE
         assert_eq!(m.distribution.healthy, 3);
         assert_eq!(m.mean, Some(round3((86.0 + 88.0 + 90.0) / 3.0 / 100.0)));
+    }
+
+    // ── ADR-048 federated mesh_health (parity with PHP FederatedMeshHealthResolverTest) ──
+
+    fn obs(node: &str, evaluator: &str, score: f64, at_ms: i64) -> HealthObservation {
+        HealthObservation {
+            node_id: node.to_string(),
+            evaluator_did: evaluator.to_string(),
+            score,
+            evaluated_at_ms: at_ms,
+        }
+    }
+
+    #[test]
+    fn majority_label_wins_with_quorum() {
+        let o = vec![
+            obs("node-a", "did:web:e1", 0.90, 1000),
+            obs("node-a", "did:web:e2", 0.88, 1000),
+            obs("node-a", "did:web:e3", 0.10, 1000),
+        ];
+        let r = resolve_node(&o);
+        assert_eq!(r.resolution, "majority");
+        assert_eq!(r.label, "healthy");
+        assert!(!r.contested);
+        // median of healthy bucket {0.88, 0.90} nearest-rank p50 → idx0 → 0.88
+        assert_eq!(r.score, 0.88);
+    }
+
+    #[test]
+    fn no_majority_falls_back_to_most_recent_contested() {
+        let o = vec![
+            obs("node-a", "did:web:e1", 0.90, 1000), // healthy
+            obs("node-a", "did:web:e2", 0.70, 1000), // degraded
+            obs("node-a", "did:web:e3", 0.45, 3000), // impaired, freshest
+        ];
+        let r = resolve_node(&o);
+        assert_eq!(r.resolution, "most_recent");
+        assert!(r.contested);
+        assert_eq!(r.score, 0.45);
+    }
+
+    #[test]
+    fn below_quorum_uses_freshest_unconfirmed() {
+        let o = vec![
+            obs("node-a", "did:web:e1", 0.30, 1000),
+            obs("node-a", "did:web:e2", 0.95, 5000), // freshest
+        ];
+        let r = resolve_node(&o);
+        assert_eq!(r.resolution, "unconfirmed");
+        assert!(!r.contested);
+        assert_eq!(r.score, 0.95);
+    }
+
+    #[test]
+    fn federated_aggregate_over_union() {
+        let mut o = Vec::new();
+        for e in ["e1", "e2", "e3"] {
+            o.push(obs("node-a", &format!("did:web:{e}"), 0.90, 1000));
+            o.push(obs("node-b", &format!("did:web:{e}"), 0.10, 1000));
+            o.push(obs("node-c", &format!("did:web:{e}"), 0.70, 1000));
+        }
+        let m = federated_mesh_health(&o);
+        assert_eq!(m.sample, 3);
+        assert_eq!(m.contested, 0);
+        // union {0.10, 0.70, 0.90} → median 0.70
+        assert_eq!(m.score, 0.70);
+        assert_eq!(m.distribution.healthy, 1);
+        assert_eq!(m.distribution.degraded, 1);
+        assert_eq!(m.distribution.critical, 1);
+    }
+
+    #[test]
+    fn empty_observations_unavailable() {
+        let m = federated_mesh_health(&[]);
+        assert_eq!(m.sample, 0);
+        assert_eq!(m.label, "unavailable");
+        assert_eq!(m.score, 0.0);
     }
 }

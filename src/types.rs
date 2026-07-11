@@ -108,6 +108,41 @@ pub struct Node {
     /// contract, hence `#[serde(skip)]`.
     #[serde(skip)]
     pub reachability_signal: f64,
+    /// ADR-045 Phase A (#407) — verified operator identity binding (PHP parity, #385).
+    /// Set when a valid ed25519 operator→node delegation is presented at register;
+    /// otherwise `(None, false, None)`. `operator_trust_tier` is `did_key` in Phase A
+    /// (the did:web higher tier layers on later, OPEN-2).
+    ///
+    /// SECURITY: `operator_pubkey` is the directory-private operator identity (ADR-045) and
+    /// MUST NEVER be served. `skip_serializing` keeps it out of every full-`Node` response
+    /// (`/v1/node/:id`, discover, bootstrap, peers); the *public* operator handle is only ever
+    /// the resolved `operator_display_name` (registry_node_detail). `default` is retained so
+    /// internal deserialization (DB row / state) still reads it.
+    #[serde(default, skip_serializing)]
+    pub operator_pubkey: Option<String>,
+    /// Public operator display name resolved from `operator_pubkey` by the directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_display_name: Option<String>,
+    /// Public short SHA-256 fingerprint for display-name disambiguation; never the raw key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_fingerprint: Option<String>,
+    /// WQ-058 / ADR-017 REG-01 — operator public-listing opt-in + advertised URL. Both are
+    /// `skip_serializing` so they never appear in full-Node responses (node-detail, discover);
+    /// the public registry listing (registry_nodes) exposes `public_listing`, and `operator_url`
+    /// ONLY when `public_listing` is true (respecting the operator's opt-out).
+    #[serde(default, skip_serializing)]
+    pub public_listing: bool,
+    #[serde(default, skip_serializing)]
+    pub operator_url: Option<String>,
+    #[serde(default)]
+    pub operator_verified: bool,
+    #[serde(default)]
+    pub operator_trust_tier: Option<String>,
+    /// #494 — runtime model list from the node's last heartbeat. null = not yet reported
+    /// (backward compat). [] = backend has no models loaded. ['x'] = only 'x' is live.
+    /// Used by discover to filter ?model= queries by what's actually running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_models: Option<Vec<String>>,
 }
 
 /// PHP `credit_cost_multiplier ?? 1.0` default — used when deserialising a
@@ -117,10 +152,15 @@ fn default_credit_multiplier() -> f64 {
 }
 
 /// `/v1/discover` response envelope (iicp-dir §3.4).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeList {
     pub nodes: Vec<Node>,
     pub count: u32,
+    /// True if ≥1 returned node has relay_capable=true — lets SDK auto-election
+    /// determine up-front whether a relay peer is available (#402 optional parity).
+    #[serde(default)]
+    pub relay_available: bool,
     #[serde(default)]
     pub query_ms: u32,
 }

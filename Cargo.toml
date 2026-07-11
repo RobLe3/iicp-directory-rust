@@ -20,6 +20,18 @@ jsonwebtoken = "9"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# Federation event-log signature verification (#385/ADR-013). ed25519-compact:
+# pure-Rust, minimal transitive footprint, by jedisct1 (libsodium author) — matches
+# the PHP seed's libsodium sodium_crypto_sign scheme. TC-11 cleared (see PARITY.md).
+ed25519-compact = "2"
+# Federation replica HTTP sync (poll seed /v1/events, resolve DID). reqwest with
+# rustls-tls+json — the same client the project already vets in iicp-client-rust;
+# async-native (no hand-rolled HTTP on the control plane). [TC-11: project-precedented]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# base64url for the seed DID document's Ed25519 JWK `x` field. Already in the tree
+# via ed25519-compact (same author, jedisct1); promoting to a direct dep adds zero
+# new transitive surface.
+ct-codecs = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

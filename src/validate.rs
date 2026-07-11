@@ -53,7 +53,10 @@ pub enum EndpointReject {
     BadScheme,
     NonRoutableHost,
     BareHostname,
+    UnresolvableHost,
 }
+
+use std::net::{IpAddr, ToSocketAddrs};
 
 /// RoutableEndpoint invariant (iicp-dir §3.1, IICP-E035). In production/staging, reject
 /// endpoints whose host is not publicly routable. Local/testing bypasses for dev workflows.
@@ -124,7 +127,59 @@ pub fn endpoint_routable(endpoint: &str, env: Env) -> Result<(), EndpointReject>
         return Err(EndpointReject::BareHostname);
     }
 
+    // IP literals are validated directly; hostnames are DNS-resolved and checked for only
+    // globally routable addresses to reduce DNS-rebinding and SSRF-style bypasses.
+    if let Ok(ip) = lower.parse::<IpAddr>() {
+        if !is_publicly_routable_ip(&ip) {
+            return Err(EndpointReject::NonRoutableHost);
+        }
+    } else {
+        ensure_host_dns_is_public(&lower)?;
+    }
+
     Ok(())
+}
+
+fn is_publicly_routable_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_unspecified()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_multicast()
+                && !v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            let is_ula = (segments[0] & 0xfe00) == 0xfc00;
+            let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && !is_ula
+                && !is_link_local
+        }
+    }
+}
+
+fn ensure_host_dns_is_public(host: &str) -> Result<(), EndpointReject> {
+    let mut found = false;
+    for sock in (host, 443)
+        .to_socket_addrs()
+        .map_err(|_| EndpointReject::UnresolvableHost)?
+    {
+        found = true;
+        if !is_publicly_routable_ip(&sock.ip()) {
+            return Err(EndpointReject::NonRoutableHost);
+        }
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(EndpointReject::UnresolvableHost)
+    }
 }
 
 /// RT-04 (#378): does the registration carry a trustworthy reachability declaration that
@@ -173,15 +228,22 @@ mod tests {
 
     #[test]
     fn routable_accepts_public_in_prod() {
-        for ok in [
-            "https://node.example.com",
-            "http://203.0.113.5:8090",
-            "https://sub.domain.io:443",
-        ] {
+        for ok in ["http://1.1.1.1:8090", "http://8.8.8.8", "https://1.1.1.1"] {
             assert!(
                 endpoint_routable(ok, Env::Production).is_ok(),
                 "should accept {ok}"
             );
+        }
+    }
+
+    #[test]
+    fn routable_accepts_dns_resolved_hostname_when_available() {
+        // Resolution behavior is environment dependent in CI sandboxes; allow either
+        // pass or explicit unresolvable failure for the hostname path.
+        match endpoint_routable("https://example.com", Env::Production) {
+            Ok(_) => {}
+            Err(EndpointReject::UnresolvableHost) => {}
+            Err(err) => panic!("unexpected hostname validation path: {err:?}"),
         }
     }
 
@@ -204,5 +266,15 @@ mod tests {
         assert!(!is_declared_reachable(Some("none"), Some("direct")));
         assert!(!is_declared_reachable(None, Some("direct")));
         assert!(!is_declared_reachable(Some("full_cone"), None));
+    }
+
+    #[test]
+    fn routable_rejects_private_resolved_ip_address() {
+        assert!(!is_publicly_routable_ip(
+            &"10.0.0.5".parse().expect("valid private ip")
+        ));
+        assert!(!is_publicly_routable_ip(
+            &"fd00::1".parse().expect("valid private ip")
+        ));
     }
 }

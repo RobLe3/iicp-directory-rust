@@ -1,0 +1,49 @@
+{
+  "contract_version": "v1.10.69",
+  "seed": {
+    "config": "config/app.php",
+    "version_key": "iicp_version"
+  },
+  "php": {
+    "required_paths": [
+      "app/Http/Controllers/DispatchRouteTicketController.php",
+      "app/Http/Controllers/OperatorSelfServiceController.php",
+      "app/Services/DataSubjectRightsService.php",
+      "app/Services/DispatchRouteTicketService.php",
+      "app/Services/IntentPolicyGuard.php",
+      "app/Services/NodePolicyManifestVerifier.php",
+      "app/Services/PolicyKeyLifecycleService.php",
+      "app/Console/Commands/DataSubjectRightsCommand.php",
+      "database/migrations/2026_07_02_100000_add_policy_manifest_to_nodes.php",
+      "database/migrations/2026_07_02_210000_create_data_subject_actions_table.php",
+      "database/migrations/2026_07_09_181500_create_policy_key_lifecycle_records_table.php",
+      "database/migrations/2026_07_09_182000_add_governance_acceptance_to_operators.php",
+      "database/migrations/2026_07_09_220000_create_dispatch_usage_daily_table.php"
+    ],
+    "required_route_fragments": [
+      "/dispatch/ticket",
+      "/operator/challenge",
+      "/operator/acceptance",
+      "operator/dsr",
+      "/export",
+      "/restrict",
+      "/anonymize"
+    ]
+  },
+  "rust": {
+    "required_route_fragments": [
+      "/api/v1/dispatch/ticket",
+      "/api/v1/operator/challenge",
+      "/api/v1/operator/acceptance",
+      "/api/v1/operator/dsr/export",
+      "/api/v1/operator/dsr/restrict",
+      "/api/v1/operator/dsr/anonymize"
+    ],
+    "required_capability_markers": [
+      "IntentPolicyGuard",
+      "DataSubjectRights",
+      "PolicyKeyLifecycle",
+      "DispatchUsage"
+    ]
+  }
+}
