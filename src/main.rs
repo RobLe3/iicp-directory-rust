@@ -21,7 +21,7 @@ mod reputation;
 mod types;
 mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{net::ToSocketAddrs, time::Duration};
@@ -43,6 +43,14 @@ use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
 const SDK_BASELINE_VERSION: &str = "0.7.68";
+
+const OPERATOR_CHALLENGE_TTL_SECS: u64 = 300;
+const OPERATOR_TS_WINDOW_SECS: i64 = 300;
+
+/// One-use, process-local operator challenges. They are intentionally short
+/// lived and contain no task content, credentials or private key material.
+static OPERATOR_CHALLENGES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::OnceLock::new();
 
 /// This directory's DID (single source for /.well-known/did.json + signed-event signer_did).
 const DIRECTORY_DID: &str = "did:web:iicp.network";
@@ -179,6 +187,12 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/register", post(register).delete(deregister))
         .route("/v1/operator/rename", post(operator_rename))
         .route("/api/v1/operator/rename", post(operator_rename))
+        .route("/v1/operator/challenge", post(operator_challenge))
+        .route("/api/v1/operator/challenge", post(operator_challenge))
+        .route("/v1/operator/key/rotate", post(operator_key_rotate))
+        .route("/api/v1/operator/key/rotate", post(operator_key_rotate))
+        .route("/v1/operator/key/revoke", post(operator_key_revoke))
+        .route("/api/v1/operator/key/revoke", post(operator_key_revoke))
         .route("/v1/leaderboards/:board_id", get(leaderboard))
         .route("/api/v1/leaderboards/:board_id", get(leaderboard))
         .route("/v1/replicas/register", post(replicas_register))
@@ -1202,6 +1216,193 @@ async fn operator_rename(
         StatusCode::OK,
         Json(serde_json::json!({ "display_name": req.display_name })),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct OperatorChallengeRequest {
+    operator_pub: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperatorKeyRequest {
+    operator_pub: String,
+    nonce: String,
+    ts: i64,
+    sig: String,
+    #[serde(default)]
+    new_operator_pub: Option<String>,
+    #[serde(default)]
+    new_key_sig: Option<String>,
+    #[serde(default)]
+    rotation_epoch: Option<u32>,
+    #[serde(default)]
+    reason_class: Option<String>,
+    #[serde(default)]
+    confirm: Option<bool>,
+}
+
+fn operator_challenges() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    OPERATOR_CHALLENGES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn operator_challenge_key(operator_pub: &str, nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(format!("{operator_pub}\n{nonce}").as_bytes()))
+}
+
+fn no_store_json(value: serde_json::Value) -> Response {
+    ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
+}
+
+fn no_store_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"error":{"code":code,"message":message}})),
+    )
+        .into_response()
+}
+
+fn valid_reason_class(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+}
+
+fn lifecycle_fields(req: &OperatorKeyRequest, include_successor: bool) -> BTreeMap<String, serde_json::Value> {
+    let mut fields = BTreeMap::from([
+        ("operator_pub".to_string(), serde_json::Value::String(req.operator_pub.clone())),
+        ("nonce".to_string(), serde_json::Value::String(req.nonce.clone())),
+        ("ts".to_string(), serde_json::Value::from(req.ts)),
+    ]);
+    if let Some(reason) = &req.reason_class {
+        fields.insert("reason_class".to_string(), serde_json::Value::String(reason.clone()));
+    }
+    if let Some(epoch) = req.rotation_epoch {
+        fields.insert("rotation_epoch".to_string(), serde_json::Value::from(epoch));
+    }
+    if include_successor {
+        fields.insert(
+            "new_operator_pub".to_string(),
+            serde_json::Value::String(req.new_operator_pub.clone().unwrap_or_default()),
+        );
+    } else if let Some(confirm) = req.confirm {
+        fields.insert("confirm".to_string(), serde_json::Value::Bool(confirm));
+    }
+    fields
+}
+
+fn consume_operator_challenge(operator_pub: &str, nonce: &str) -> bool {
+    let now = delegation::now_unix();
+    let mut challenges = operator_challenges().lock().expect("operator challenge lock");
+    challenges.retain(|_, expires| *expires >= now);
+    challenges
+        .remove(&operator_challenge_key(operator_pub, nonce))
+        .is_some_and(|expires| expires >= now)
+}
+
+async fn operator_challenge(
+    State(st): State<AppState>,
+    Json(req): Json<OperatorChallengeRequest>,
+) -> Response {
+    if req.operator_pub.is_empty() || req.operator_pub.len() > 64 {
+        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "operator_pub is invalid");
+    }
+    match st.repo.operator_identity_active(&req.operator_pub).await {
+        None => return no_store_error(StatusCode::NOT_FOUND, "IICP-E044", "unknown operator (register a delegated node first)"),
+        Some(false) => return no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity is no longer active"),
+        Some(true) => {}
+    }
+    use ct_codecs::{Base64UrlSafeNoPadding, Encoder};
+    let nonce = Base64UrlSafeNoPadding::encode_to_string(&uuid::Uuid::new_v4().as_bytes()).unwrap_or_default();
+    let expires = delegation::now_unix().saturating_add(OPERATOR_CHALLENGE_TTL_SECS);
+    operator_challenges()
+        .lock()
+        .expect("operator challenge lock")
+        .insert(operator_challenge_key(&req.operator_pub, &nonce), expires);
+    no_store_json(serde_json::json!({
+        "nonce": nonce,
+        "expires_at": chrono::DateTime::from_timestamp(expires as i64, 0).map(|v| v.to_rfc3339()),
+        "operator_fingerprint": public_operator_fingerprint(&req.operator_pub),
+        "signing_contract": "iicp.operator.self-service.v1"
+    }))
+}
+
+async fn validate_operator_key_request(
+    st: &AppState,
+    req: &OperatorKeyRequest,
+    action: &str,
+    include_successor: bool,
+) -> Result<(), Response> {
+    if req.operator_pub.is_empty() || req.operator_pub.len() > 64 || req.nonce.len() < 16 || req.nonce.len() > 64 || req.sig.len() > 128 {
+        return Err(no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "operator request fields are invalid"));
+    }
+    if (delegation::now_unix() as i64 - req.ts).abs() > OPERATOR_TS_WINDOW_SECS {
+        return Err(no_store_error(StatusCode::UNAUTHORIZED, "IICP-E041", "stale or future-dated operator request"));
+    }
+    match st.repo.operator_identity_active(&req.operator_pub).await {
+        None => return Err(no_store_error(StatusCode::NOT_FOUND, "IICP-E044", "unknown operator")),
+        Some(false) => return Err(no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity is no longer active")),
+        Some(true) => {}
+    }
+    if !consume_operator_challenge(&req.operator_pub, &req.nonce) {
+        return Err(no_store_error(StatusCode::UNAUTHORIZED, "IICP-E062", "challenge is missing, expired or already used"));
+    }
+    let fields = lifecycle_fields(req, include_successor);
+    let (valid, reason) = delegation::verify_self_service(&req.operator_pub, &req.sig, action, &fields);
+    if !valid {
+        let code = if reason == "malformed" { "IICP-E042" } else { "IICP-E043" };
+        return Err(no_store_error(StatusCode::UNAUTHORIZED, code, "operator signature verification failed"));
+    }
+    Ok(())
+}
+
+async fn operator_key_rotate(State(st): State<AppState>, Json(req): Json<OperatorKeyRequest>) -> Response {
+    if let Err(response) = validate_operator_key_request(&st, &req, "key_rotate", true).await {
+        return response;
+    }
+    let Some(successor) = req.new_operator_pub.as_deref() else {
+        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "new_operator_pub is required");
+    };
+    let Some(successor_sig) = req.new_key_sig.as_deref() else {
+        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "new_key_sig is required");
+    };
+    if successor == req.operator_pub || successor.len() > 64 || successor_sig.len() > 128 || req.reason_class.as_deref().is_some_and(|value| !valid_reason_class(value)) {
+        return no_store_error(StatusCode::UNAUTHORIZED, "IICP-E064", "malformed successor operator key or signature");
+    }
+    let successor_fields = BTreeMap::from([
+        ("operator_pub".to_string(), serde_json::Value::String(req.operator_pub.clone())),
+        ("new_operator_pub".to_string(), serde_json::Value::String(successor.to_string())),
+        ("nonce".to_string(), serde_json::Value::String(req.nonce.clone())),
+        ("ts".to_string(), serde_json::Value::from(req.ts)),
+        ("rotation_epoch".to_string(), req.rotation_epoch.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)),
+    ]);
+    let (successor_valid, _) = delegation::verify_self_service(successor, successor_sig, "key_rotate_successor", &successor_fields);
+    if !successor_valid {
+        return no_store_error(StatusCode::UNAUTHORIZED, "IICP-E064", "successor operator signature verification failed");
+    }
+    match st.repo.rotate_operator_identity(&req.operator_pub, successor, req.rotation_epoch, req.reason_class.as_deref().unwrap_or("operator_rotation")).await {
+        Ok(result) => no_store_json(serde_json::json!({"status":"rotated","operator_fingerprint":public_operator_fingerprint(successor),"linked_nodes":result.linked_nodes,"rotation_epoch":result.rotation_epoch,"receipt_id_prefix":operator_challenge_key(&req.operator_pub, &req.nonce)[..12].to_string(),"legal_certification":false})),
+        Err(_) => no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity rotation cannot be completed"),
+    }
+}
+
+async fn operator_key_revoke(State(st): State<AppState>, Json(req): Json<OperatorKeyRequest>) -> Response {
+    if req.confirm != Some(true) {
+        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "confirm=true is required");
+    }
+    if req.reason_class.as_deref().is_some_and(|value| !valid_reason_class(value)) {
+        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "reason_class is invalid");
+    }
+    if let Err(response) = validate_operator_key_request(&st, &req, "key_revoke", false).await {
+        return response;
+    }
+    match st.repo.revoke_operator_identity(&req.operator_pub, req.reason_class.as_deref().unwrap_or("operator_request")).await {
+        Ok(result) => no_store_json(serde_json::json!({"status":"revoked","operator_fingerprint":public_operator_fingerprint(&req.operator_pub),"linked_nodes":result.linked_nodes,"revoked_at":result.revoked_at_unix.and_then(|v| chrono::DateTime::from_timestamp(v, 0)).map(|v|v.to_rfc3339()),"receipt_id_prefix":operator_challenge_key(&req.operator_pub, &req.nonce)[..12].to_string(),"legal_certification":false})),
+        Err(_) => no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity revocation cannot be completed"),
+    }
 }
 
 /// `GET /v1/leaderboards/{board_id}` (#310/#463, spec iicp-recognition §6). Anonymous-read
@@ -5374,6 +5575,43 @@ mod tests {
             .unwrap()
     }
 
+    fn post_operator(path: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn sign_self_service(
+        keypair: &ed25519_compact::KeyPair,
+        operator_pub: &str,
+        action: &str,
+        fields: BTreeMap<String, serde_json::Value>,
+    ) -> String {
+        use ct_codecs::{Base64, Encoder};
+        let bytes = delegation::canonical_self_service_bytes(action, &fields);
+        Base64::encode_to_string(&keypair.sk.sign(&bytes, None)[..]).unwrap()
+    }
+
+    async fn challenge_nonce(st: AppState, operator_pub: &str) -> String {
+        use http_body_util::BodyExt;
+        let response = app(st)
+            .oneshot(post_operator(
+                "/v1/operator/challenge",
+                serde_json::json!({"operator_pub": operator_pub}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        body["nonce"].as_str().unwrap().to_string()
+    }
+
     #[tokio::test]
     async fn operator_signed_rename_updates_display_name() {
         let st = test_state();
@@ -5451,6 +5689,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn operator_key_rotation_requires_two_keys_and_preserves_active_successor() {
+        use ct_codecs::{Base64, Encoder};
+        use ed25519_compact::{KeyPair, Seed};
+        use http_body_util::BodyExt;
+
+        let st = test_state();
+        let old = KeyPair::from_seed(Seed::new([41; 32]));
+        let next = KeyPair::from_seed(Seed::new([42; 32]));
+        let old_pub = Base64::encode_to_string(&old.pk[..]).unwrap();
+        let next_pub = Base64::encode_to_string(&next.pk[..]).unwrap();
+        st.repo.upsert_operator(&old_pub, Some("Lifecycle"), None, None).await;
+        let nonce = challenge_nonce(st.clone(), &old_pub).await;
+        let ts = delegation::now_unix() as i64;
+        let fields = BTreeMap::from([
+            ("operator_pub".to_string(), serde_json::Value::String(old_pub.clone())),
+            ("new_operator_pub".to_string(), serde_json::Value::String(next_pub.clone())),
+            ("nonce".to_string(), serde_json::Value::String(nonce.clone())),
+            ("ts".to_string(), serde_json::Value::from(ts)),
+            ("reason_class".to_string(), serde_json::Value::String("operator_rotation".to_string())),
+        ]);
+        let successor_fields = BTreeMap::from([
+            ("operator_pub".to_string(), serde_json::Value::String(old_pub.clone())),
+            ("new_operator_pub".to_string(), serde_json::Value::String(next_pub.clone())),
+            ("nonce".to_string(), serde_json::Value::String(nonce.clone())),
+            ("ts".to_string(), serde_json::Value::from(ts)),
+            ("rotation_epoch".to_string(), serde_json::Value::Null),
+        ]);
+        let response = app(st.clone())
+            .oneshot(post_operator(
+                "/v1/operator/key/rotate",
+                serde_json::json!({
+                    "operator_pub": old_pub,
+                    "new_operator_pub": next_pub,
+                    "nonce": nonce,
+                    "ts": ts,
+                    "reason_class": "operator_rotation",
+                    "sig": sign_self_service(&old, &old_pub, "key_rotate", fields),
+                    "new_key_sig": sign_self_service(&next, &next_pub, "key_rotate_successor", successor_fields),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["status"], "rotated");
+        assert_eq!(body["rotation_epoch"], 1);
+        assert_eq!(st.repo.operator_identity_active(&old_pub).await, Some(false));
+        assert_eq!(st.repo.operator_identity_active(&next_pub).await, Some(true));
+    }
+
+    #[tokio::test]
+    async fn operator_key_revocation_consumes_one_challenge_and_fails_closed() {
+        use ct_codecs::{Base64, Encoder};
+        use ed25519_compact::{KeyPair, Seed};
+        use http_body_util::BodyExt;
+
+        let st = test_state();
+        let key = KeyPair::from_seed(Seed::new([43; 32]));
+        let operator_pub = Base64::encode_to_string(&key.pk[..]).unwrap();
+        st.repo.upsert_operator(&operator_pub, Some("Revoke"), None, None).await;
+        let nonce = challenge_nonce(st.clone(), &operator_pub).await;
+        let ts = delegation::now_unix() as i64;
+        let fields = BTreeMap::from([
+            ("operator_pub".to_string(), serde_json::Value::String(operator_pub.clone())),
+            ("nonce".to_string(), serde_json::Value::String(nonce.clone())),
+            ("ts".to_string(), serde_json::Value::from(ts)),
+            ("confirm".to_string(), serde_json::Value::Bool(true)),
+            ("reason_class".to_string(), serde_json::Value::String("operator_request".to_string())),
+        ]);
+        let body = serde_json::json!({
+            "operator_pub": operator_pub,
+            "nonce": nonce,
+            "ts": ts,
+            "confirm": true,
+            "reason_class": "operator_request",
+            "sig": sign_self_service(&key, &operator_pub, "key_revoke", fields),
+        });
+        let response = app(st.clone()).oneshot(post_operator("/v1/operator/key/revoke", body.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let received: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(received["status"], "revoked");
+        assert_eq!(st.repo.operator_identity_active(&operator_pub).await, Some(false));
+        let replay = app(st.clone()).oneshot(post_operator("/v1/operator/key/revoke", body)).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let replay_body: serde_json::Value = serde_json::from_slice(&replay.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(replay_body["error"]["code"], "IICP-E063");
     }
 
     // #310/#463 (PHP LeaderboardTest parity) — the founders board orders by ordinal, serves

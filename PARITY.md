@@ -3,8 +3,8 @@
 Last refreshed: **2026-07-11**. The Laravel seed is currently `v1.10.69`.
 
 > **Status:** this Rust implementation is a reconciled parity baseline, not a
-> cutover-ready replacement. It remains behind the seed for ticketed dispatch,
-> ticketed dispatch, operator self-service/DSR, policy-key lifecycle, and
+> cutover-ready replacement. It remains behind the seed for operator acceptance/DSR,
+> policy-key lifecycle, and
 > dispatch-usage accounting. Public-mesh intent-policy refusal is now implemented
 > from the shared canonical taxonomy. `directory/parity/contract-v1.10.69.json` is the
 > authoritative gap checklist; do not infer parity from route count alone.
@@ -40,6 +40,7 @@ Status legend: ✅ done · 🔶 present but not full production equivalent · �
 | `POST /api/v1/heartbeat` + legacy `/v1/heartbeat` | ✅ |
 | `POST /api/v1/peers` + legacy `/v1/peers` | ✅ |
 | `POST /api/v1/operator/rename` + legacy `/v1/operator/rename` | ✅ |
+| `POST /api/v1/operator/challenge`, `/key/rotate`, `/key/revoke` + legacy `/v1` | ✅ signed dual-key lifecycle; no-store/redacted receipts |
 | `GET /api/v1/leaderboards/{board_id}` + legacy `/v1/leaderboards/{board_id}` | ✅ |
 
 ### Registry, credits, conformance and telemetry
@@ -87,8 +88,8 @@ The public discover/detail wire shape is intentionally not a raw Rust `Node` ser
 
 - ✅ `POST /api/v1/dispatch/ticket`: prompt-free, signed, intent/node/expiry-scoped route disclosure ticket. V1 is disclosure-only; stateful redemption/node admission is deferred.
 - ✅ Intent-policy refusal for prohibited and high-risk capability/discovery intent families; transparency and general/custom intents remain routable.
-- Operator challenge/acceptance plus signed DSR export, restriction and anonymisation.
-- Policy-manifest verification and operator-key lifecycle/revocation records.
+- Operator acceptance plus signed DSR export, restriction and anonymisation.
+- Policy-manifest verification and policy-key lifecycle records.
 - Dispatch usage accounting, telemetry retention and the matching operational commands.
 
 These are control-plane safety features, not cosmetic route aliases. Rust must not claim full directory parity until each has equivalent storage, authorization, redaction and contract tests.
@@ -118,7 +119,7 @@ suites.
 ```bash
 cd iicp-directory-rs
 cargo fmt --check && cargo test --locked
-# 212 passed
+# 214 passed
 ```
 
 New parity tests added in this refresh:

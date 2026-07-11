@@ -25,6 +25,25 @@ pub struct NodeRecord {
     pub proxy_token: Option<String>,
 }
 
+/// Public-safe result of an accountless operator identity lifecycle action.
+/// Raw keys remain repository-private; callers receive only counts and the
+/// replacement identity needed for internal registration continuity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorLifecycleResult {
+    pub linked_nodes: u32,
+    pub rotation_epoch: Option<u32>,
+    pub revoked_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorLifecycleError {
+    Unknown,
+    Inactive,
+    SuccessorExists,
+    Invalid,
+    Storage,
+}
+
 /// Discovery query parameters (iicp-dir §3.3).
 #[derive(Debug, Default, Clone)]
 pub struct DiscoverQuery {
@@ -312,6 +331,28 @@ pub trait NodeRepository: Send + Sync {
     /// not exist (404) — never creates a record here; binding happens only via a verified
     /// register delegation. `integrity_hash`/`first_seen_ms`/ordinal stay pinned.
     async fn rename_operator(&self, operator_pubkey: &str, display_name: &str) -> bool;
+
+    /// Lifecycle state is private control-plane data. `active` is the only
+    /// identity state allowed to create new signed self-service actions.
+    async fn operator_identity_active(&self, operator_pubkey: &str) -> Option<bool>;
+
+    /// Atomically rotate an active operator to a fresh successor key, preserving
+    /// node-linked wallet/reputation/recognition continuity through rebinding.
+    async fn rotate_operator_identity(
+        &self,
+        old_operator_pubkey: &str,
+        new_operator_pubkey: &str,
+        requested_epoch: Option<u32>,
+        reason_class: &str,
+    ) -> Result<OperatorLifecycleResult, OperatorLifecycleError>;
+
+    /// Revoke an active operator identity. Linked nodes become unverified but
+    /// retain their historical node-backed ledger evidence.
+    async fn revoke_operator_identity(
+        &self,
+        operator_pubkey: &str,
+        reason_class: &str,
+    ) -> Result<OperatorLifecycleResult, OperatorLifecycleError>;
 
     /// #310 — assign founder recognition state (ordinal/tier/badge) to a known operator. Called
     /// by the founder lock-in detector (§5.4); no-op if the operator does not exist. (Forward
@@ -654,6 +695,8 @@ struct OperatorRow {
     ordinal: Option<i64>,
     tier: Option<String>,
     badge: Option<String>,
+    identity_status: String,
+    rotation_epoch: Option<u32>,
 }
 
 impl InMemoryRepo {
@@ -1360,6 +1403,7 @@ impl NodeRepository for InMemoryRepo {
                         attested_created_at: attested_created_at.map(String::from),
                         integrity_hash: integrity_hash.map(String::from),
                         first_seen_ms: now_ms(),
+                        identity_status: "active".to_string(),
                         ..Default::default()
                     },
                 );
@@ -1394,12 +1438,104 @@ impl NodeRepository for InMemoryRepo {
     async fn rename_operator(&self, operator_pubkey: &str, display_name: &str) -> bool {
         let mut g = self.operators.lock().unwrap();
         match g.get_mut(operator_pubkey) {
-            Some(row) => {
+            Some(row) if row.identity_status == "active" => {
                 row.display_name = Some(display_name.to_string());
                 true
             }
-            None => false,
+            _ => false,
         }
+    }
+
+    async fn operator_identity_active(&self, operator_pubkey: &str) -> Option<bool> {
+        self.operators
+            .lock()
+            .unwrap()
+            .get(operator_pubkey)
+            .map(|row| row.identity_status == "active")
+    }
+
+    async fn rotate_operator_identity(
+        &self,
+        old_operator_pubkey: &str,
+        new_operator_pubkey: &str,
+        requested_epoch: Option<u32>,
+        _reason_class: &str,
+    ) -> Result<OperatorLifecycleResult, OperatorLifecycleError> {
+        if old_operator_pubkey == new_operator_pubkey {
+            return Err(OperatorLifecycleError::Invalid);
+        }
+        let mut operators = self.operators.lock().unwrap();
+        let old = operators
+            .get(old_operator_pubkey)
+            .cloned()
+            .ok_or(OperatorLifecycleError::Unknown)?;
+        if old.identity_status != "active" {
+            return Err(OperatorLifecycleError::Inactive);
+        }
+        if operators.contains_key(new_operator_pubkey) {
+            return Err(OperatorLifecycleError::SuccessorExists);
+        }
+        let epoch = old
+            .rotation_epoch
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(requested_epoch.unwrap_or(0));
+        let mut successor = old.clone();
+        successor.identity_status = "active".to_string();
+        successor.rotation_epoch = None;
+        operators.insert(new_operator_pubkey.to_string(), successor);
+        let old_mut = operators
+            .get_mut(old_operator_pubkey)
+            .expect("old operator retained as lifecycle evidence");
+        old_mut.identity_status = "rotated".to_string();
+        old_mut.rotation_epoch = Some(epoch);
+        drop(operators);
+
+        let mut records = self.records.lock().unwrap();
+        let mut linked_nodes = 0u32;
+        for rec in records.iter_mut() {
+            if rec.node.operator_pubkey.as_deref() == Some(old_operator_pubkey) {
+                rec.node.operator_pubkey = Some(new_operator_pubkey.to_string());
+                rec.node.operator_verified = true;
+                linked_nodes = linked_nodes.saturating_add(1);
+            }
+        }
+        Ok(OperatorLifecycleResult {
+            linked_nodes,
+            rotation_epoch: Some(epoch),
+            revoked_at_unix: None,
+        })
+    }
+
+    async fn revoke_operator_identity(
+        &self,
+        operator_pubkey: &str,
+        _reason_class: &str,
+    ) -> Result<OperatorLifecycleResult, OperatorLifecycleError> {
+        let mut operators = self.operators.lock().unwrap();
+        let row = operators
+            .get_mut(operator_pubkey)
+            .ok_or(OperatorLifecycleError::Unknown)?;
+        if row.identity_status != "active" {
+            return Err(OperatorLifecycleError::Inactive);
+        }
+        row.identity_status = "revoked".to_string();
+        drop(operators);
+
+        let mut records = self.records.lock().unwrap();
+        let mut linked_nodes = 0u32;
+        for rec in records.iter_mut() {
+            if rec.node.operator_pubkey.as_deref() == Some(operator_pubkey) {
+                rec.node.operator_verified = false;
+                rec.node.operator_trust_tier = None;
+                linked_nodes = linked_nodes.saturating_add(1);
+            }
+        }
+        Ok(OperatorLifecycleResult {
+            linked_nodes,
+            rotation_epoch: None,
+            revoked_at_unix: Some(now_ms() / 1000),
+        })
     }
 
     async fn set_operator_recognition(

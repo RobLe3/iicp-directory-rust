@@ -15,6 +15,7 @@
 //! signer (Python/TS/Rust) — pinned by the cross-language KAT in the tests below.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 /// The compact operator→node delegation token carried (optionally) at register.
 #[derive(Debug, Clone, Deserialize)]
@@ -159,6 +160,56 @@ pub fn verify_rename(
         return (false, "malformed");
     };
     match pk.verify(canonical_rename_bytes(display_name, operator_pub, ts), &s) {
+        Ok(()) => (true, "ok"),
+        Err(_) => (false, "bad_signature"),
+    }
+}
+
+/// Canonical accountless operator self-service bytes. Mirrors the Laravel
+/// controller: action plus lexically sorted JSON fields, excluding signatures
+/// and server-injected values. This keeps rotate/revoke signing stable across
+/// PHP, Rust and the SDKs without ever serializing a private key.
+pub fn canonical_self_service_bytes(
+    action: &str,
+    fields: &BTreeMap<String, serde_json::Value>,
+) -> Vec<u8> {
+    let mut payload = fields.clone();
+    payload.remove("sig");
+    payload.remove("new_key_sig");
+    payload.remove("_operator");
+    payload.insert("action".to_string(), serde_json::Value::String(action.to_string()));
+    format!(
+        "iicp:operator:self-service:v1\n{}",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+    )
+    .into_bytes()
+}
+
+/// Verify a detached Ed25519 signature against a base64 operator public key.
+/// Returns the same safe classification used by rename verification.
+pub fn verify_self_service(
+    operator_pub: &str,
+    signature: &str,
+    action: &str,
+    fields: &BTreeMap<String, serde_json::Value>,
+) -> (bool, &'static str) {
+    use ct_codecs::{Base64, Decoder};
+    use ed25519_compact::{PublicKey, Signature};
+    let pub_raw = match Base64::decode_to_vec(operator_pub, None) {
+        Ok(value) if value.len() == 32 => value,
+        _ => return (false, "malformed"),
+    };
+    let sig_raw = match Base64::decode_to_vec(signature, None) {
+        Ok(value) if value.len() == 64 => value,
+        _ => return (false, "malformed"),
+    };
+    let Ok(key) = PublicKey::from_slice(&pub_raw) else {
+        return (false, "malformed");
+    };
+    let Ok(sig) = Signature::from_slice(&sig_raw) else {
+        return (false, "malformed");
+    };
+    match key.verify(canonical_self_service_bytes(action, fields), &sig) {
         Ok(()) => (true, "ok"),
         Err(_) => (false, "bad_signature"),
     }
