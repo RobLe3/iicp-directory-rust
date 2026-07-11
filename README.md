@@ -2,7 +2,7 @@
 
 Rust reference implementation of the IICP directory control plane.
 
-**Status as of 2026-07-11:** the Rust repository has been reconciled with the in-tree Rust baseline and retains broad `v1.10.55` public-route compatibility. The Laravel seed is now `v1.10.69`; Rust is **not** yet full control-plane parity because ticketed dispatch, intent-risk policy, operator self-service/DSR, policy-key lifecycle and dispatch accounting remain to be ported. See [`PARITY.md`](PARITY.md) and `parity/contract-v1.10.69.json` before making any cutover claim.
+**Status as of 2026-07-11:** the Rust repository has been reconciled with the in-tree Rust baseline and retains broad `v1.10.55` public-route compatibility. The Laravel seed is now `v1.10.69`; Rust is **not** yet full control-plane parity because ticketed dispatch, intent-risk policy, operator self-service/DSR, policy-key lifecycle and dispatch accounting (tracked in issue #1) remain to be ported. See [`PARITY.md`](PARITY.md) and `parity/contract-v1.10.69.json` before making any cutover claim.
 
 The PHP/Laravel directory remains the production seed. Rust is the typed replacement candidate and must continue to pass the same REACH/live conformance probes before it can own production traffic.
 
