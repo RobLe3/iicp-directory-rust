@@ -4777,6 +4777,24 @@ mod tests {
         assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    #[test]
+    fn profile_negotiation_fixture_uses_the_discovery_wire_field() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../parity/profile-negotiation-v0.json"))
+                .expect("profile negotiation fixture must be valid JSON");
+        assert_eq!(fixture["fixture_version"], "0.2.0-draft");
+        assert_eq!(fixture["profile_fixture_sha256"], PROFILE_FIXTURE_SHA256);
+        for case in fixture["cases"].as_array().expect("cases must be an array") {
+            if case["expected"]["requested"] == true {
+                assert!(
+                    case["request"]["profile_fixture_sha256"].as_str().is_some(),
+                    "{}",
+                    case["name"]
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn directory_key_and_signed_token_endpoints_work_with_seed_key() {
         let state = test_state_with_signing_key();
