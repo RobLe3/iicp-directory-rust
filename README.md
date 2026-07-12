@@ -2,7 +2,7 @@
 
 Rust reference implementation of the IICP directory control plane.
 
-**Status as of 2026-07-11:** the Rust repository has been reconciled with the in-tree Rust baseline and retains broad `v1.10.55` public-route compatibility. The Laravel seed is now `v1.10.69`; Rust is **not** yet full control-plane parity because ticketed dispatch, intent-risk policy, operator self-service/DSR, policy-key lifecycle and dispatch accounting (tracked in issue #1) remain to be ported. See [`PARITY.md`](PARITY.md) and `parity/contract-v1.10.69.json` before making any cutover claim.
+**Status:** Rust is a reconciled parity baseline, not a cutover-ready replacement for the Laravel production seed. It implements broad public-route compatibility and key control-plane safeguards, while operational proof and remaining parity work still require verification. See [`PARITY.md`](PARITY.md) and the versioned parity fixtures before making any cutover claim.
 
 The PHP/Laravel directory remains the production seed. Rust is the typed replacement candidate and must continue to pass the same REACH/live conformance probes before it can own production traffic.
 
@@ -81,11 +81,10 @@ Current local verification:
 ```bash
 cd iicp-directory-rs
 cargo test
-# 203 passed
 ```
 
 The route-alias and live-shape compatibility tests are in `src/main.rs` near the other HTTP integration tests.
 
 ## Relationship to PHP
 
-See [`PARITY.md`](PARITY.md) for the detailed PHP/Rust parity checklist. The versioned `parity/contract-v1.10.69.json` defines the current seed requirements; the dedicated PHP repository is aligned with that contract and remains the easiest way to compare exact Laravel behavior.
+See [`PARITY.md`](PARITY.md) for the detailed PHP/Rust parity checklist. The versioned parity fixtures define the seed requirements; the dedicated PHP repository remains the easiest way to compare exact Laravel behavior.

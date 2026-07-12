@@ -1,12 +1,12 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
-Last refreshed: **2026-07-11**. The Laravel seed is currently `v1.10.69`.
+Last refreshed: **2026-07-12**. The Laravel seed remains the production reference; use its release metadata and the versioned parity fixtures for the current comparison point.
 
 > **Status:** this Rust implementation is a reconciled parity baseline, not a
 > cutover-ready replacement. It remains behind the seed for operator acceptance/DSR,
 > policy-key lifecycle, and
 > dispatch-usage accounting. Public-mesh intent-policy refusal is now implemented
-> from the shared canonical taxonomy. `directory/parity/contract-v1.10.69.json` is the
+> from the shared canonical taxonomy. The versioned parity fixtures are the
 > authoritative gap checklist; do not infer parity from route count alone.
 
 The goal is not merely to compile a Rust server. The Rust directory must be wire-compatible with the PHP/Laravel directory for clients, nodes, relays, the website and future replicas. The PHP seed remains production authority until live conformance and operational evidence justify a cutover.
@@ -84,7 +84,7 @@ This closes the biggest practical Rust-vs-live drift: older Rust discovery expos
 
 The public discover/detail wire shape is intentionally not a raw Rust `Node` serialization. Internal fields such as task counters, pricing scalar columns, operator verification internals and `health_models` stay available to Rust scoring/storage, but are hidden from the public response when live PHP exposes the same information only through public summary blocks.
 
-## v1.10.69 required gaps
+## Seed-required gaps
 
 - ✅ `POST /api/v1/dispatch/ticket`: prompt-free, signed, intent/node/expiry-scoped route disclosure ticket. V1 is disclosure-only; stateful redemption/node admission is deferred.
 - ✅ Intent-policy refusal for prohibited and high-risk capability/discovery intent families; transparency and general/custom intents remain routable.
