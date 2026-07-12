@@ -8,6 +8,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+# Compile-time taxonomy fixtures are part of the directory's policy contract.
+# Keep them in the builder image so a production Docker build cannot silently
+# diverge from the checked-in binary/test build.
+COPY parity ./parity
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

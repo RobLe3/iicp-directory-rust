@@ -46,6 +46,9 @@ const SDK_BASELINE_VERSION: &str = "0.7.68";
 
 const OPERATOR_CHALLENGE_TTL_SECS: u64 = 300;
 const OPERATOR_TS_WINDOW_SECS: i64 = 300;
+const PROFILE_ID: &str = "iicp.profile.compatibility.v0";
+const PROFILE_VERSION: &str = "0.3.0-draft";
+const PROFILE_FIXTURE_SHA256: &str = "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf";
 
 /// One-use, process-local operator challenges. They are intentionally short
 /// lived and contain no task content, credentials or private key material.
@@ -307,6 +310,35 @@ struct DiscoverParams {
     /// Falls back to the static `models` list when health_models is not yet reported.
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    profile_version: Option<String>,
+    #[serde(default)]
+    profile_fixture_sha256: Option<String>,
+    #[serde(default)]
+    profile_required: Option<bool>,
+}
+
+fn profile_negotiation(p: &DiscoverParams) -> Option<serde_json::Value> {
+    let profile_id = p.profile_id.as_ref()?;
+    let required = p.profile_required.unwrap_or(false);
+    let compatible = profile_id == PROFILE_ID
+        && p.profile_version.as_deref() == Some(PROFILE_VERSION)
+        && p.profile_fixture_sha256.as_deref() == Some(PROFILE_FIXTURE_SHA256);
+    Some(serde_json::json!({
+        "requested": true,
+        "profile_id": profile_id,
+        "profile_version": p.profile_version.as_deref(),
+        "fixture_sha256": p.profile_fixture_sha256.as_deref(),
+        "required": required,
+        "status": if compatible { "compatible" } else { "unsupported" },
+        "reason": if compatible { "compatible" } else { "unsupported_pre_normative_profile" },
+        "dispatch_allowed": compatible || !required,
+        "supported_profile": PROFILE_ID,
+        "supported_version": PROFILE_VERSION,
+        "supported_fixture_sha256": PROFILE_FIXTURE_SHA256,
+    }))
 }
 
 /// `GET /v1/discover` → NODELIST (iicp-dir §3.3/§3.4).
@@ -314,6 +346,19 @@ async fn discover(
     State(st): State<AppState>,
     Query(p): Query<DiscoverParams>,
 ) -> axum::response::Response {
+    let negotiated_profile = profile_negotiation(&p);
+    if negotiated_profile
+        .as_ref()
+        .is_some_and(|n| n.get("dispatch_allowed") == Some(&serde_json::Value::Bool(false)))
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": {"code": "unsupported_pre_normative_profile", "message": "The requested pre-normative profile is not supported by this directory."},
+                "profile_negotiation": negotiated_profile,
+            })),
+        ).into_response();
+    }
     // PHP validates intent is required and returns 422 (DIR-DISC-10 REACH probe).
     let intent = match p.intent {
         Some(ref i) if !i.is_empty() => i.clone(),
@@ -411,12 +456,15 @@ async fn discover(
     let nodes = enriched;
     let count = nodes.len() as u32;
     let relay_available = nodes.iter().any(|n| n.relay_capable.unwrap_or(false));
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "nodes": nodes.iter().map(live_node_value).collect::<Vec<_>>(),
         "count": count,
         "relay_available": relay_available,
         "query_ms": started.elapsed().as_millis() as u32,
     });
+    if let Some(negotiation) = negotiated_profile {
+        body["profile_negotiation"] = negotiation;
+    }
     // PHP adds Cache-Control for CDN caching (Cloudflare s-maxage=300 + stale-while-revalidate).
     axum::response::Response::builder()
         .status(200)
@@ -4528,6 +4576,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_profile_negotiation_is_additive_and_required_mismatch_fails_closed() {
+        let legacy = app(test_state())
+            .oneshot(axum::http::Request::builder().uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1").body(axum::body::Body::empty()).unwrap())
+            .await.unwrap();
+        let legacy_body = legacy.into_body().collect().await.unwrap().to_bytes();
+        assert!(serde_json::from_slice::<serde_json::Value>(&legacy_body).unwrap().get("profile_negotiation").is_none());
+
+        let compatible_uri = "/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.compatibility.v0&profile_version=0.3.0-draft&profile_fixture_sha256=4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf&profile_required=true";
+        let ok = app(test_state()).oneshot(axum::http::Request::builder().uri(compatible_uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let ok_body = ok.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&ok_body).unwrap()["profile_negotiation"]["status"], "compatible");
+
+        let rejected = app(test_state()).oneshot(axum::http::Request::builder().uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.unknown.v0&profile_version=0.1.0-draft&profile_fixture_sha256=0000000000000000000000000000000000000000000000000000000000000000&profile_required=true").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
     async fn directory_key_and_signed_token_endpoints_work_with_seed_key() {
         let state = test_state_with_signing_key();
         let key_resp = app(state.clone())
@@ -4638,6 +4704,8 @@ mod tests {
         assert_eq!(claims["node_id"], "a");
         assert!(claims.get("prompt").is_none());
         assert!(claims.get("payload").is_none());
+        assert!(claims.get("endpoint").is_none());
+        assert!(claims.get("node_token").is_none());
     }
 
     #[tokio::test]
@@ -5560,6 +5628,51 @@ mod tests {
             "operator_display_name is already claimed by another verified operator (IICP-E051)"
         );
         assert!(st.repo.get("op-name-b").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rotated_predecessor_does_not_block_successor_display_name() {
+        // A key rotation retains the predecessor as immutable lifecycle evidence and
+        // copies its public handle to the active successor. The successor must be
+        // able to re-register under that handle; otherwise supervised handoff loops
+        // indefinitely after an otherwise accepted rotation.
+        let st = test_state();
+        st.repo
+            .upsert_operator(
+                "operator-predecessor",
+                Some("Mesh Pioneer"),
+                Some("2026-07-12T00:00:00Z"),
+                Some(&"a".repeat(64)),
+            )
+            .await;
+        st.repo
+            .rotate_operator_identity(
+                "operator-predecessor",
+                "operator-successor",
+                Some(1),
+                "operator_rotation",
+            )
+            .await
+            .expect("active operator rotates");
+
+        assert_eq!(
+            st.repo
+                .operator_identity_active("operator-predecessor")
+                .await,
+            Some(false)
+        );
+        assert_eq!(
+            st.repo
+                .operator_identity_active("operator-successor")
+                .await,
+            Some(true)
+        );
+        assert!(
+            !st.repo
+                .operator_display_name_claimed_by_other("operator-successor", "mesh pioneer")
+                .await,
+            "rotated predecessor must not reserve the successor's copied handle"
+        );
     }
 
     // ── #460 operator-signed rename (PHP OperatorRenameTest parity #385) ──────────

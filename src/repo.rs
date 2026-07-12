@@ -319,7 +319,9 @@ pub trait NodeRepository: Send + Sync {
     /// (the operator_pubkey itself is directory-private and never served).
     async fn operator_display_name(&self, operator_pubkey: &str) -> Option<String>;
 
-    /// #525/G3 — true when another verified operator already owns this normalized name.
+    /// #525/G3 — true when another *active* verified operator owns this normalized name.
+    /// Rotated and revoked identity records remain as private lifecycle evidence, but
+    /// must not prevent their active successor from retaining the same public handle.
     async fn operator_display_name_claimed_by_other(
         &self,
         operator_pubkey: &str,
@@ -1426,6 +1428,7 @@ impl NodeRepository for InMemoryRepo {
     ) -> bool {
         self.operators.lock().unwrap().iter().any(|(op, row)| {
             op != operator_pubkey
+                && row.identity_status == "active"
                 && row
                     .display_name
                     .as_deref()

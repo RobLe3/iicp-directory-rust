@@ -205,7 +205,7 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
                 .expect("profile fixture must be valid JSON");
-        assert_eq!(fixture["fixture_version"], "0.1.0-draft");
+        assert_eq!(fixture["fixture_version"], "0.2.0-draft");
         assert_eq!(fixture["status"], "pre-normative");
         let scenarios = fixture["scenarios"]
             .as_array()
@@ -217,6 +217,7 @@ mod tests {
         assert!(scenarios
             .iter()
             .any(|item| item["name"] == "mcp_tool_dangerous"));
+        assert!(scenarios.iter().all(|item| item["expected_reason"].is_string()));
     }
 
     #[test]

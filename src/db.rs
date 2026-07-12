@@ -1933,9 +1933,12 @@ impl NodeRepository for MySqlRepo {
         normalized_display_name: &str,
     ) -> bool {
         // MySQL LOWER(TRIM(REGEXP_REPLACE())) parity with PHP's whitespace-folded comparison.
+        // Lifecycle history is deliberately retained, but only an active identity may
+        // reserve a public operator handle. A rotated predecessor must not block its
+        // successor's first re-registration after key migration.
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT 1 FROM operators \
-             WHERE operator_pubkey <> ? AND display_name IS NOT NULL \
+             WHERE operator_pubkey <> ? AND identity_status = 'active' AND display_name IS NOT NULL \
              AND LOWER(TRIM(REGEXP_REPLACE(display_name, '[[:space:]]+', ' '))) = ? \
              LIMIT 1",
         )
