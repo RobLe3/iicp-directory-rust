@@ -177,7 +177,10 @@ pub fn canonical_self_service_bytes(
     payload.remove("sig");
     payload.remove("new_key_sig");
     payload.remove("_operator");
-    payload.insert("action".to_string(), serde_json::Value::String(action.to_string()));
+    payload.insert(
+        "action".to_string(),
+        serde_json::Value::String(action.to_string()),
+    );
     format!(
         "iicp:operator:self-service:v1\n{}",
         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())

@@ -48,7 +48,8 @@ const OPERATOR_CHALLENGE_TTL_SECS: u64 = 300;
 const OPERATOR_TS_WINDOW_SECS: i64 = 300;
 const PROFILE_ID: &str = "iicp.profile.compatibility.v0";
 const PROFILE_VERSION: &str = "0.3.0-draft";
-const PROFILE_FIXTURE_SHA256: &str = "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf";
+const PROFILE_FIXTURE_SHA256: &str =
+    "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf";
 
 /// One-use, process-local operator challenges. They are intentionally short
 /// lived and contain no task content, credentials or private key material.
@@ -603,11 +604,14 @@ fn select_dispatch_ticket_node(
     req: &DispatchTicketRequest,
 ) -> Result<types::Node, (StatusCode, &'static str, &'static str)> {
     if let Some(node_id) = req.node_id.as_deref() {
-        return nodes.into_iter().find(|node| node.node_id == node_id).ok_or((
-            StatusCode::NOT_FOUND,
-            "no_route_available",
-            "No eligible route matched the requested intent and filters.",
-        ));
+        return nodes
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                "no_route_available",
+                "No eligible route matched the requested intent and filters.",
+            ));
     }
     if let Some(prefix) = req.node_id_prefix.as_deref() {
         let mut matches: Vec<_> = nodes
@@ -1306,7 +1310,9 @@ fn operator_challenges() -> &'static std::sync::Mutex<HashMap<String, u64>> {
 
 fn operator_challenge_key(operator_pub: &str, nonce: &str) -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(format!("{operator_pub}\n{nonce}").as_bytes()))
+    hex::encode(Sha256::digest(
+        format!("{operator_pub}\n{nonce}").as_bytes(),
+    ))
 }
 
 fn no_store_json(value: serde_json::Value) -> Response {
@@ -1325,19 +1331,31 @@ fn no_store_error(status: StatusCode, code: &str, message: &str) -> Response {
 fn valid_reason_class(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
-fn lifecycle_fields(req: &OperatorKeyRequest, include_successor: bool) -> BTreeMap<String, serde_json::Value> {
+fn lifecycle_fields(
+    req: &OperatorKeyRequest,
+    include_successor: bool,
+) -> BTreeMap<String, serde_json::Value> {
     let mut fields = BTreeMap::from([
-        ("operator_pub".to_string(), serde_json::Value::String(req.operator_pub.clone())),
-        ("nonce".to_string(), serde_json::Value::String(req.nonce.clone())),
+        (
+            "operator_pub".to_string(),
+            serde_json::Value::String(req.operator_pub.clone()),
+        ),
+        (
+            "nonce".to_string(),
+            serde_json::Value::String(req.nonce.clone()),
+        ),
         ("ts".to_string(), serde_json::Value::from(req.ts)),
     ]);
     if let Some(reason) = &req.reason_class {
-        fields.insert("reason_class".to_string(), serde_json::Value::String(reason.clone()));
+        fields.insert(
+            "reason_class".to_string(),
+            serde_json::Value::String(reason.clone()),
+        );
     }
     if let Some(epoch) = req.rotation_epoch {
         fields.insert("rotation_epoch".to_string(), serde_json::Value::from(epoch));
@@ -1355,7 +1373,9 @@ fn lifecycle_fields(req: &OperatorKeyRequest, include_successor: bool) -> BTreeM
 
 fn consume_operator_challenge(operator_pub: &str, nonce: &str) -> bool {
     let now = delegation::now_unix();
-    let mut challenges = operator_challenges().lock().expect("operator challenge lock");
+    let mut challenges = operator_challenges()
+        .lock()
+        .expect("operator challenge lock");
     challenges.retain(|_, expires| *expires >= now);
     challenges
         .remove(&operator_challenge_key(operator_pub, nonce))
@@ -1367,15 +1387,32 @@ async fn operator_challenge(
     Json(req): Json<OperatorChallengeRequest>,
 ) -> Response {
     if req.operator_pub.is_empty() || req.operator_pub.len() > 64 {
-        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "operator_pub is invalid");
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "operator_pub is invalid",
+        );
     }
     match st.repo.operator_identity_active(&req.operator_pub).await {
-        None => return no_store_error(StatusCode::NOT_FOUND, "IICP-E044", "unknown operator (register a delegated node first)"),
-        Some(false) => return no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity is no longer active"),
+        None => {
+            return no_store_error(
+                StatusCode::NOT_FOUND,
+                "IICP-E044",
+                "unknown operator (register a delegated node first)",
+            )
+        }
+        Some(false) => {
+            return no_store_error(
+                StatusCode::CONFLICT,
+                "IICP-E063",
+                "operator identity is no longer active",
+            )
+        }
         Some(true) => {}
     }
     use ct_codecs::{Base64UrlSafeNoPadding, Encoder};
-    let nonce = Base64UrlSafeNoPadding::encode_to_string(&uuid::Uuid::new_v4().as_bytes()).unwrap_or_default();
+    let nonce = Base64UrlSafeNoPadding::encode_to_string(&uuid::Uuid::new_v4().as_bytes())
+        .unwrap_or_default();
     let expires = delegation::now_unix().saturating_add(OPERATOR_CHALLENGE_TTL_SECS);
     operator_challenges()
         .lock()
@@ -1395,72 +1432,198 @@ async fn validate_operator_key_request(
     action: &str,
     include_successor: bool,
 ) -> Result<(), Response> {
-    if req.operator_pub.is_empty() || req.operator_pub.len() > 64 || req.nonce.len() < 16 || req.nonce.len() > 64 || req.sig.len() > 128 {
-        return Err(no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "operator request fields are invalid"));
+    if req.operator_pub.is_empty()
+        || req.operator_pub.len() > 64
+        || req.nonce.len() < 16
+        || req.nonce.len() > 64
+        || req.sig.len() > 128
+    {
+        return Err(no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "operator request fields are invalid",
+        ));
     }
     if (delegation::now_unix() as i64 - req.ts).abs() > OPERATOR_TS_WINDOW_SECS {
-        return Err(no_store_error(StatusCode::UNAUTHORIZED, "IICP-E041", "stale or future-dated operator request"));
+        return Err(no_store_error(
+            StatusCode::UNAUTHORIZED,
+            "IICP-E041",
+            "stale or future-dated operator request",
+        ));
     }
     match st.repo.operator_identity_active(&req.operator_pub).await {
-        None => return Err(no_store_error(StatusCode::NOT_FOUND, "IICP-E044", "unknown operator")),
-        Some(false) => return Err(no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity is no longer active")),
+        None => {
+            return Err(no_store_error(
+                StatusCode::NOT_FOUND,
+                "IICP-E044",
+                "unknown operator",
+            ))
+        }
+        Some(false) => {
+            return Err(no_store_error(
+                StatusCode::CONFLICT,
+                "IICP-E063",
+                "operator identity is no longer active",
+            ))
+        }
         Some(true) => {}
     }
     if !consume_operator_challenge(&req.operator_pub, &req.nonce) {
-        return Err(no_store_error(StatusCode::UNAUTHORIZED, "IICP-E062", "challenge is missing, expired or already used"));
+        return Err(no_store_error(
+            StatusCode::UNAUTHORIZED,
+            "IICP-E062",
+            "challenge is missing, expired or already used",
+        ));
     }
     let fields = lifecycle_fields(req, include_successor);
-    let (valid, reason) = delegation::verify_self_service(&req.operator_pub, &req.sig, action, &fields);
+    let (valid, reason) =
+        delegation::verify_self_service(&req.operator_pub, &req.sig, action, &fields);
     if !valid {
-        let code = if reason == "malformed" { "IICP-E042" } else { "IICP-E043" };
-        return Err(no_store_error(StatusCode::UNAUTHORIZED, code, "operator signature verification failed"));
+        let code = if reason == "malformed" {
+            "IICP-E042"
+        } else {
+            "IICP-E043"
+        };
+        return Err(no_store_error(
+            StatusCode::UNAUTHORIZED,
+            code,
+            "operator signature verification failed",
+        ));
     }
     Ok(())
 }
 
-async fn operator_key_rotate(State(st): State<AppState>, Json(req): Json<OperatorKeyRequest>) -> Response {
+async fn operator_key_rotate(
+    State(st): State<AppState>,
+    Json(req): Json<OperatorKeyRequest>,
+) -> Response {
     if let Err(response) = validate_operator_key_request(&st, &req, "key_rotate", true).await {
         return response;
     }
     let Some(successor) = req.new_operator_pub.as_deref() else {
-        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "new_operator_pub is required");
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "new_operator_pub is required",
+        );
     };
     let Some(successor_sig) = req.new_key_sig.as_deref() else {
-        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "new_key_sig is required");
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "new_key_sig is required",
+        );
     };
-    if successor == req.operator_pub || successor.len() > 64 || successor_sig.len() > 128 || req.reason_class.as_deref().is_some_and(|value| !valid_reason_class(value)) {
-        return no_store_error(StatusCode::UNAUTHORIZED, "IICP-E064", "malformed successor operator key or signature");
+    if successor == req.operator_pub
+        || successor.len() > 64
+        || successor_sig.len() > 128
+        || req
+            .reason_class
+            .as_deref()
+            .is_some_and(|value| !valid_reason_class(value))
+    {
+        return no_store_error(
+            StatusCode::UNAUTHORIZED,
+            "IICP-E064",
+            "malformed successor operator key or signature",
+        );
     }
     let successor_fields = BTreeMap::from([
-        ("operator_pub".to_string(), serde_json::Value::String(req.operator_pub.clone())),
-        ("new_operator_pub".to_string(), serde_json::Value::String(successor.to_string())),
-        ("nonce".to_string(), serde_json::Value::String(req.nonce.clone())),
+        (
+            "operator_pub".to_string(),
+            serde_json::Value::String(req.operator_pub.clone()),
+        ),
+        (
+            "new_operator_pub".to_string(),
+            serde_json::Value::String(successor.to_string()),
+        ),
+        (
+            "nonce".to_string(),
+            serde_json::Value::String(req.nonce.clone()),
+        ),
         ("ts".to_string(), serde_json::Value::from(req.ts)),
-        ("rotation_epoch".to_string(), req.rotation_epoch.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)),
+        (
+            "rotation_epoch".to_string(),
+            req.rotation_epoch
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        ),
     ]);
-    let (successor_valid, _) = delegation::verify_self_service(successor, successor_sig, "key_rotate_successor", &successor_fields);
+    let (successor_valid, _) = delegation::verify_self_service(
+        successor,
+        successor_sig,
+        "key_rotate_successor",
+        &successor_fields,
+    );
     if !successor_valid {
-        return no_store_error(StatusCode::UNAUTHORIZED, "IICP-E064", "successor operator signature verification failed");
+        return no_store_error(
+            StatusCode::UNAUTHORIZED,
+            "IICP-E064",
+            "successor operator signature verification failed",
+        );
     }
-    match st.repo.rotate_operator_identity(&req.operator_pub, successor, req.rotation_epoch, req.reason_class.as_deref().unwrap_or("operator_rotation")).await {
-        Ok(result) => no_store_json(serde_json::json!({"status":"rotated","operator_fingerprint":public_operator_fingerprint(successor),"linked_nodes":result.linked_nodes,"rotation_epoch":result.rotation_epoch,"receipt_id_prefix":operator_challenge_key(&req.operator_pub, &req.nonce)[..12].to_string(),"legal_certification":false})),
-        Err(_) => no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity rotation cannot be completed"),
+    match st
+        .repo
+        .rotate_operator_identity(
+            &req.operator_pub,
+            successor,
+            req.rotation_epoch,
+            req.reason_class.as_deref().unwrap_or("operator_rotation"),
+        )
+        .await
+    {
+        Ok(result) => no_store_json(
+            serde_json::json!({"status":"rotated","operator_fingerprint":public_operator_fingerprint(successor),"linked_nodes":result.linked_nodes,"rotation_epoch":result.rotation_epoch,"receipt_id_prefix":operator_challenge_key(&req.operator_pub, &req.nonce)[..12].to_string(),"legal_certification":false}),
+        ),
+        Err(_) => no_store_error(
+            StatusCode::CONFLICT,
+            "IICP-E063",
+            "operator identity rotation cannot be completed",
+        ),
     }
 }
 
-async fn operator_key_revoke(State(st): State<AppState>, Json(req): Json<OperatorKeyRequest>) -> Response {
+async fn operator_key_revoke(
+    State(st): State<AppState>,
+    Json(req): Json<OperatorKeyRequest>,
+) -> Response {
     if req.confirm != Some(true) {
-        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "confirm=true is required");
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "confirm=true is required",
+        );
     }
-    if req.reason_class.as_deref().is_some_and(|value| !valid_reason_class(value)) {
-        return no_store_error(StatusCode::UNPROCESSABLE_ENTITY, "validation_error", "reason_class is invalid");
+    if req
+        .reason_class
+        .as_deref()
+        .is_some_and(|value| !valid_reason_class(value))
+    {
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "reason_class is invalid",
+        );
     }
     if let Err(response) = validate_operator_key_request(&st, &req, "key_revoke", false).await {
         return response;
     }
-    match st.repo.revoke_operator_identity(&req.operator_pub, req.reason_class.as_deref().unwrap_or("operator_request")).await {
-        Ok(result) => no_store_json(serde_json::json!({"status":"revoked","operator_fingerprint":public_operator_fingerprint(&req.operator_pub),"linked_nodes":result.linked_nodes,"revoked_at":result.revoked_at_unix.and_then(|v| chrono::DateTime::from_timestamp(v, 0)).map(|v|v.to_rfc3339()),"receipt_id_prefix":operator_challenge_key(&req.operator_pub, &req.nonce)[..12].to_string(),"legal_certification":false})),
-        Err(_) => no_store_error(StatusCode::CONFLICT, "IICP-E063", "operator identity revocation cannot be completed"),
+    match st
+        .repo
+        .revoke_operator_identity(
+            &req.operator_pub,
+            req.reason_class.as_deref().unwrap_or("operator_request"),
+        )
+        .await
+    {
+        Ok(result) => no_store_json(
+            serde_json::json!({"status":"revoked","operator_fingerprint":public_operator_fingerprint(&req.operator_pub),"linked_nodes":result.linked_nodes,"revoked_at":result.revoked_at_unix.and_then(|v| chrono::DateTime::from_timestamp(v, 0)).map(|v|v.to_rfc3339()),"receipt_id_prefix":operator_challenge_key(&req.operator_pub, &req.nonce)[..12].to_string(),"legal_certification":false}),
+        ),
+        Err(_) => no_store_error(
+            StatusCode::CONFLICT,
+            "IICP-E063",
+            "operator identity revocation cannot be completed",
+        ),
     }
 }
 
@@ -4578,16 +4741,37 @@ mod tests {
     #[tokio::test]
     async fn discover_profile_negotiation_is_additive_and_required_mismatch_fails_closed() {
         let legacy = app(test_state())
-            .oneshot(axum::http::Request::builder().uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1").body(axum::body::Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let legacy_body = legacy.into_body().collect().await.unwrap().to_bytes();
-        assert!(serde_json::from_slice::<serde_json::Value>(&legacy_body).unwrap().get("profile_negotiation").is_none());
+        assert!(serde_json::from_slice::<serde_json::Value>(&legacy_body)
+            .unwrap()
+            .get("profile_negotiation")
+            .is_none());
 
         let compatible_uri = "/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.compatibility.v0&profile_version=0.3.0-draft&profile_fixture_sha256=4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf&profile_required=true";
-        let ok = app(test_state()).oneshot(axum::http::Request::builder().uri(compatible_uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let ok = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(compatible_uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
         let ok_body = ok.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&ok_body).unwrap()["profile_negotiation"]["status"], "compatible");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&ok_body).unwrap()["profile_negotiation"]
+                ["status"],
+            "compatible"
+        );
 
         let rejected = app(test_state()).oneshot(axum::http::Request::builder().uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.unknown.v0&profile_version=0.1.0-draft&profile_fixture_sha256=0000000000000000000000000000000000000000000000000000000000000000&profile_required=true").body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -5662,9 +5846,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            st.repo
-                .operator_identity_active("operator-successor")
-                .await,
+            st.repo.operator_identity_active("operator-successor").await,
             Some(true)
         );
         assert!(
@@ -5729,10 +5911,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_slice(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         body["nonce"].as_str().unwrap().to_string()
     }
 
@@ -5826,20 +6007,43 @@ mod tests {
         let next = KeyPair::from_seed(Seed::new([42; 32]));
         let old_pub = Base64::encode_to_string(&old.pk[..]).unwrap();
         let next_pub = Base64::encode_to_string(&next.pk[..]).unwrap();
-        st.repo.upsert_operator(&old_pub, Some("Lifecycle"), None, None).await;
+        st.repo
+            .upsert_operator(&old_pub, Some("Lifecycle"), None, None)
+            .await;
         let nonce = challenge_nonce(st.clone(), &old_pub).await;
         let ts = delegation::now_unix() as i64;
         let fields = BTreeMap::from([
-            ("operator_pub".to_string(), serde_json::Value::String(old_pub.clone())),
-            ("new_operator_pub".to_string(), serde_json::Value::String(next_pub.clone())),
-            ("nonce".to_string(), serde_json::Value::String(nonce.clone())),
+            (
+                "operator_pub".to_string(),
+                serde_json::Value::String(old_pub.clone()),
+            ),
+            (
+                "new_operator_pub".to_string(),
+                serde_json::Value::String(next_pub.clone()),
+            ),
+            (
+                "nonce".to_string(),
+                serde_json::Value::String(nonce.clone()),
+            ),
             ("ts".to_string(), serde_json::Value::from(ts)),
-            ("reason_class".to_string(), serde_json::Value::String("operator_rotation".to_string())),
+            (
+                "reason_class".to_string(),
+                serde_json::Value::String("operator_rotation".to_string()),
+            ),
         ]);
         let successor_fields = BTreeMap::from([
-            ("operator_pub".to_string(), serde_json::Value::String(old_pub.clone())),
-            ("new_operator_pub".to_string(), serde_json::Value::String(next_pub.clone())),
-            ("nonce".to_string(), serde_json::Value::String(nonce.clone())),
+            (
+                "operator_pub".to_string(),
+                serde_json::Value::String(old_pub.clone()),
+            ),
+            (
+                "new_operator_pub".to_string(),
+                serde_json::Value::String(next_pub.clone()),
+            ),
+            (
+                "nonce".to_string(),
+                serde_json::Value::String(nonce.clone()),
+            ),
             ("ts".to_string(), serde_json::Value::from(ts)),
             ("rotation_epoch".to_string(), serde_json::Value::Null),
         ]);
@@ -5859,11 +6063,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         assert_eq!(body["status"], "rotated");
         assert_eq!(body["rotation_epoch"], 1);
-        assert_eq!(st.repo.operator_identity_active(&old_pub).await, Some(false));
-        assert_eq!(st.repo.operator_identity_active(&next_pub).await, Some(true));
+        assert_eq!(
+            st.repo.operator_identity_active(&old_pub).await,
+            Some(false)
+        );
+        assert_eq!(
+            st.repo.operator_identity_active(&next_pub).await,
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -5875,15 +6087,26 @@ mod tests {
         let st = test_state();
         let key = KeyPair::from_seed(Seed::new([43; 32]));
         let operator_pub = Base64::encode_to_string(&key.pk[..]).unwrap();
-        st.repo.upsert_operator(&operator_pub, Some("Revoke"), None, None).await;
+        st.repo
+            .upsert_operator(&operator_pub, Some("Revoke"), None, None)
+            .await;
         let nonce = challenge_nonce(st.clone(), &operator_pub).await;
         let ts = delegation::now_unix() as i64;
         let fields = BTreeMap::from([
-            ("operator_pub".to_string(), serde_json::Value::String(operator_pub.clone())),
-            ("nonce".to_string(), serde_json::Value::String(nonce.clone())),
+            (
+                "operator_pub".to_string(),
+                serde_json::Value::String(operator_pub.clone()),
+            ),
+            (
+                "nonce".to_string(),
+                serde_json::Value::String(nonce.clone()),
+            ),
             ("ts".to_string(), serde_json::Value::from(ts)),
             ("confirm".to_string(), serde_json::Value::Bool(true)),
-            ("reason_class".to_string(), serde_json::Value::String("operator_request".to_string())),
+            (
+                "reason_class".to_string(),
+                serde_json::Value::String("operator_request".to_string()),
+            ),
         ]);
         let body = serde_json::json!({
             "operator_pub": operator_pub,
@@ -5893,14 +6116,27 @@ mod tests {
             "reason_class": "operator_request",
             "sig": sign_self_service(&key, &operator_pub, "key_revoke", fields),
         });
-        let response = app(st.clone()).oneshot(post_operator("/v1/operator/key/revoke", body.clone())).await.unwrap();
+        let response = app(st.clone())
+            .oneshot(post_operator("/v1/operator/key/revoke", body.clone()))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let received: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let received: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         assert_eq!(received["status"], "revoked");
-        assert_eq!(st.repo.operator_identity_active(&operator_pub).await, Some(false));
-        let replay = app(st.clone()).oneshot(post_operator("/v1/operator/key/revoke", body)).await.unwrap();
+        assert_eq!(
+            st.repo.operator_identity_active(&operator_pub).await,
+            Some(false)
+        );
+        let replay = app(st.clone())
+            .oneshot(post_operator("/v1/operator/key/revoke", body))
+            .await
+            .unwrap();
         assert_eq!(replay.status(), StatusCode::CONFLICT);
-        let replay_body: serde_json::Value = serde_json::from_slice(&replay.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let replay_body: serde_json::Value =
+            serde_json::from_slice(&replay.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         assert_eq!(replay_body["error"]["code"], "IICP-E063");
     }
 

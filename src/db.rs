@@ -1996,7 +1996,11 @@ impl NodeRepository for MySqlRepo {
         if old_operator_pubkey == new_operator_pubkey {
             return Err(OperatorLifecycleError::Invalid);
         }
-        let mut tx = self.pool.begin().await.map_err(|_| OperatorLifecycleError::Storage)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| OperatorLifecycleError::Storage)?;
         let old: Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<String>, Option<u32>)> = sqlx::query_as(
             "SELECT display_name, attested_created_at, operator_integrity_hash, first_seen_ms, ordinal, tier, badge, provenance, rotation_epoch \
              FROM operators WHERE operator_pubkey = ? AND identity_status = 'active' FOR UPDATE",
@@ -2005,17 +2009,43 @@ impl NodeRepository for MySqlRepo {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| OperatorLifecycleError::Storage)?;
-        let Some((display_name, attested_created_at, integrity_hash, first_seen_ms, ordinal, tier, badge, provenance, prior_epoch)) = old else {
-            let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
-                .bind(old_operator_pubkey).fetch_optional(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
-            return Err(if exists.is_some() { OperatorLifecycleError::Inactive } else { OperatorLifecycleError::Unknown });
+        let Some((
+            display_name,
+            attested_created_at,
+            integrity_hash,
+            first_seen_ms,
+            ordinal,
+            tier,
+            badge,
+            provenance,
+            prior_epoch,
+        )) = old
+        else {
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
+                    .bind(old_operator_pubkey)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|_| OperatorLifecycleError::Storage)?;
+            return Err(if exists.is_some() {
+                OperatorLifecycleError::Inactive
+            } else {
+                OperatorLifecycleError::Unknown
+            });
         };
-        let successor_exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
-            .bind(new_operator_pubkey).fetch_optional(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
+        let successor_exists: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
+                .bind(new_operator_pubkey)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| OperatorLifecycleError::Storage)?;
         if successor_exists.is_some() {
             return Err(OperatorLifecycleError::SuccessorExists);
         }
-        let epoch = prior_epoch.unwrap_or(0).saturating_add(1).max(requested_epoch.unwrap_or(0));
+        let epoch = prior_epoch
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(requested_epoch.unwrap_or(0));
         sqlx::query(
             "INSERT INTO operators (operator_pubkey, identity_status, display_name, attested_created_at, operator_integrity_hash, first_seen_ms, ordinal, tier, badge, provenance, created_at, updated_at) \
              VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
@@ -2037,8 +2067,14 @@ impl NodeRepository for MySqlRepo {
         )
         .bind(successor_hash).bind(epoch).bind(reason_class).bind(old_operator_pubkey)
         .execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
-        tx.commit().await.map_err(|_| OperatorLifecycleError::Storage)?;
-        Ok(OperatorLifecycleResult { linked_nodes: linked, rotation_epoch: Some(epoch), revoked_at_unix: None })
+        tx.commit()
+            .await
+            .map_err(|_| OperatorLifecycleError::Storage)?;
+        Ok(OperatorLifecycleResult {
+            linked_nodes: linked,
+            rotation_epoch: Some(epoch),
+            revoked_at_unix: None,
+        })
     }
 
     async fn revoke_operator_identity(
@@ -2046,20 +2082,38 @@ impl NodeRepository for MySqlRepo {
         operator_pubkey: &str,
         reason_class: &str,
     ) -> Result<OperatorLifecycleResult, OperatorLifecycleError> {
-        let mut tx = self.pool.begin().await.map_err(|_| OperatorLifecycleError::Storage)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| OperatorLifecycleError::Storage)?;
         let active: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? AND identity_status = 'active' FOR UPDATE")
             .bind(operator_pubkey).fetch_optional(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
         if active.is_none() {
-            let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
-                .bind(operator_pubkey).fetch_optional(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
-            return Err(if exists.is_some() { OperatorLifecycleError::Inactive } else { OperatorLifecycleError::Unknown });
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
+                    .bind(operator_pubkey)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|_| OperatorLifecycleError::Storage)?;
+            return Err(if exists.is_some() {
+                OperatorLifecycleError::Inactive
+            } else {
+                OperatorLifecycleError::Unknown
+            });
         }
         let linked = sqlx::query("UPDATE nodes SET operator_verified = 0, operator_trust_tier = NULL, updated_at = NOW() WHERE operator_pubkey = ?")
             .bind(operator_pubkey).execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?.rows_affected() as u32;
         sqlx::query("UPDATE operators SET identity_status = 'revoked', identity_revoked_at = NOW(), identity_reason_class = ?, updated_at = NOW() WHERE operator_pubkey = ?")
             .bind(reason_class).bind(operator_pubkey).execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
-        tx.commit().await.map_err(|_| OperatorLifecycleError::Storage)?;
-        Ok(OperatorLifecycleResult { linked_nodes: linked, rotation_epoch: None, revoked_at_unix: Some(chrono::Utc::now().timestamp()) })
+        tx.commit()
+            .await
+            .map_err(|_| OperatorLifecycleError::Storage)?;
+        Ok(OperatorLifecycleResult {
+            linked_nodes: linked,
+            rotation_epoch: None,
+            revoked_at_unix: Some(chrono::Utc::now().timestamp()),
+        })
     }
 
     async fn set_operator_recognition(
