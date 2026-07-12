@@ -466,14 +466,18 @@ async fn discover(
     if let Some(negotiation) = negotiated_profile {
         body["profile_negotiation"] = negotiation;
     }
-    // PHP adds Cache-Control for CDN caching (Cloudflare s-maxage=300 + stale-while-revalidate).
+    // Keep Rust-directory cache semantics aligned with the seed: routes may
+    // carry rotating tunnel/relay endpoints, so long CDN staleness is unsafe.
+    // Rust has no origin result cache yet; advertise that fact safely so
+    // conformance telemetry does not invent cache-hit/miss evidence.
     axum::response::Response::builder()
         .status(200)
         .header("content-type", "application/json")
         .header(
             "cache-control",
-            "public, max-age=60, s-maxage=300, stale-while-revalidate=120",
+            "public, max-age=5, s-maxage=10, stale-while-revalidate=5",
         )
+        .header("x-iicp-discover-origin-cache", "bypass")
         .header("vary", "Accept-Encoding")
         .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
@@ -4775,6 +4779,36 @@ mod tests {
 
         let rejected = app(test_state()).oneshot(axum::http::Request::builder().uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.unknown.v0&profile_version=0.1.0-draft&profile_fixture_sha256=0000000000000000000000000000000000000000000000000000000000000000&profile_required=true").body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn discover_uses_short_freshness_and_declares_cache_bypass() {
+        let response = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-iicp-discover-origin-cache")
+                .unwrap(),
+            "bypass"
+        );
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cache_control.contains("max-age=5"));
+        assert!(cache_control.contains("s-maxage=10"));
+        assert!(cache_control.contains("stale-while-revalidate=5"));
     }
 
     #[test]
