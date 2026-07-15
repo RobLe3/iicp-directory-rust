@@ -1700,6 +1700,7 @@ mod tests {
             relay_capable: None,
             sdk_language: None,
             sdk_version: None,
+            backend: None,
             address_family: None,
             cip_policy: None,
             quantization: vec![],

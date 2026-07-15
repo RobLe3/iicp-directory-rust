@@ -70,6 +70,10 @@ pub struct Node {
     /// SDK version string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdk_version: Option<String>,
+    /// Informational local execution backend. This is not a routing or mesh
+    /// control-plane field; it must never contain backend topology or peer data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// Derived from endpoint host: ipv4 | ipv6 | hostname | unknown (PHP NodeScorer parity).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_family: Option<String>,
@@ -202,6 +206,7 @@ mod tests {
         assert_eq!(n.node_id, "n1");
         assert!(n.health_label.is_none());
         assert!(n.reputation_tier.is_none());
+        assert!(n.backend.is_none());
     }
 
     #[test]
@@ -212,6 +217,22 @@ mod tests {
         let n: Node = serde_json::from_str(json).unwrap();
         assert_eq!(n.health_label.as_deref(), Some("healthy"));
         assert_eq!(n.reputation_tier.as_deref(), Some("bronze"));
+    }
+
+    #[test]
+    fn node_roundtrips_backend_as_optional_informational_metadata() {
+        let mut value = serde_json::json!({
+            "node_id": "n1",
+            "endpoint": "https://x",
+            "region": "eu",
+            "score": 0.9,
+            "available": true,
+            "backend": "meshllm"
+        });
+        let node: Node = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(node.backend.as_deref(), Some("meshllm"));
+        value = serde_json::to_value(node).unwrap();
+        assert_eq!(value["backend"], "meshllm");
     }
 
     #[test]

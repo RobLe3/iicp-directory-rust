@@ -391,6 +391,10 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         relay_capable: None,
         sdk_language: None,
         sdk_version: None,
+        backend: payload
+            .get("backend")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         address_family: None,
         cip_policy: payload.get("cip_policy").cloned(),
         public_key: None,
@@ -758,6 +762,7 @@ mod tests {
             payload: json!({
                 "endpoint": format!("https://{node_id}.test"),
                 "region": "eu-central",
+                "backend": "meshllm",
                 "capabilities": [
                     {"intent": CHAT, "models": ["llama-3-8b"], "max_tokens": 4096, "input_modalities": ["text"]}
                 ]
@@ -786,6 +791,10 @@ mod tests {
         let ev = register_event("n1", 1);
         assert_eq!(apply_event(&repo, &ev).await, ApplyOutcome::Applied);
         assert_eq!(discoverable(&repo, CHAT).await, vec!["n1".to_string()]);
+        assert_eq!(
+            repo.get("n1").await.unwrap().backend.as_deref(),
+            Some("meshllm")
+        );
     }
 
     #[tokio::test]
@@ -1109,7 +1118,7 @@ mod tests {
         let snapshot = json!({
             "snapshot_seq": 42,
             "nodes": [
-                {"node_id": "s1", "endpoint": "https://s1.test", "region": "eu", "available": true, "reputation_score": 0.8},
+                {"node_id": "s1", "endpoint": "https://s1.test", "region": "eu", "backend": "meshllm", "available": true, "reputation_score": 0.8},
                 {"node_id": "s2", "endpoint": "https://s2.test", "region": "us", "available": false, "reputation_score": 0.7}
             ],
             "capabilities": [
@@ -1120,6 +1129,10 @@ mod tests {
         assert_eq!(apply_snapshot(&repo, &snapshot).await, 2);
         // s1 available → discoverable; s2 unavailable → mirrored but not discoverable.
         assert_eq!(discoverable(&repo, CHAT).await, vec!["s1".to_string()]);
+        assert_eq!(
+            repo.get("s1").await.unwrap().backend.as_deref(),
+            Some("meshllm")
+        );
     }
 
     #[tokio::test]

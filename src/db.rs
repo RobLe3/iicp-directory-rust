@@ -127,6 +127,8 @@ struct NodeRow {
     sdk_language: Option<String>,
     #[sqlx(default)]
     sdk_version: Option<String>,
+    #[sqlx(default)]
+    backend: Option<String>,
     // ADR-045 Phase A (#407) — verified operator identity binding (PHP parity, #385).
     #[sqlx(default)]
     operator_pubkey: Option<String>,
@@ -203,6 +205,7 @@ impl From<NodeRow> for Node {
             relay_capable: Some(r.relay_capable),
             sdk_language: r.sdk_language,
             sdk_version: r.sdk_version,
+            backend: r.backend,
             address_family: None, // set at query time by detect_address_family
             cip_policy: Some(serde_json::json!({
                 "allow_remote_inference": false, "allow_tool_execution": false,
@@ -290,7 +293,7 @@ impl NodeRepository for MySqlRepo {
                       n.load, n.active_jobs, n.max_concurrent, n.tasks_total,
                       n.avg_latency_ms, n.exposure_mode, n.transport_endpoint,
                       n.credit_cost_multiplier, n.pricing_model, n.attested, n.tasks_failed,
-                      n.public_reachable, n.relay_capable
+                      n.public_reachable, n.relay_capable, n.backend
                FROM nodes n
                INNER JOIN capabilities c ON c.node_id = n.id
                WHERE c.intent = ?
@@ -336,9 +339,9 @@ impl NodeRepository for MySqlRepo {
             r#"INSERT INTO nodes
                  (id, endpoint, region, available, relay_capable, node_token_hash, node_hmac_key,
                   proxy_token_hash, max_concurrent, tokens_per_min, reputation_score, status,
-                  operator_pubkey, operator_verified, operator_trust_tier,
+                  operator_pubkey, operator_verified, operator_trust_tier, backend,
                   public_listing, operator_url)
-               VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?)
                ON DUPLICATE KEY UPDATE
                  endpoint           = VALUES(endpoint),
                  region             = VALUES(region),
@@ -352,6 +355,7 @@ impl NodeRepository for MySqlRepo {
                  operator_pubkey     = VALUES(operator_pubkey),
                  operator_verified   = VALUES(operator_verified),
                  operator_trust_tier = VALUES(operator_trust_tier),
+                 backend             = VALUES(backend),
                  -- WQ-058 / ADR-017 REG-01 — re-register updates the public-listing opt-in.
                  public_listing      = VALUES(public_listing),
                  operator_url        = VALUES(operator_url)
@@ -369,6 +373,7 @@ impl NodeRepository for MySqlRepo {
         .bind(&rec.node.operator_pubkey)
         .bind(rec.node.operator_verified)
         .bind(&rec.node.operator_trust_tier)
+        .bind(&rec.node.backend)
         .bind(rec.node.public_listing)
         .bind(&rec.node.operator_url)
         .execute(&self.pool)
@@ -485,7 +490,7 @@ impl NodeRepository for MySqlRepo {
             r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable,
+                      public_reachable, relay_capable, backend,
                       operator_pubkey, operator_verified, operator_trust_tier
                FROM nodes WHERE id = ?"#,
         )
@@ -506,7 +511,7 @@ impl NodeRepository for MySqlRepo {
             r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable,
+                      public_reachable, relay_capable, backend,
                       operator_pubkey, operator_verified, operator_trust_tier
                FROM nodes
                WHERE (id = ? OR id LIKE CONCAT(?, '%')) AND available = 1
@@ -544,7 +549,7 @@ impl NodeRepository for MySqlRepo {
             r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, sdk_language, sdk_version
+                      public_reachable, relay_capable, sdk_language, sdk_version, backend
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -566,7 +571,7 @@ impl NodeRepository for MySqlRepo {
             r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable
+                      public_reachable, relay_capable, backend
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)"#,
@@ -622,7 +627,7 @@ impl NodeRepository for MySqlRepo {
                 r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                           max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                           credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable
+                      public_reachable, relay_capable, backend
                    FROM nodes
                    WHERE available = 1
                      AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -642,7 +647,7 @@ impl NodeRepository for MySqlRepo {
             r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable
+                      public_reachable, relay_capable, backend
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -718,7 +723,7 @@ impl NodeRepository for MySqlRepo {
             r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
                       max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
                       credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, public_listing, operator_url
+                      public_reachable, relay_capable, backend, public_listing, operator_url
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)

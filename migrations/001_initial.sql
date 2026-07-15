@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     -- SDK info
     sdk_language   VARCHAR(32)          NULL,
     sdk_version    VARCHAR(32)          NULL,
+    -- Informational local backend flavour; no peer/topology/control-plane data.
+    backend        VARCHAR(32)          NULL,
     -- ADR-043 exposure classification
     exposure_mode  VARCHAR(36)          NULL,
     -- Credit pricing (iicp-dir §6.4 — multiplier of base 1.0 credits/1000 tokens)

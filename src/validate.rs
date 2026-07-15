@@ -205,15 +205,18 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
                 .expect("profile fixture must be valid JSON");
-        assert_eq!(fixture["fixture_version"], "0.3.0-draft");
+        assert_eq!(fixture["fixture_version"], "0.4.0-draft");
         assert_eq!(fixture["status"], "pre-normative");
         let scenarios = fixture["scenarios"]
             .as_array()
             .expect("fixture scenarios array");
-        assert_eq!(scenarios.len(), 11);
+        assert_eq!(scenarios.len(), 15);
         assert!(scenarios
             .iter()
             .any(|item| item["name"] == "required_extension"));
+        assert!(scenarios
+            .iter()
+            .any(|item| item["name"] == "unsupported_intent_version"));
         assert!(scenarios
             .iter()
             .any(|item| item["name"] == "mcp_tool_dangerous"));

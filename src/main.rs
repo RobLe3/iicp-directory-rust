@@ -47,8 +47,11 @@ const SDK_BASELINE_VERSION: &str = "0.7.68";
 const OPERATOR_CHALLENGE_TTL_SECS: u64 = 300;
 const OPERATOR_TS_WINDOW_SECS: i64 = 300;
 const PROFILE_ID: &str = "iicp.profile.compatibility.v0";
-const PROFILE_VERSION: &str = "0.3.0-draft";
+const PROFILE_VERSION: &str = "0.4.0-draft";
 const PROFILE_FIXTURE_SHA256: &str =
+    "d039eaf52afca6866832779261db7bdd2ffd818a36bc8ba9aea1db0c9c115012";
+const PREVIOUS_PROFILE_VERSION: &str = "0.3.0-draft";
+const PREVIOUS_PROFILE_FIXTURE_SHA256: &str =
     "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf";
 
 /// One-use, process-local operator challenges. They are intentionally short
@@ -325,8 +328,17 @@ fn profile_negotiation(p: &DiscoverParams) -> Option<serde_json::Value> {
     let profile_id = p.profile_id.as_ref()?;
     let required = p.profile_required.unwrap_or(false);
     let compatible = profile_id == PROFILE_ID
-        && p.profile_version.as_deref() == Some(PROFILE_VERSION)
-        && p.profile_fixture_sha256.as_deref() == Some(PROFILE_FIXTURE_SHA256);
+        && matches!(
+            (
+                p.profile_version.as_deref(),
+                p.profile_fixture_sha256.as_deref()
+            ),
+            (Some(PROFILE_VERSION), Some(PROFILE_FIXTURE_SHA256))
+                | (
+                    Some(PREVIOUS_PROFILE_VERSION),
+                    Some(PREVIOUS_PROFILE_FIXTURE_SHA256)
+                )
+        );
     Some(serde_json::json!({
         "requested": true,
         "profile_id": profile_id,
@@ -888,7 +900,13 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
         }),
     );
 
-    obj.insert("backend".into(), serde_json::json!("unknown"));
+    obj.insert(
+        "backend".into(),
+        n.backend
+            .as_deref()
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|| serde_json::json!("unknown")),
+    );
     obj.insert(
         "backend_stability".into(),
         serde_json::json!({
@@ -1107,6 +1125,9 @@ struct RegisterRequest {
     /// SDK version string (informational, Phase 5).
     #[serde(default)]
     sdk_version: Option<String>,
+    /// Informational local backend flavour. It does not alter IICP routing.
+    #[serde(default)]
+    backend: Option<String>,
     /// cx_public_key identity object (ADR-030 operator identity, Phase 5).
     #[serde(default)]
     cx_public_key: Option<serde_json::Value>,
@@ -1806,6 +1827,20 @@ async fn register(
     if req.capabilities.is_empty() {
         return reject("validation_error", "at least one capability is required");
     }
+    if let Some(ref backend) = req.backend {
+        const BACKENDS: &[&str] = &[
+            "ollama",
+            "lmstudio",
+            "vllm",
+            "llamacpp",
+            "meshllm",
+            "anthropic",
+            "custom",
+        ];
+        if !BACKENDS.contains(&backend.as_str()) {
+            return reject("validation_error", &format!("invalid backend: {backend}"));
+        }
+    }
     for cap in &req.capabilities {
         if !validate_intent(&cap.intent) {
             return reject(
@@ -1989,6 +2024,7 @@ async fn register(
         relay_capable: req.relay_capable,
         sdk_language: req.sdk_language.clone(),
         sdk_version: req.sdk_version.clone(),
+        backend: req.backend.clone(),
         address_family: None, // set at query time by detect_address_family
         public_key: req.cx_public_key.clone(),
         transport_metadata: req.transport_metadata.clone(),
@@ -2054,6 +2090,7 @@ async fn register(
         serde_json::json!({
             "endpoint": req.endpoint,
             "region": req.region,
+            "backend": req.backend,
             "capabilities": req.capabilities.iter().map(|c| serde_json::json!({
                 "intent": c.intent,
                 "models": c.models,
@@ -4609,6 +4646,7 @@ mod tests {
                 relay_capable: None,
                 sdk_language: None,
                 sdk_version: None,
+                backend: None,
                 address_family: None,
                 cip_policy: Some(
                     serde_json::json!({"allow_remote_inference":false,"allow_tool_execution":false,"allow_file_access":false,"pricing_credits_per_1000":null}),
@@ -4759,7 +4797,7 @@ mod tests {
             .get("profile_negotiation")
             .is_none());
 
-        let compatible_uri = "/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.compatibility.v0&profile_version=0.3.0-draft&profile_fixture_sha256=4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf&profile_required=true";
+        let compatible_uri = "/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.compatibility.v0&profile_version=0.4.0-draft&profile_fixture_sha256=d039eaf52afca6866832779261db7bdd2ffd818a36bc8ba9aea1db0c9c115012&profile_required=true";
         let ok = app(test_state())
             .oneshot(
                 axum::http::Request::builder()
@@ -4776,6 +4814,17 @@ mod tests {
                 ["status"],
             "compatible"
         );
+
+        let legacy = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.compatibility.v0&profile_version=0.3.0-draft&profile_fixture_sha256=4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf&profile_required=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK);
 
         let rejected = app(test_state()).oneshot(axum::http::Request::builder().uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1&profile_id=iicp.profile.unknown.v0&profile_version=0.1.0-draft&profile_fixture_sha256=0000000000000000000000000000000000000000000000000000000000000000&profile_required=true").body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -4819,12 +4868,18 @@ mod tests {
         assert_eq!(fixture["fixture_version"], "0.2.0-draft");
         assert_eq!(fixture["profile_fixture_sha256"], PROFILE_FIXTURE_SHA256);
         for case in fixture["cases"].as_array().expect("cases must be an array") {
-            if case["expected"]["requested"] == true {
-                assert!(
-                    case["request"]["profile_fixture_sha256"].as_str().is_some(),
-                    "{}",
-                    case["name"]
-                );
+            let request: DiscoverParams = serde_json::from_value(case["request"].clone())
+                .expect("profile negotiation fixture request must deserialize");
+            let expected = &case["expected"];
+            if expected["requested"] == true {
+                assert!(request.profile_fixture_sha256.is_some(), "{}", case["name"]);
+                let actual =
+                    profile_negotiation(&request).expect("requested profile must negotiate");
+                for field in ["status", "reason", "dispatch_allowed"] {
+                    assert_eq!(actual[field], expected[field], "{}: {field}", case["name"]);
+                }
+            } else {
+                assert!(profile_negotiation(&request).is_none(), "{}", case["name"]);
             }
         }
     }
@@ -5593,6 +5648,7 @@ mod tests {
             "relay_capable": true,
             "sdk_language": "python",
             "sdk_version": "0.5.2",
+            "backend": "meshllm",
             "nat_type": "full_cone",
             "transport_method": "direct"
         });
@@ -5646,6 +5702,7 @@ mod tests {
             .expect("registered node must appear in discover");
         assert_eq!(node["relay_capable"], true);
         assert_eq!(node["sdk_language"], "python");
+        assert_eq!(node["backend"], "meshllm");
         assert_eq!(node["nat_type"], "full_cone");
         assert_eq!(node["models"][0], "llama3");
         assert_eq!(node["quantization"][0], "q4_k_m");
@@ -5944,7 +6001,6 @@ mod tests {
 
     fn sign_self_service(
         keypair: &ed25519_compact::KeyPair,
-        operator_pub: &str,
         action: &str,
         fields: BTreeMap<String, serde_json::Value>,
     ) -> String {
@@ -6108,8 +6164,8 @@ mod tests {
                     "nonce": nonce,
                     "ts": ts,
                     "reason_class": "operator_rotation",
-                    "sig": sign_self_service(&old, &old_pub, "key_rotate", fields),
-                    "new_key_sig": sign_self_service(&next, &next_pub, "key_rotate_successor", successor_fields),
+                    "sig": sign_self_service(&old, "key_rotate", fields),
+                    "new_key_sig": sign_self_service(&next, "key_rotate_successor", successor_fields),
                 }),
             ))
             .await
@@ -6166,7 +6222,7 @@ mod tests {
             "ts": ts,
             "confirm": true,
             "reason_class": "operator_request",
-            "sig": sign_self_service(&key, &operator_pub, "key_revoke", fields),
+            "sig": sign_self_service(&key, "key_revoke", fields),
         });
         let response = app(st.clone())
             .oneshot(post_operator("/v1/operator/key/revoke", body.clone()))
@@ -6754,6 +6810,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 422);
+    }
+
+    #[tokio::test]
+    async fn register_rejects_unknown_backend_without_persisting() {
+        let state = test_state();
+        let body = serde_json::json!({
+            "node_id": "backend-invalid",
+            "endpoint": "https://1.1.1.1",
+            "backend": "meshllm-peer-topology",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
+        });
+        let resp = app(state.clone())
+            .oneshot(post_register(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(state.repo.get("backend-invalid").await.is_none());
     }
 
     #[tokio::test]
@@ -7999,6 +8072,7 @@ mod tests {
                 relay_capable: None,
                 sdk_language: None,
                 sdk_version: None,
+                backend: None,
                 address_family: None,
                 cip_policy: Some(
                     serde_json::json!({"allow_remote_inference":false,"allow_tool_execution":false,"allow_file_access":false,"pricing_credits_per_1000":null}),
