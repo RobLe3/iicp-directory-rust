@@ -825,6 +825,18 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
     obj.insert("public_key".into(), public_key.clone());
     let key_ready = !public_key.is_null();
     obj.insert("key_ready".into(), serde_json::json!(key_ready));
+    let response_encryption_ready = public_key
+        .get("features")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature.as_str() == Some("response_encryption_v1"))
+        });
+    obj.insert(
+        "response_encryption_ready".into(),
+        serde_json::json!(response_encryption_ready),
+    );
     obj.insert(
         "privacy_routing_status".into(),
         serde_json::json!(if key_ready {
@@ -4756,6 +4768,7 @@ mod tests {
         for field in [
             "cx_public_key",
             "key_ready",
+            "response_encryption_ready",
             "privacy_routing_status",
             "auto_update",
             "backend_stability",
@@ -4777,6 +4790,7 @@ mod tests {
         }
         assert_eq!(node["sdk_baseline_version"], SDK_BASELINE_VERSION);
         assert_eq!(node["privacy_routing_status"], "transitional");
+        assert_eq!(node["response_encryption_ready"], false);
         assert_eq!(node["browser_usable"], true);
     }
 
