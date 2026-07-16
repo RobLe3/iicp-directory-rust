@@ -83,6 +83,38 @@ pub fn event_message(
     Sha256::digest(input.as_bytes()).into()
 }
 
+/// Domain-separated signing message for an event carrying optional service-origin
+/// metadata. Legacy events MUST continue to use [`event_message`]. A present service ID
+/// selects V2 and is bound to the signature; it is metadata, never authorization.
+pub fn event_message_with_service_id(
+    service_id: &str,
+    event_id: &str,
+    event_type: &str,
+    seq: i64,
+    ts_ms: i64,
+    payload: &Value,
+    prev_hash: &str,
+) -> Option<[u8; 32]> {
+    if !valid_service_id(service_id) {
+        return None;
+    }
+    let payload_hash = hex::encode(Sha256::digest(canonical_json(payload).as_bytes()));
+    let input = format!(
+        "iicp-event-v2:{service_id}:{event_id}:{event_type}:{seq}:{ts_ms}:{payload_hash}:{prev_hash}"
+    );
+    Some(Sha256::digest(input.as_bytes()).into())
+}
+
+pub fn valid_service_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
 /// Verify a hex Ed25519 detached signature over `message` against the seed's hex
 /// public key (64 hex chars = 32 bytes). Returns false on any malformed input or a
 /// bad signature — the replica MUST NOT apply an event that fails this (DIR-FED-01).
@@ -141,6 +173,30 @@ pub fn sign_event(
     Some(hex::encode(sig.as_ref()))
 }
 
+#[allow(dead_code)]
+pub fn sign_event_with_service_id(
+    secret_key_hex: &str,
+    service_id: &str,
+    event_id: &str,
+    event_type: &str,
+    seq: i64,
+    ts_ms: i64,
+    payload: &Value,
+    prev_hash: &str,
+) -> Option<String> {
+    use ed25519_compact::{KeyPair, Seed};
+    let sk_bytes = hex::decode(secret_key_hex).ok()?;
+    if sk_bytes.len() != 64 {
+        return None;
+    }
+    let seed_bytes: [u8; 32] = sk_bytes.get(..32)?.try_into().ok()?;
+    let kp = KeyPair::from_seed(Seed::new(seed_bytes));
+    let message = event_message_with_service_id(
+        service_id, event_id, event_type, seq, ts_ms, payload, prev_hash,
+    )?;
+    Some(hex::encode(kp.sk.sign(message, None).as_ref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +211,9 @@ mod tests {
     // across ed25519-compact (here), PHP libsodium (NodeEventLoggerSignatureTest), and node:crypto.
     const KAT_SIG: &str = "dab46d8578fd741b4d6109351968dacc7560caf78cd0df7e9573c3a0537acdbe6f36be9e7280a60ea49dcc8020470471b1f01828e1ab5c820762d08849032a03";
     const KAT_MSG_HEX: &str = "bdb2183b5aa7d75cc90dcea5dcf950c04a50d0f5f3b96ef44fe230dc53e6f443";
+    const SERVICE_V2_KAT_MSG_HEX: &str =
+        "87d84d6cd402c45816355250169e37d2b5067846e440ae4fdb00c8cc3302e18d";
+    const SERVICE_V2_KAT_SIG: &str = "d845a788503adff672f2d74e50eee3f23c86e7cfb1a041d4607765cafbcbcf78d8d7e10583c79263a573a1e48b05b679cc727016161aabe8a69f00101dba7d03";
 
     fn kat_payload() -> Value {
         json!({"endpoint": "http://localhost:8090", "region": "eu-central"})
@@ -184,6 +243,70 @@ mod tests {
             GENESIS_ROOT,
         );
         assert_eq!(hex::encode(msg), KAT_MSG_HEX);
+    }
+
+    #[test]
+    fn service_event_v2_is_domain_separated_and_validated() {
+        let msg = event_message_with_service_id(
+            "directory-monolith",
+            "474a7713-85c8-4d61-bea5-0ab16f3825a0",
+            "REGISTER",
+            1080,
+            1779195794150,
+            &kat_payload(),
+            GENESIS_ROOT,
+        )
+        .expect("portable service id");
+        assert_eq!(hex::encode(msg), SERVICE_V2_KAT_MSG_HEX);
+        assert_ne!(
+            msg,
+            event_message(
+                "474a7713-85c8-4d61-bea5-0ab16f3825a0",
+                "REGISTER",
+                1080,
+                1779195794150,
+                &kat_payload(),
+                GENESIS_ROOT,
+            )
+        );
+        assert!(event_message_with_service_id(
+            "invalid:service",
+            "event",
+            "REGISTER",
+            1,
+            1,
+            &json!({}),
+            GENESIS_ROOT,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn service_event_v2_signature_round_trips() {
+        let secret_key_hex = format!("{}{}", "11".repeat(32), KAT_PUBKEY);
+        let sig = sign_event_with_service_id(
+            &secret_key_hex,
+            "directory-monolith",
+            "474a7713-85c8-4d61-bea5-0ab16f3825a0",
+            "REGISTER",
+            1080,
+            1779195794150,
+            &kat_payload(),
+            GENESIS_ROOT,
+        )
+        .expect("valid service event");
+        assert_eq!(sig, SERVICE_V2_KAT_SIG);
+        let msg = event_message_with_service_id(
+            "directory-monolith",
+            "474a7713-85c8-4d61-bea5-0ab16f3825a0",
+            "REGISTER",
+            1080,
+            1779195794150,
+            &kat_payload(),
+            GENESIS_ROOT,
+        )
+        .unwrap();
+        assert!(verify_event(KAT_PUBKEY, &sig, &msg));
     }
 
     #[test]

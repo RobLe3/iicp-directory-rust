@@ -256,6 +256,10 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
 pub struct FederatedEvent {
     pub event_id: String,
     pub event_type: String,
+    /// Optional, signed service-origin metadata. Unknown values remain opaque and MUST
+    /// NOT be interpreted as authorization or routing instructions.
+    #[serde(default)]
+    pub service_id: Option<String>,
     pub seq: i64,
     pub ts_ms: i64,
     #[serde(default)]
@@ -574,6 +578,16 @@ pub async fn verify_and_apply(
     last_applied_seq: i64,
     expected_prev_hash: Option<&str>,
 ) -> (ApplyOutcome, i64) {
+    if ev
+        .service_id
+        .as_deref()
+        .is_some_and(|service_id| !federation::valid_service_id(service_id))
+    {
+        return (
+            ApplyOutcome::Rejected("invalid service_id"),
+            last_applied_seq,
+        );
+    }
     // DIR-FED-02: reject non-monotonic / replayed seq (idempotency at the seq level).
     if ev.seq <= last_applied_seq {
         return (ApplyOutcome::Skipped, last_applied_seq);
@@ -597,14 +611,33 @@ pub async fn verify_and_apply(
                 );
             }
         }
-        let msg = federation::event_message(
-            &ev.event_id,
-            &ev.event_type,
-            ev.seq,
-            ev.ts_ms,
-            &ev.payload,
-            prev_hash,
-        );
+        let msg = match ev.service_id.as_deref() {
+            Some(service_id) => match federation::event_message_with_service_id(
+                service_id,
+                &ev.event_id,
+                &ev.event_type,
+                ev.seq,
+                ev.ts_ms,
+                &ev.payload,
+                prev_hash,
+            ) {
+                Some(message) => message,
+                None => {
+                    return (
+                        ApplyOutcome::Rejected("invalid service_id"),
+                        last_applied_seq,
+                    )
+                }
+            },
+            None => federation::event_message(
+                &ev.event_id,
+                &ev.event_type,
+                ev.seq,
+                ev.ts_ms,
+                &ev.payload,
+                prev_hash,
+            ),
+        };
         if !federation::verify_event(pk, sig, &msg) {
             return (ApplyOutcome::Rejected("bad signature"), last_applied_seq);
         }
@@ -756,6 +789,7 @@ mod tests {
         FederatedEvent {
             event_id: format!("evt-{node_id}-{seq}"),
             event_type: "REGISTER".into(),
+            service_id: None,
             seq,
             ts_ms: 1_779_200_000_000,
             node_id: Some(node_id.into()),
@@ -804,6 +838,7 @@ mod tests {
         let dereg = FederatedEvent {
             event_id: "d1".into(),
             event_type: "DEREGISTER".into(),
+            service_id: None,
             seq: 2,
             ts_ms: 1,
             node_id: Some("n2".into()),
@@ -839,12 +874,54 @@ mod tests {
         assert!(discoverable(&repo, CHAT).await.is_empty());
     }
 
+    #[tokio::test]
+    async fn signed_unknown_service_id_is_retained_but_not_authoritative() {
+        let repo = InMemoryRepo::new(vec![]);
+        let mut ev = register_event("service-node", 11);
+        ev.service_id = Some("future-research-service".into());
+        let pubkey = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let secret = format!("{}{}", "11".repeat(32), pubkey);
+        ev.sig = federation::sign_event_with_service_id(
+            &secret,
+            ev.service_id.as_deref().unwrap(),
+            &ev.event_id,
+            &ev.event_type,
+            ev.seq,
+            ev.ts_ms,
+            &ev.payload,
+            federation::GENESIS_ROOT,
+        );
+
+        let (outcome, high_water) = verify_and_apply(&repo, &ev, Some(pubkey), 0, None).await;
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(high_water, 11);
+
+        ev.service_id = Some("tampered-service".into());
+        let (tampered, high_water) =
+            verify_and_apply(&InMemoryRepo::new(vec![]), &ev, Some(pubkey), 0, None).await;
+        assert_eq!(tampered, ApplyOutcome::Rejected("bad signature"));
+        assert_eq!(high_water, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_service_id_fails_closed() {
+        let mut ev = register_event("service-node", 12);
+        ev.service_id = Some("invalid:service".into());
+        ev.sig = Some("00".repeat(64));
+        let pubkey = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let (outcome, high_water) =
+            verify_and_apply(&InMemoryRepo::new(vec![]), &ev, Some(pubkey), 0, None).await;
+        assert_eq!(outcome, ApplyOutcome::Rejected("invalid service_id"));
+        assert_eq!(high_water, 0);
+    }
+
     // ── ADR-048 (#374): HEALTH apply (parity with PHP HealthEventTest) ──
 
     fn health_event(node_id: &str, seq: i64, payload: Value) -> FederatedEvent {
         FederatedEvent {
             event_id: format!("evt-h-{node_id}-{seq}"),
             event_type: "HEALTH".into(),
+            service_id: None,
             seq,
             ts_ms: 1_779_200_000_000,
             node_id: Some(node_id.into()),
@@ -908,6 +985,7 @@ mod tests {
         FederatedEvent {
             event_id: format!("evt-{event_type}-{node_id}-{seq}"),
             event_type: event_type.into(),
+            service_id: None,
             seq,
             ts_ms: 1_779_200_000_000,
             node_id: Some(node_id.into()),
