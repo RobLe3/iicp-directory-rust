@@ -1,20 +1,9 @@
 use ct_codecs::{Base64UrlSafeNoPadding, Decoder};
 use ed25519_compact::{PublicKey, Signature};
-use serde_json::{json, Number, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const DOMAIN: &[u8] = b"IICP-CIP-CONSUMER-COSIGNATURE-V1\0";
-
-fn normalize(value: &mut Value) {
-    match value {
-        Value::Number(number) if number.as_f64() == Some(-0.0) => {
-            *number = Number::from(0);
-        }
-        Value::Array(values) => values.iter_mut().for_each(normalize),
-        Value::Object(values) => values.values_mut().for_each(normalize),
-        _ => {}
-    }
-}
 
 fn pre_signature_refusal(v: &Value) -> Option<Value> {
     let s = |key: &str| v[key].as_str().unwrap();
@@ -89,15 +78,16 @@ fn fixture() -> Value {
 }
 
 fn verify_canonical_vector(vector: &Value) {
-    let mut receipt = vector["receipt"].clone();
-    normalize(&mut receipt);
-    let canonical = serde_json::to_string(&receipt).unwrap();
-    assert_eq!(canonical, vector["canonical_json_utf8"]);
+    let canonical = serde_jcs::to_vec(&vector["receipt"]).unwrap();
     assert_eq!(
-        format!("{:x}", Sha256::digest(canonical.as_bytes())),
+        String::from_utf8_lossy(&canonical),
+        vector["canonical_json_utf8"].as_str().unwrap()
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&canonical)),
         vector["canonical_json_sha256"]
     );
-    let digest = Sha256::digest([DOMAIN, canonical.as_bytes()].concat());
+    let digest = Sha256::digest([DOMAIN, canonical.as_slice()].concat());
     assert_eq!(format!("{digest:x}"), vector["receipt_digest_hex"]);
 
     for role in ["provider", "consumer"] {
@@ -115,7 +105,7 @@ fn verify_canonical_vector(vector: &Value) {
         .unwrap();
         PublicKey::from_slice(&public)
             .unwrap()
-            .verify(&digest, &Signature::from_slice(&signature).unwrap())
+            .verify(digest, &Signature::from_slice(&signature).unwrap())
             .unwrap();
     }
 }
@@ -154,6 +144,17 @@ fn canonical_digest_dual_signatures_and_semantics_are_portable() {
     verify_canonical_vector(&data["canonical_vector"]);
     verify_semantic_cases(&data);
     verify_settlement_cases(&data);
+}
+
+#[test]
+fn full_jcs_vectors_are_portable() {
+    let data = fixture();
+    for vector in data["jcs_vectors"].as_array().unwrap() {
+        assert_eq!(
+            String::from_utf8(serde_jcs::to_vec(&vector["input"]).unwrap()).unwrap(),
+            vector["canonical_json_utf8"]
+        );
+    }
 }
 
 #[test]

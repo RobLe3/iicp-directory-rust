@@ -1,7 +1,7 @@
 {
-  "fixture_version": "1.0.0-draft",
+  "fixture_version": "1.1.0-draft",
   "status": "pre-normative",
-  "notice": "Conformance evidence only. This fixture does not enable or require consumer co-signatures, and it changes no settlement behavior.",
+  "notice": "Conformance evidence only. This fixture validates full RFC 8785 canonicalization but does not enable or require consumer co-signatures, and it changes no settlement behavior.",
   "profile": {
     "id": "urn:iicp:profile:cip:consumer-cosignature:v1",
     "alias": "consumer_cosignature_v1",
@@ -42,6 +42,46 @@
     "provider_signature_b64url": "YGK8Cm64I2cPplsj8XoTHHPyMd5DGm4PcSYIMzDHSXcBjRcDd0dl7VnGbEm_E7WeSrB4RBQljwQeohLGL-WIBA",
     "consumer_signature_b64url": "iuvN7O755IrQv8I72SVdAaasXZ1oH9HYQOwt864E6fikL4HAt-BX3ovB1MlVXo3ym3UtJmbFD1_d26vU7uKABg"
   },
+  "jcs_vectors": [
+    {
+      "name": "rfc8785_number_string_literal_sample",
+      "input": {
+        "numbers": [
+          333333333.3333333,
+          1e+30,
+          4.5,
+          0.002,
+          1e-27
+        ],
+        "string": "€$\u000f\nA'B\"\\\\\"/",
+        "literals": [
+          null,
+          true,
+          false
+        ]
+      },
+      "canonical_json_utf8": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}"
+    },
+    {
+      "name": "utf16_property_order_non_bmp_before_private_use",
+      "input": {
+        "": 2,
+        "😀": 1
+      },
+      "canonical_json_utf8": "{\"😀\":1,\"\":2}"
+    },
+    {
+      "name": "negative_zero_and_nested_order",
+      "input": {
+        "z": -0.0,
+        "a": {
+          "β": "café",
+          "a": null
+        }
+      },
+      "canonical_json_utf8": "{\"a\":{\"a\":null,\"β\":\"café\"},\"z\":0}"
+    }
+  ],
   "conformance_cases": [
     {
       "name": "valid_cross_operator_required",
