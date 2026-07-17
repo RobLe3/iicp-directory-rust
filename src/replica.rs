@@ -395,6 +395,14 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         relay_capable: None,
         sdk_language: None,
         sdk_version: None,
+        consumer_cosignature_ready: payload
+            .get("supported_receipt_profiles")
+            .and_then(Value::as_array)
+            .is_some_and(|profiles| {
+                profiles
+                    .iter()
+                    .any(|p| p.as_str() == Some("consumer_cosignature_v1"))
+            }),
         backend: payload
             .get("backend")
             .and_then(Value::as_str)

@@ -13,6 +13,8 @@ mod db;
 mod delegation;
 mod federation;
 mod health;
+#[cfg(test)]
+mod jcs;
 mod policy;
 mod recognition;
 mod replica;
@@ -1137,6 +1139,9 @@ struct RegisterRequest {
     /// SDK version string (informational, Phase 5).
     #[serde(default)]
     sdk_version: Option<String>,
+    /// Pre-normative receipt profiles. Unknown values are rejected.
+    #[serde(default)]
+    supported_receipt_profiles: Vec<String>,
     /// Informational local backend flavour. It does not alter IICP routing.
     #[serde(default)]
     backend: Option<String>,
@@ -1853,6 +1858,14 @@ async fn register(
             return reject("validation_error", &format!("invalid backend: {backend}"));
         }
     }
+    if req.supported_receipt_profiles.len() > 4
+        || req
+            .supported_receipt_profiles
+            .iter()
+            .any(|profile| profile != "consumer_cosignature_v1")
+    {
+        return reject("validation_error", "unsupported receipt profile");
+    }
     for cap in &req.capabilities {
         if !validate_intent(&cap.intent) {
             return reject(
@@ -2036,6 +2049,10 @@ async fn register(
         relay_capable: req.relay_capable,
         sdk_language: req.sdk_language.clone(),
         sdk_version: req.sdk_version.clone(),
+        consumer_cosignature_ready: req
+            .supported_receipt_profiles
+            .iter()
+            .any(|profile| profile == "consumer_cosignature_v1"),
         backend: req.backend.clone(),
         address_family: None, // set at query time by detect_address_family
         public_key: req.cx_public_key.clone(),
@@ -2103,6 +2120,7 @@ async fn register(
             "endpoint": req.endpoint,
             "region": req.region,
             "backend": req.backend,
+            "supported_receipt_profiles": req.supported_receipt_profiles,
             "capabilities": req.capabilities.iter().map(|c| serde_json::json!({
                 "intent": c.intent,
                 "models": c.models,
@@ -4136,6 +4154,19 @@ fn sdk_adoption_json(nodes: &[crate::types::Node]) -> serde_json::Value {
     })
 }
 
+fn receipt_profile_adoption_json(nodes: &[crate::types::Node]) -> serde_json::Value {
+    let ready = nodes
+        .iter()
+        .filter(|node| node.consumer_cosignature_ready)
+        .count();
+    serde_json::json!({
+        "basis": "heartbeating_nodes",
+        "profile": "consumer_cosignature_v1",
+        "ready": ready,
+        "total_heartbeating": nodes.len(),
+    })
+}
+
 /// `/v1/stats` (iicp-dir §3.9b). Returns live active_node count when backed by MySQL;
 /// mesh_health score is deferred to Phase 2 (requires per-node health vector aggregation).
 async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
@@ -4149,6 +4180,7 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
     // scoring algorithm itself is byte-for-byte the PHP NodeHealthService.
     let provider_set = st.repo.active_nodes().await;
     let sdk_adoption = sdk_adoption_json(&provider_set);
+    let receipt_profile_adoption = receipt_profile_adoption_json(&provider_set);
     let healths: Vec<health::NodeHealth> = provider_set
         .iter()
         .map(|n| {
@@ -4270,6 +4302,7 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
         "mesh_health_federated": mesh_health_federated,
         "directory_health": directory_health,
         "sdk_adoption": sdk_adoption,
+        "receipt_profile_adoption": receipt_profile_adoption,
     }))
 }
 
@@ -4658,6 +4691,7 @@ mod tests {
                 relay_capable: None,
                 sdk_language: None,
                 sdk_version: None,
+                consumer_cosignature_ready: false,
                 backend: None,
                 address_family: None,
                 cip_policy: Some(
@@ -5132,6 +5166,11 @@ mod tests {
         );
         assert!(v["sdk_adoption"]["by_language"].is_object());
         assert!(v["sdk_adoption"]["by_version"].is_object());
+        assert!(v["receipt_profile_adoption"].is_object());
+        assert_eq!(
+            v["receipt_profile_adoption"]["profile"],
+            "consumer_cosignature_v1"
+        );
     }
 
     #[tokio::test]
@@ -5663,6 +5702,7 @@ mod tests {
             "sdk_language": "python",
             "sdk_version": "0.5.2",
             "backend": "meshllm",
+            "supported_receipt_profiles": ["consumer_cosignature_v1"],
             "nat_type": "full_cone",
             "transport_method": "direct"
         });
@@ -5717,6 +5757,8 @@ mod tests {
         assert_eq!(node["relay_capable"], true);
         assert_eq!(node["sdk_language"], "python");
         assert_eq!(node["backend"], "meshllm");
+        assert_eq!(node["consumer_cosignature_ready"], true);
+        assert!(node.get("supported_receipt_profiles").is_none());
         assert_eq!(node["nat_type"], "full_cone");
         assert_eq!(node["models"][0], "llama3");
         assert_eq!(node["quantization"][0], "q4_k_m");
@@ -8086,6 +8128,7 @@ mod tests {
                 relay_capable: None,
                 sdk_language: None,
                 sdk_version: None,
+                consumer_cosignature_ready: false,
                 backend: None,
                 address_family: None,
                 cip_policy: Some(

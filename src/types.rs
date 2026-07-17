@@ -70,6 +70,10 @@ pub struct Node {
     /// SDK version string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdk_version: Option<String>,
+    /// Public-safe adoption signal derived from a validated registration list.
+    /// It is evidence only and MUST NOT affect routing, trust or settlement.
+    #[serde(default)]
+    pub consumer_cosignature_ready: bool,
     /// Informational local execution backend. This is not a routing or mesh
     /// control-plane field; it must never contain backend topology or peer data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
