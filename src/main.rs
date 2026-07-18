@@ -153,6 +153,9 @@ struct AppState {
     signing_key: Option<String>,
     /// IICP-E034 registration rate-limit counter, per source IP (W-033 PHP parity).
     register_rate: RegisterRateMap,
+    /// Adoption-gated E050 E′ hardening. False preserves the migration-safe
+    /// dead-endpoint fallback; production must not enable this before #534.
+    strict_e050_secured: bool,
 }
 
 /// Emit + sign a federated event onto this directory's log if a signing key is configured
@@ -1786,6 +1789,38 @@ fn endpoint_change_allowed(
     !old_endpoint_alive // no token: allow only if the old endpoint is gone
 }
 
+fn e050_routing_change_allowed(
+    strict: bool,
+    secured: bool,
+    endpoint_changed: bool,
+    transport_endpoint_changed: bool,
+    relay_endpoint_changed: bool,
+    has_token_ownership: bool,
+    old_endpoint_alive: bool,
+) -> bool {
+    let routing_changed = endpoint_changed || transport_endpoint_changed || relay_endpoint_changed;
+    if has_token_ownership {
+        return true;
+    }
+    // Strict mode must also protect credential rotation. Otherwise a caller
+    // can first re-register the same route without a token, receive a fresh
+    // token, and then use it to authorize a routing change.
+    if strict && secured {
+        return false;
+    }
+    if !routing_changed {
+        return true;
+    }
+    endpoint_change_allowed(endpoint_changed, false, old_endpoint_alive)
+}
+
+fn relay_endpoint(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    metadata
+        .and_then(serde_json::Value::as_object)
+        .and_then(|value| value.get("relay_endpoint"))
+        .and_then(serde_json::Value::as_str)
+}
+
 /// Liveness probe for the IICP-E050 absence path — PHP `isEndpointAlive` parity. A 2xx
 /// from `<endpoint>/iicp/health` within 5s means the old endpoint is still serving (so a
 /// token-less endpoint change is a likely takeover → rejected). Certs are not verified
@@ -1945,20 +1980,37 @@ async fn register(
             );
         }
 
-        // IICP-E050 — a primary endpoint change requires ownership OR a verifiably-dead
-        // old endpoint (so a token-less rotation of a CGNAT/tunnel node still works, but a
-        // live-takeover is rejected). The liveness probe only runs when there's no token.
-        if existing.endpoint != req.endpoint && !has_ownership {
-            let old_alive = probe_endpoint_alive(&existing.endpoint).await;
-            if !endpoint_change_allowed(true, false, old_alive) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({
-                        "error": "IICP-E050",
-                        "message": "endpoint change requires the current node_token (the existing endpoint is still reachable); re-register with current_node_token to prove ownership"
-                    })),
-                );
-            }
+        let endpoint_changed = existing.endpoint != req.endpoint;
+        let transport_endpoint_changed = existing.transport_endpoint != req.transport_endpoint;
+        let relay_endpoint_changed = relay_endpoint(existing.transport_metadata.as_ref())
+            != relay_endpoint(req.transport_metadata.as_ref());
+        let secured = existing.operator_pubkey.is_some() || existing.public_key.is_some();
+        let old_alive =
+            if endpoint_changed && !has_ownership && !(st.strict_e050_secured && secured) {
+                probe_endpoint_alive(&existing.endpoint).await
+            } else {
+                false
+            };
+        if !e050_routing_change_allowed(
+            st.strict_e050_secured,
+            secured,
+            endpoint_changed,
+            transport_endpoint_changed,
+            relay_endpoint_changed,
+            has_ownership,
+            old_alive,
+        ) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "IICP-E050",
+                    "message": if st.strict_e050_secured && secured {
+                        "secured-node re-registration requires a valid current_node_token"
+                    } else {
+                        "endpoint change requires the current node_token (the existing endpoint is still reachable); re-register with current_node_token to prove ownership"
+                    }
+                })),
+            );
         }
     }
 
@@ -4647,6 +4699,12 @@ async fn main() {
         env,
         signing_key,
         register_rate: new_register_rate(),
+        strict_e050_secured: std::env::var("IICP_E050_STRICT_SECURED").is_ok_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        }),
     };
     let router = match replica_seed_url {
         Some(seed) => app(state).layer(middleware::from_fn_with_state(seed, replica_write_gate)),
@@ -4728,6 +4786,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         }
     }
 
@@ -7034,6 +7093,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         };
         let router = app(st);
         let body = |id: &str| {
@@ -7101,6 +7161,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         };
         let router = app(st);
         let body = serde_json::json!({
@@ -7152,6 +7213,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         };
         let router = app(st);
 
@@ -7304,6 +7366,31 @@ mod tests {
         // Endpoint change, NO token, old endpoint still alive → REJECTED (hijack attempt:
         // pointing a victim's node_id at a live different endpoint).
         assert!(!super::endpoint_change_allowed(true, false, true));
+    }
+
+    #[test]
+    fn e050_strict_shared_parity_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../parity/e050-strict-v0.json")).unwrap();
+        assert_eq!(fixture["schema"], "iicp.e050_strict_parity.v0");
+        for case in fixture["cases"].as_array().unwrap() {
+            let input = &case["input"];
+            let actual = super::e050_routing_change_allowed(
+                input["strict"].as_bool().unwrap(),
+                input["secured"].as_bool().unwrap(),
+                input["endpoint_changed"].as_bool().unwrap(),
+                input["transport_endpoint_changed"].as_bool().unwrap(),
+                input["relay_endpoint_changed"].as_bool().unwrap(),
+                input["has_ownership"].as_bool().unwrap(),
+                input["old_endpoint_alive"].as_bool().unwrap(),
+            );
+            assert_eq!(
+                actual,
+                case["allowed"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
     }
 
     #[tokio::test]
@@ -7767,6 +7854,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         };
         for bad_id in &[
             "",
@@ -7779,6 +7867,7 @@ mod tests {
                 env: Env::Production,
                 signing_key: None,
                 register_rate: new_register_rate(),
+                strict_e050_secured: false,
             })
             .oneshot(post_register(serde_json::json!({
                 "node_id": bad_id,
@@ -7806,6 +7895,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         };
         let resp = app(st)
             .oneshot(post_register(serde_json::json!({
@@ -7830,6 +7920,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         };
         let resp = app(st)
             .oneshot(post_register(serde_json::json!({
@@ -7907,6 +7998,7 @@ mod tests {
             env: Env::Production,
             signing_key: None,
             register_rate: new_register_rate(),
+            strict_e050_secured: false,
         };
         let body = serde_json::json!({
             "node_id": "self-node",
