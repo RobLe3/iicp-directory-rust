@@ -467,15 +467,19 @@ async fn apply_register(repo: &dyn NodeRepository, ev: &FederatedEvent) -> Apply
     let Some(node) = node_from_register(node_id, &ev.payload) else {
         return ApplyOutcome::Rejected("REGISTER missing endpoint");
     };
-    repo.register(NodeRecord {
-        node,
-        intents: intents_from_payload(&ev.payload),
-        node_token: None, // replica never issues tokens; writes 307 to seed
-        node_hmac_key: None,
-        proxy_token: None,
-    })
-    .await;
-    ApplyOutcome::Applied
+    match repo
+        .register(NodeRecord {
+            node,
+            intents: intents_from_payload(&ev.payload),
+            node_token: None, // replica never issues tokens; writes 307 to seed
+            node_hmac_key: None,
+            proxy_token: None,
+        })
+        .await
+    {
+        Ok(()) => ApplyOutcome::Applied,
+        Err(_) => ApplyOutcome::Rejected("REGISTER persistence failed"),
+    }
 }
 
 /// HEALTH (ADR-048 / #374) — store the per-(node, evaluator) snapshot so the
@@ -722,15 +726,17 @@ pub async fn apply_snapshot(repo: &dyn NodeRepository, snapshot: &Value) -> usiz
                 node.reputation_score = rep;
                 node.score = rep;
             }
-            repo.register(NodeRecord {
-                node,
-                intents: intents.get(node_id).cloned().unwrap_or_default(),
-                node_token: None,
-                node_hmac_key: None,
-                proxy_token: None,
-            })
-            .await;
-            applied += 1;
+            applied += usize::from(
+                repo.register(NodeRecord {
+                    node,
+                    intents: intents.get(node_id).cloned().unwrap_or_default(),
+                    node_token: None,
+                    node_hmac_key: None,
+                    proxy_token: None,
+                })
+                .await
+                .is_ok(),
+            );
         }
     }
     applied

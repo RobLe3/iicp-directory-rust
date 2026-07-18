@@ -20,6 +20,7 @@ mod recognition;
 mod replica;
 mod repo;
 mod reputation;
+mod schema;
 mod types;
 mod validate;
 
@@ -1840,6 +1841,317 @@ async fn probe_endpoint_alive(endpoint: &str) -> bool {
     matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
 }
 
+struct PendingRegistration {
+    request: RegisterRequest,
+    node: types::Node,
+    intents: Vec<String>,
+    node_id: String,
+    node_token: String,
+    proxy_token: String,
+    node_hmac_key: String,
+    operator_pubkey_for_upsert: Option<String>,
+    recovered: bool,
+    declared_reachable: bool,
+}
+
+fn resolve_registration_node_id(requested: Option<&str>) -> Result<String, &'static str> {
+    let Some(custom_id) = requested.filter(|value| !value.is_empty()) else {
+        return Ok(uuid::Uuid::new_v4().to_string());
+    };
+    let properties = (
+        custom_id.len() <= 36,
+        custom_id.as_bytes()[0].is_ascii_alphanumeric(),
+        custom_id.chars().all(|character| {
+            matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | ':' | '-')
+        }),
+    );
+    match properties {
+        (true, true, true) => Ok(custom_id.to_string()),
+        _ => Err(
+            "node_id must start with [a-zA-Z0-9] and contain only [a-zA-Z0-9._:-], max 36 chars",
+        ),
+    }
+}
+
+fn validate_registration_request(
+    request: &RegisterRequest,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    validate_registration_shape(request).or_else(|| validate_registration_capabilities(request))
+}
+
+fn validate_registration_shape(
+    request: &RegisterRequest,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if request.capabilities.is_empty() {
+        return Some(reject(
+            "validation_error",
+            "at least one capability is required",
+        ));
+    }
+    const BACKENDS: &[&str] = &[
+        "ollama",
+        "lmstudio",
+        "vllm",
+        "llamacpp",
+        "meshllm",
+        "anthropic",
+        "custom",
+    ];
+    if request
+        .backend
+        .as_deref()
+        .is_some_and(|backend| !BACKENDS.contains(&backend))
+    {
+        return Some(reject(
+            "validation_error",
+            &format!(
+                "invalid backend: {}",
+                request.backend.as_deref().unwrap_or_default()
+            ),
+        ));
+    }
+    validate_registration_profiles_and_exposure(request)
+}
+
+fn validate_registration_profiles_and_exposure(
+    request: &RegisterRequest,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if request.supported_receipt_profiles.len() > 4
+        || request
+            .supported_receipt_profiles
+            .iter()
+            .any(|profile| profile != "consumer_cosignature_v1")
+    {
+        return Some(reject("validation_error", "unsupported receipt profile"));
+    }
+    if request
+        .exposure_mode
+        .as_deref()
+        .is_some_and(|mode| !EXPOSURE_MODES.contains(&mode))
+    {
+        return Some(reject(
+            "validation_error",
+            &format!(
+                "invalid exposure_mode: {}",
+                request.exposure_mode.as_deref().unwrap_or_default()
+            ),
+        ));
+    }
+    None
+}
+
+fn validate_registration_capabilities(
+    request: &RegisterRequest,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    for capability in &request.capabilities {
+        if !validate_intent(&capability.intent) {
+            return Some(reject(
+                "validation_error",
+                &format!("invalid intent URN: {}", capability.intent),
+            ));
+        }
+        if let Some(classification) =
+            policy::IntentPolicyGuard::public_mesh_refusal(&capability.intent)
+        {
+            return Some(policy_reject(&classification));
+        }
+    }
+    None
+}
+
+async fn commit_registration(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    pending: PendingRegistration,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state
+        .repo
+        .register(repo::NodeRecord {
+            node: pending.node,
+            intents: pending.intents,
+            node_token: Some(pending.node_token.clone()),
+            node_hmac_key: Some(pending.node_hmac_key.clone()),
+            proxy_token: Some(pending.proxy_token.clone()),
+        })
+        .await
+        .is_err()
+    {
+        eprintln!("[repository] registration transaction failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "server_error",
+                    "message": "registration persistence failed"
+                }
+            })),
+        );
+    }
+
+    // Tokens become externally visible only after the node and all capabilities commit.
+    let client_ip = get_client_ip(headers);
+    state
+        .repo
+        .observe_address(&pending.node_id, client_ip, "register")
+        .await;
+    upsert_operator_from_register(
+        state,
+        &pending.operator_pubkey_for_upsert,
+        pending.request.operator_display_name.as_deref(),
+        pending.request.operator_created_at.as_deref(),
+        pending.request.operator_integrity_hash.as_deref(),
+    )
+    .await;
+    emit_event(
+        state,
+        "REGISTER",
+        &pending.node_id,
+        serde_json::json!({
+            "endpoint": pending.request.endpoint,
+            "region": pending.request.region,
+            "backend": pending.request.backend,
+            "supported_receipt_profiles": pending.request.supported_receipt_profiles,
+            "capabilities": pending.request.capabilities.iter().map(|capability| serde_json::json!({
+                "intent": capability.intent,
+                "models": capability.models,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
+
+    let jwt_token = auth::issue_jwt(&pending.node_id);
+    let jwt_expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(3600))
+        .map(|time| time.to_rfc3339());
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "node_id": pending.node_id,
+            "node_token": pending.node_token,
+            "proxy_token": pending.proxy_token,
+            "node_hmac_key": pending.node_hmac_key,
+            "expires_at": serde_json::Value::Null,
+            "jwt_token": jwt_token,
+            "jwt_expires_at": jwt_expires_at,
+            "directory": "iicp-directory-rs",
+            "observed_source_ip": client_ip,
+            "recovered": pending.recovered,
+            "lifetime_jobs": 0u32,
+            "public_reachable": pending.declared_reachable,
+        })),
+    )
+}
+
+fn registration_rate_rejection(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let ip = get_client_ip(headers).to_string();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let count = {
+        let mut rates = state.register_rate.lock().unwrap();
+        let (count, start) =
+            register_rate_step(rates.get(&ip).copied(), now_ms, REGISTER_RATE_TTL_MS);
+        rates.insert(ip, (count, start));
+        count
+    };
+    (count > REGISTER_RATE_LIMIT).then(|| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "IICP-E034",
+                "message": "Too many registration attempts from this source IP. Try again shortly.",
+                "retry_after": REGISTER_RATE_TTL_MS / 1000
+            })),
+        )
+    })
+}
+
+async fn registration_ownership_rejection(
+    state: &AppState,
+    request: &RegisterRequest,
+    node_id: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let existing = state.repo.get(node_id).await?;
+    let has_ownership = match request.current_node_token.as_deref() {
+        Some(token) if !token.is_empty() => state.repo.verify_node_token(node_id, token).await,
+        _ => false,
+    };
+
+    let cx_changed = request
+        .cx_public_key
+        .as_ref()
+        .is_some_and(|key| !key.is_null() && existing.public_key.as_ref() != Some(key));
+    if cx_changed && !has_ownership {
+        return Some((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "IICP-E049",
+                "message": "cx_public_key update requires a valid current_node_token"
+            })),
+        ));
+    }
+
+    let endpoint_changed = existing.endpoint != request.endpoint;
+    let transport_endpoint_changed = existing.transport_endpoint != request.transport_endpoint;
+    let relay_endpoint_changed = relay_endpoint(existing.transport_metadata.as_ref())
+        != relay_endpoint(request.transport_metadata.as_ref());
+    let secured = existing.operator_pubkey.is_some() || existing.public_key.is_some();
+    let old_alive = if endpoint_changed && !has_ownership && !(state.strict_e050_secured && secured)
+    {
+        probe_endpoint_alive(&existing.endpoint).await
+    } else {
+        false
+    };
+    if e050_routing_change_allowed(
+        state.strict_e050_secured,
+        secured,
+        endpoint_changed,
+        transport_endpoint_changed,
+        relay_endpoint_changed,
+        has_ownership,
+        old_alive,
+    ) {
+        return None;
+    }
+
+    Some((
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "IICP-E050",
+            "message": if state.strict_e050_secured && secured {
+                "secured-node re-registration requires a valid current_node_token"
+            } else {
+                "endpoint change requires the current node_token (the existing endpoint is still reachable); re-register with current_node_token to prove ownership"
+            }
+        })),
+    ))
+}
+
+async fn operator_display_name_rejection(
+    state: &AppState,
+    operator_pubkey: Option<&str>,
+    display_name: Option<&str>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let (Some(operator_pubkey), Some(display_name)) = (operator_pubkey, display_name) else {
+        return None;
+    };
+    let normalized = normalize_operator_display_name(display_name)?;
+    state
+        .repo
+        .operator_display_name_claimed_by_other(operator_pubkey, &normalized)
+        .await
+        .then(|| {
+            reject(
+                "validation_error",
+                "operator_display_name is already claimed by another verified operator (IICP-E051)",
+            )
+        })
+}
+
 /// `POST /v1/register` (iicp-dir §3.1). Validates the endpoint routability invariant
 /// (IICP-E035) and every capability intent URN before issuing a token. The RT-04 guard
 /// (`is_declared_reachable`) decides whether a liveness probe would be skipped — the
@@ -1852,74 +2164,11 @@ async fn register(
     // IICP-E034 (W-033 PHP parity): rate-limit registrations per source IP BEFORE any work,
     // so rapid capability cycling can't churn the directory. Source IP via get_client_ip
     // (CF-Connecting-IP → X-Forwarded-For), same extraction the rest of the handler uses.
-    {
-        let ip = get_client_ip(&headers).to_string();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let count = {
-            let mut g = st.register_rate.lock().unwrap();
-            let (count, start) =
-                register_rate_step(g.get(&ip).copied(), now_ms, REGISTER_RATE_TTL_MS);
-            g.insert(ip, (count, start));
-            count
-        };
-        if count > REGISTER_RATE_LIMIT {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "IICP-E034",
-                    "message": "Too many registration attempts from this source IP. Try again shortly.",
-                    "retry_after": REGISTER_RATE_TTL_MS / 1000
-                })),
-            );
-        }
+    if let Some(rejection) = registration_rate_rejection(&st, &headers) {
+        return rejection;
     }
-    if req.capabilities.is_empty() {
-        return reject("validation_error", "at least one capability is required");
-    }
-    if let Some(ref backend) = req.backend {
-        const BACKENDS: &[&str] = &[
-            "ollama",
-            "lmstudio",
-            "vllm",
-            "llamacpp",
-            "meshllm",
-            "anthropic",
-            "custom",
-        ];
-        if !BACKENDS.contains(&backend.as_str()) {
-            return reject("validation_error", &format!("invalid backend: {backend}"));
-        }
-    }
-    if req.supported_receipt_profiles.len() > 4
-        || req
-            .supported_receipt_profiles
-            .iter()
-            .any(|profile| profile != "consumer_cosignature_v1")
-    {
-        return reject("validation_error", "unsupported receipt profile");
-    }
-    for cap in &req.capabilities {
-        if !validate_intent(&cap.intent) {
-            return reject(
-                "validation_error",
-                &format!("invalid intent URN: {}", cap.intent),
-            );
-        }
-        // Refuse restricted capability families before they are persisted or
-        // become discoverable through the public mesh.
-        if let Some(classification) = policy::IntentPolicyGuard::public_mesh_refusal(&cap.intent) {
-            return policy_reject(&classification);
-        }
-    }
-    // AL2 (#401) — exposure_mode enum parity with PHP RegisterController: reject
-    // out-of-vocabulary values instead of silently accepting them (ADR-043 §9).
-    if let Some(ref em) = req.exposure_mode {
-        if !EXPOSURE_MODES.contains(&em.as_str()) {
-            return reject("validation_error", &format!("invalid exposure_mode: {em}"));
-        }
+    if let Some(rejection) = validate_registration_request(&req) {
+        return rejection;
     }
     if let Err(e) = endpoint_routable(&req.endpoint, st.env) {
         return reject("IICP-E035", &format!("non-routable endpoint: {e:?}"));
@@ -1936,82 +2185,17 @@ async fn register(
     let recovered = req.node_id.as_deref().is_some_and(|s| !s.is_empty());
     // PHP validates node_id format: alphanumeric start, then [a-zA-Z0-9._:-], max 36 chars.
     // If a custom node_id is supplied, validate it before assigning.
-    let node_id = if let Some(ref custom_id) = req.node_id.filter(|s| !s.is_empty()) {
-        if custom_id.len() > 36
-            || !custom_id
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric())
-            || custom_id
-                .chars()
-                .any(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | ':' | '-'))
-        {
-            return reject("validation_error", "node_id must start with [a-zA-Z0-9] and contain only [a-zA-Z0-9._:-], max 36 chars");
-        }
-        custom_id.clone()
-    } else {
-        uuid::Uuid::new_v4().to_string()
+    let node_id = match resolve_registration_node_id(req.node_id.as_deref()) {
+        Ok(node_id) => node_id,
+        Err(message) => return reject("validation_error", message),
     };
 
     // IICP-E049/E050 (F2/#529) — re-registration ownership guards. When this node_id
     // already exists, protect the two takeover vectors. Ownership = a current_node_token
     // that verifies against the stored hash; computed once and shared. PHP NodeRegistry
     // applyReRegistrationUpdate parity.
-    if let Some(existing) = st.repo.get(&node_id).await {
-        let has_ownership = match req.current_node_token.as_deref() {
-            Some(t) if !t.is_empty() => st.repo.verify_node_token(&node_id, t).await,
-            _ => false,
-        };
-
-        // IICP-E049 — changing the node's identity key (cx_public_key) is pure ownership:
-        // it requires current_node_token, with no dead-endpoint excuse. Otherwise an
-        // attacker could re-register a victim's node_id with their own key (impersonation).
-        let cx_changed = req
-            .cx_public_key
-            .as_ref()
-            .is_some_and(|k| !k.is_null() && existing.public_key.as_ref() != Some(k));
-        if cx_changed && !has_ownership {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "IICP-E049",
-                    "message": "cx_public_key update requires a valid current_node_token"
-                })),
-            );
-        }
-
-        let endpoint_changed = existing.endpoint != req.endpoint;
-        let transport_endpoint_changed = existing.transport_endpoint != req.transport_endpoint;
-        let relay_endpoint_changed = relay_endpoint(existing.transport_metadata.as_ref())
-            != relay_endpoint(req.transport_metadata.as_ref());
-        let secured = existing.operator_pubkey.is_some() || existing.public_key.is_some();
-        let old_alive =
-            if endpoint_changed && !has_ownership && !(st.strict_e050_secured && secured) {
-                probe_endpoint_alive(&existing.endpoint).await
-            } else {
-                false
-            };
-        if !e050_routing_change_allowed(
-            st.strict_e050_secured,
-            secured,
-            endpoint_changed,
-            transport_endpoint_changed,
-            relay_endpoint_changed,
-            has_ownership,
-            old_alive,
-        ) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "IICP-E050",
-                    "message": if st.strict_e050_secured && secured {
-                        "secured-node re-registration requires a valid current_node_token"
-                    } else {
-                        "endpoint change requires the current node_token (the existing endpoint is still reachable); re-register with current_node_token to prove ownership"
-                    }
-                })),
-            );
-        }
+    if let Some(rejection) = registration_ownership_rejection(&st, &req, &node_id).await {
+        return rejection;
     }
 
     let node_token = uuid::Uuid::new_v4().to_string();
@@ -2031,22 +2215,14 @@ async fn register(
 
     // #525/G3 — operator display names are public handles; a look-alike claim by another
     // verified operator is rejected using PHP's whitespace-folded, case-insensitive check.
-    if let (Some(op_pub), Some(display_name)) = (
+    if let Some(rejection) = operator_display_name_rejection(
+        &st,
         operator_pubkey_for_upsert.as_deref(),
         req.operator_display_name.as_deref(),
-    ) {
-        if let Some(normalized) = normalize_operator_display_name(display_name) {
-            if st
-                .repo
-                .operator_display_name_claimed_by_other(op_pub, &normalized)
-                .await
-            {
-                return reject(
-                    "validation_error",
-                    "operator_display_name is already claimed by another verified operator (IICP-E051)",
-                );
-            }
-        }
+    )
+    .await
+    {
+        return rejection;
     }
 
     let node = types::Node {
@@ -2135,76 +2311,23 @@ async fn register(
         health_models: None, // #494 — populated by the first heartbeat with a backend URL
     };
     let intents = req.capabilities.iter().map(|c| c.intent.clone()).collect();
-    st.repo
-        .register(repo::NodeRecord {
+    commit_registration(
+        &st,
+        &headers,
+        PendingRegistration {
+            request: req,
             node,
             intents,
-            node_token: Some(node_token.clone()),
-            node_hmac_key: Some(node_hmac_key.clone()),
-            proxy_token: Some(proxy_token.clone()),
-        })
-        .await;
-
-    // Record observed source IP (NodeAddressObserver). Takes CF-Connecting-IP first,
-    // then the leftmost token of X-Forwarded-For per RFC 7239 §5.2 (PHP parity).
-    let client_ip = get_client_ip(&headers);
-    st.repo
-        .observe_address(&node_id, client_ip, "register")
-        .await;
-
-    // #463/#310/#464 — upsert the operator-identity record when the delegation verified.
-    upsert_operator_from_register(
-        &st,
-        &operator_pubkey_for_upsert,
-        req.operator_display_name.as_deref(),
-        req.operator_created_at.as_deref(),
-        req.operator_integrity_hash.as_deref(),
+            node_id,
+            node_token,
+            proxy_token,
+            node_hmac_key,
+            operator_pubkey_for_upsert,
+            recovered,
+            declared_reachable: declared,
+        },
     )
-    .await;
-
-    // #442 — emit a signed REGISTER event onto the log so replicas can mirror this node
-    // (carries capabilities, #438, so a replica's /v1/discover can serve it). No-op unsigned.
-    emit_event(
-        &st,
-        "REGISTER",
-        &node_id,
-        serde_json::json!({
-            "endpoint": req.endpoint,
-            "region": req.region,
-            "backend": req.backend,
-            "supported_receipt_profiles": req.supported_receipt_profiles,
-            "capabilities": req.capabilities.iter().map(|c| serde_json::json!({
-                "intent": c.intent,
-                "models": c.models,
-            })).collect::<Vec<_>>(),
-        }),
-    )
-    .await;
-
-    // Issue a JWT (HS256, sub=node_id, exp=now+3600).
-    let jwt_token = auth::issue_jwt(&node_id);
-    // PHP NodeRegistry returns jwt_expires_at as ISO-8601; compute similarly.
-    let jwt_expires_at = chrono::Utc::now()
-        .checked_add_signed(chrono::Duration::seconds(3600))
-        .map(|t| t.to_rfc3339());
-
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "node_id": node_id,
-            "node_token": node_token,
-            "proxy_token": proxy_token,
-            "node_hmac_key": node_hmac_key,
-            "expires_at": serde_json::Value::Null,   // not supported — PHP also returns null
-            "jwt_token": jwt_token,                   // PHP field name; adapter reads this
-            "jwt_expires_at": jwt_expires_at,
-            "directory": "iicp-directory-rs",
-            "observed_source_ip": client_ip,
-            "recovered": recovered,
-            "lifetime_jobs": 0u32,
-            "public_reachable": declared,
-        })),
-    )
+    .await
 }
 
 // ── heartbeat (iicp-dir §3.2) ─────────────────────────────────────────────────
@@ -4630,6 +4753,36 @@ async fn deregister(
     }
 }
 
+async fn initialize_repository() -> Arc<dyn NodeRepository> {
+    // Wire DATABASE_URL → MySqlRepo when present. A configured database is an
+    // explicit persistence contract: connection or schema failures are fatal,
+    // never a silent downgrade to ephemeral memory.
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        match db::init_pool(&url).await {
+            Ok(pool) => {
+                match schema::ensure_schema(&pool).await {
+                    Ok(status) => {
+                        println!("iicp-directory-rs {VERSION}: MySQL schema status={status}")
+                    }
+                    Err(error) => {
+                        eprintln!("FATAL: MySQL schema verification failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+                println!("iicp-directory-rs {VERSION}: MySQL pool connected");
+                Arc::new(db::MySqlRepo::new(pool))
+            }
+            Err(e) => {
+                eprintln!("FATAL: configured MySQL connection failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("iicp-directory-rs {VERSION}: no DATABASE_URL; using InMemoryRepo");
+        Arc::new(InMemoryRepo::default())
+    }
+}
+
 #[tokio::main]
 async fn main() {
     START_TIME.set(Instant::now()).ok();
@@ -4640,26 +4793,7 @@ async fn main() {
         Ok("staging") => Env::Staging,
         _ => Env::Production,
     };
-
-    // Wire DATABASE_URL → MySqlRepo when present; fallback to InMemoryRepo for local dev.
-    let repo: Arc<dyn NodeRepository> = if let Ok(url) = std::env::var("DATABASE_URL") {
-        match db::init_pool(&url).await {
-            Ok(pool) => {
-                if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
-                    eprintln!("WARNING: migrations failed ({e}); proceeding");
-                }
-                println!("iicp-directory-rs {VERSION}: MySQL pool connected");
-                Arc::new(db::MySqlRepo::new(pool))
-            }
-            Err(e) => {
-                eprintln!("WARNING: MySQL pool failed ({e}); falling back to InMemoryRepo");
-                Arc::new(InMemoryRepo::default())
-            }
-        }
-    } else {
-        println!("iicp-directory-rs {VERSION}: no DATABASE_URL; using InMemoryRepo");
-        Arc::new(InMemoryRepo::default())
-    };
+    let repo = initialize_repository().await;
 
     // Spawn background maintenance tasks before starting the HTTP server.
     tokio::spawn(background::run_expire_nodes_loop(Arc::clone(&repo)));

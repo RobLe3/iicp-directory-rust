@@ -1,0 +1,2178 @@
+{
+  "compatibility": "required subset; additive tables, columns and indexes are allowed",
+  "schema": "iicp.directory.mysql.contract.v1",
+  "source": "fresh Laravel migrations on MySQL 8.0",
+  "tables": {
+    "availability_windows": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "end_time": {
+          "column_type": "time",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "node_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "share": {
+          "column_type": "double",
+          "default": "1",
+          "extra": "",
+          "nullable": false
+        },
+        "start_time": {
+          "column_type": "time",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {
+        "availability_windows_node_id_foreign": {
+          "columns": [
+            "node_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ],
+          "referenced_table": "nodes"
+        }
+      },
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "availability_windows_node_id_index": {
+          "columns": [
+            "node_id"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "capabilities": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "inference_engine": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "input_modalities": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "intent": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "max_tokens": {
+          "column_type": "int unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "models": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "node_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "quantization": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {
+        "capabilities_node_id_foreign": {
+          "columns": [
+            "node_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ],
+          "referenced_table": "nodes"
+        }
+      },
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "capabilities_intent_index": {
+          "columns": [
+            "intent"
+          ],
+          "unique": false
+        },
+        "capabilities_node_id_intent_index": {
+          "columns": [
+            "node_id",
+            "intent"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "conformance_badges": {
+      "columns": {
+        "badge_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "expires_at": {
+          "column_type": "datetime",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "issuer_did": {
+          "column_type": "varchar(256)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "passed_at": {
+          "column_type": "datetime",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "sig": {
+          "column_type": "text",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "status": {
+          "column_type": "varchar(16)",
+          "default": "active",
+          "extra": "",
+          "nullable": false
+        },
+        "subject_component": {
+          "column_type": "varchar(16)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "subject_did": {
+          "column_type": "varchar(256)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "suite_version": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "test_results_url": {
+          "column_type": "varchar(512)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "tier": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "verification_mode": {
+          "column_type": "varchar(32)",
+          "default": "self-attested",
+          "extra": "",
+          "nullable": false
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "badge_id"
+          ],
+          "unique": true
+        },
+        "conformance_badges_expires_at_status_index": {
+          "columns": [
+            "expires_at",
+            "status"
+          ],
+          "unique": false
+        },
+        "conformance_badges_subject_did_tier_status_index": {
+          "columns": [
+            "subject_did",
+            "tier",
+            "status"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "credit_ip_gates": {
+      "columns": {
+        "allocation_count": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "ip_address": {
+          "column_type": "varchar(45)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "last_allocation_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "ip_address"
+          ],
+          "unique": true
+        }
+      }
+    },
+    "credit_transactions": {
+      "columns": {
+        "amount": {
+          "column_type": "decimal(15,4)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "expires_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "node_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "nonce": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "reason": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "task_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "type": {
+          "column_type": "enum('credit','debit')",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {
+        "credit_transactions_node_id_foreign": {
+          "columns": [
+            "node_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ],
+          "referenced_table": "nodes"
+        }
+      },
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "credit_transactions_node_id_created_at_index": {
+          "columns": [
+            "node_id",
+            "created_at"
+          ],
+          "unique": false
+        },
+        "credit_transactions_nonce_unique": {
+          "columns": [
+            "nonce"
+          ],
+          "unique": true
+        },
+        "credit_tx_expires_at_idx": {
+          "columns": [
+            "expires_at"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "credits": {
+      "columns": {
+        "balance": {
+          "column_type": "decimal(15,4)",
+          "default": "0.0000",
+          "extra": "",
+          "nullable": false
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "free_credit_last_allocation_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "node_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "node_id"
+          ],
+          "unique": true
+        }
+      }
+    },
+    "data_subject_actions": {
+      "columns": {
+        "action": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "affected_counts": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "applied_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "retention_reason": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "selector": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "subject_hash": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "tracking_id": {
+          "column_type": "varchar(96)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "data_subject_actions_action_applied_at_index": {
+          "columns": [
+            "action",
+            "applied_at"
+          ],
+          "unique": false
+        },
+        "data_subject_actions_subject_hash_index": {
+          "columns": [
+            "subject_hash"
+          ],
+          "unique": false
+        },
+        "data_subject_actions_tracking_id_unique": {
+          "columns": [
+            "tracking_id"
+          ],
+          "unique": true
+        }
+      }
+    },
+    "dispatch_usage_daily": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "mode": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "request_count": {
+          "column_type": "bigint unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "usage_date": {
+          "column_type": "date",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "dispatch_usage_daily_usage_date_index": {
+          "columns": [
+            "usage_date"
+          ],
+          "unique": false
+        },
+        "dispatch_usage_daily_usage_date_mode_unique": {
+          "columns": [
+            "usage_date",
+            "mode"
+          ],
+          "unique": true
+        }
+      }
+    },
+    "iicp_telemetry_aggregates": {
+      "columns": {
+        "computed_at": {
+          "column_type": "timestamp",
+          "default": "CURRENT_TIMESTAMP",
+          "extra": "default_generated",
+          "nullable": false
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "metric": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "sample_count": {
+          "column_type": "int",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "value": {
+          "column_type": "double",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "window": {
+          "column_type": "varchar(8)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "iicp_telemetry_aggregates_window_metric_computed_at_index": {
+          "columns": [
+            "window",
+            "metric",
+            "computed_at"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "iicp_telemetry_probes": {
+      "columns": {
+        "detail": {
+          "column_type": "text",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "latency_ms": {
+          "column_type": "double",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "level": {
+          "column_type": "varchar(8)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "metadata": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "node_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "passed": {
+          "column_type": "tinyint(1)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "probe_id": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "probe_token_id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "probe_type": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "probed_at": {
+          "column_type": "timestamp",
+          "default": "CURRENT_TIMESTAMP",
+          "extra": "default_generated",
+          "nullable": false
+        },
+        "run_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "test_id": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        }
+      },
+      "foreign_keys": {
+        "iicp_telemetry_probes_probe_token_id_foreign": {
+          "columns": [
+            "probe_token_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ],
+          "referenced_table": "probe_tokens"
+        }
+      },
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "iicp_telemetry_probes_node_id_probed_at_index": {
+          "columns": [
+            "node_id",
+            "probed_at"
+          ],
+          "unique": false
+        },
+        "iicp_telemetry_probes_probe_token_id_probed_at_index": {
+          "columns": [
+            "probe_token_id",
+            "probed_at"
+          ],
+          "unique": false
+        },
+        "iicp_telemetry_probes_test_id_probed_at_index": {
+          "columns": [
+            "test_id",
+            "probed_at"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "node_address_history": {
+      "columns": {
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "ip_address": {
+          "column_type": "varchar(45)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "node_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "observed_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "request_type": {
+          "column_type": "enum('register','heartbeat','other')",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        }
+      },
+      "foreign_keys": {
+        "node_address_history_node_id_foreign": {
+          "columns": [
+            "node_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ],
+          "referenced_table": "nodes"
+        }
+      },
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "node_address_history_node_id_index": {
+          "columns": [
+            "node_id"
+          ],
+          "unique": false
+        },
+        "node_address_history_observed_at_index": {
+          "columns": [
+            "observed_at"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "node_events": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "event_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "event_type": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "node_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "payload": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "prev_hash": {
+          "column_type": "char(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "seq": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "service_id": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "signature": {
+          "column_type": "varchar(128)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "ts_ms": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "node_events_event_id_unique": {
+          "columns": [
+            "event_id"
+          ],
+          "unique": true
+        },
+        "node_events_node_id_index": {
+          "columns": [
+            "node_id"
+          ],
+          "unique": false
+        },
+        "node_events_seq_event_type_index": {
+          "columns": [
+            "seq",
+            "event_type"
+          ],
+          "unique": false
+        },
+        "node_events_seq_unique": {
+          "columns": [
+            "seq"
+          ],
+          "unique": true
+        },
+        "node_events_service_id_index": {
+          "columns": [
+            "service_id"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "node_health_observations": {
+      "columns": {
+        "components": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "evaluated_at_ms": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "evaluator_did": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "event_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "label": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "node_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "score": {
+          "column_type": "double",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "node_health_observations_evaluated_at_ms_index": {
+          "columns": [
+            "evaluated_at_ms"
+          ],
+          "unique": false
+        },
+        "node_health_observations_node_id_evaluator_did_unique": {
+          "columns": [
+            "node_id",
+            "evaluator_did"
+          ],
+          "unique": true
+        },
+        "node_health_observations_node_id_index": {
+          "columns": [
+            "node_id"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "nodes": {
+      "columns": {
+        "active_jobs": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "allow_file_access": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "allow_remote_inference": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "allow_tool_execution": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "attested": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "auto_update_enabled": {
+          "column_type": "tinyint(1)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "auto_update_interval_s": {
+          "column_type": "int unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "available": {
+          "column_type": "tinyint(1)",
+          "default": "1",
+          "extra": "",
+          "nullable": false
+        },
+        "avg_latency_ms": {
+          "column_type": "double",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "avg_latency_ms_recent": {
+          "column_type": "double",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "backend": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "backend_stability": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "credit_balance": {
+          "column_type": "decimal(15,4)",
+          "default": "0.0000",
+          "extra": "",
+          "nullable": false
+        },
+        "credit_cost_multiplier": {
+          "column_type": "double",
+          "default": "1",
+          "extra": "",
+          "nullable": false
+        },
+        "cx_public_key": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "declaration_signature": {
+          "column_type": "text",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "did_public_key": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "dormant_since": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "endpoint": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "endpoint_verified_dead_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "exposure_mode": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "free_credit_last_allocation_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "gossip_public_key": {
+          "column_type": "varchar(128)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "health_models": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "identity_key": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "last_seen": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "lifetime_jobs": {
+          "column_type": "bigint unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "liveness_challenge": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "liveness_verified_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "load": {
+          "column_type": "double",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "max_concurrent": {
+          "column_type": "int unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "nat_type": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "node_hmac_key": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "node_token_hash": {
+          "column_type": "varchar(512)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "observed_source_ip": {
+          "column_type": "varchar(45)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "operator_contact": {
+          "column_type": "varchar(256)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "operator_pubkey": {
+          "column_type": "varchar(80)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "operator_trust_tier": {
+          "column_type": "varchar(16)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "operator_url": {
+          "column_type": "varchar(256)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "operator_verified": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "policy_manifest": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "pricing_credits_per_1000": {
+          "column_type": "decimal(10,4)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "pricing_effective_from": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "pricing_effective_until": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "pricing_model": {
+          "column_type": "varchar(32)",
+          "default": "per_token",
+          "extra": "",
+          "nullable": false
+        },
+        "proxy_token_hash": {
+          "column_type": "varchar(60)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "public_listing": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "public_reachable": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "recent_window_start": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "region": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "relay_capable": {
+          "column_type": "tinyint(1)",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "rep_hourly_gain": {
+          "column_type": "decimal(8,4)",
+          "default": "0.0000",
+          "extra": "",
+          "nullable": false
+        },
+        "rep_hourly_window_start": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "reputation_score": {
+          "column_type": "double",
+          "default": "0.5",
+          "extra": "",
+          "nullable": false
+        },
+        "sdk_language": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "sdk_latest_seen": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "sdk_update_error_class": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "sdk_update_last_checked_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "sdk_version": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "status": {
+          "column_type": "varchar(255)",
+          "default": "active",
+          "extra": "",
+          "nullable": false
+        },
+        "supported_receipt_profiles": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "tasks_failed": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "tasks_failed_recent": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "tasks_total": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "tasks_total_recent": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "tokens_per_min": {
+          "column_type": "int unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "transport_endpoint": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "transport_metadata": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "transport_method": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "nodes_available_index": {
+          "columns": [
+            "available"
+          ],
+          "unique": false
+        },
+        "nodes_discover_idx": {
+          "columns": [
+            "available",
+            "status",
+            "last_seen"
+          ],
+          "unique": false
+        },
+        "nodes_endpoint_verified_dead_at_index": {
+          "columns": [
+            "endpoint_verified_dead_at"
+          ],
+          "unique": false
+        },
+        "nodes_last_seen_index": {
+          "columns": [
+            "last_seen"
+          ],
+          "unique": false
+        },
+        "nodes_operator_pubkey_idx": {
+          "columns": [
+            "operator_pubkey"
+          ],
+          "unique": false
+        },
+        "nodes_public_reachable_last_seen_idx": {
+          "columns": [
+            "public_reachable",
+            "last_seen"
+          ],
+          "unique": false
+        },
+        "nodes_recent_window_start_index": {
+          "columns": [
+            "recent_window_start"
+          ],
+          "unique": false
+        },
+        "nodes_region_index": {
+          "columns": [
+            "region"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "operators": {
+      "columns": {
+        "acceptance_method": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "acceptance_nonce_sha256": {
+          "column_type": "char(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "attested_created_at": {
+          "column_type": "varchar(40)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "badge": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "display_name": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "dpa_accepted_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "dpa_version": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "first_seen_ms": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "identity_reason_class": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "identity_revoked_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "identity_status": {
+          "column_type": "varchar(16)",
+          "default": "active",
+          "extra": "",
+          "nullable": false
+        },
+        "operator_integrity_hash": {
+          "column_type": "char(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "operator_pubkey": {
+          "column_type": "varchar(80)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "ordinal": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "provenance": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "rotation_epoch": {
+          "column_type": "int unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "successor_operator_pubkey_sha256": {
+          "column_type": "char(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "terms_accepted_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "terms_version": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "tier": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "operators_identity_status_idx": {
+          "columns": [
+            "identity_status",
+            "updated_at"
+          ],
+          "unique": false
+        },
+        "operators_operator_pubkey_unique": {
+          "columns": [
+            "operator_pubkey"
+          ],
+          "unique": true
+        }
+      }
+    },
+    "policy_key_lifecycle_records": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "evidence_ref": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "policy_key_sha256": {
+          "column_type": "char(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "revocation_reason_class": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "revoked_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "rotation_epoch": {
+          "column_type": "int unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "status": {
+          "column_type": "varchar(32)",
+          "default": "active",
+          "extra": "",
+          "nullable": false
+        },
+        "superseded_by_policy_key_sha256": {
+          "column_type": "char(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "policy_key_lifecycle_records_policy_key_sha256_unique": {
+          "columns": [
+            "policy_key_sha256"
+          ],
+          "unique": true
+        },
+        "policy_key_lifecycle_status_idx": {
+          "columns": [
+            "status",
+            "updated_at"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "probe_tokens": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "expires_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "label": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "last_seen_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "region": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "token_hash": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "probe_tokens_token_hash_unique": {
+          "columns": [
+            "token_hash"
+          ],
+          "unique": true
+        }
+      }
+    },
+    "proxy_telemetry": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "latency_ms_observed": {
+          "column_type": "double",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "node_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "proxy_node_id": {
+          "column_type": "varchar(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "qos_advertised": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "qos_met": {
+          "column_type": "tinyint(1)",
+          "default": "1",
+          "extra": "",
+          "nullable": false
+        },
+        "status": {
+          "column_type": "varchar(32)",
+          "default": "success",
+          "extra": "",
+          "nullable": false
+        },
+        "time_bucket": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "tokens_observed": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "proxy_telemetry_dedup": {
+          "columns": [
+            "node_id",
+            "proxy_node_id",
+            "time_bucket"
+          ],
+          "unique": true
+        },
+        "proxy_telemetry_node_id_index": {
+          "columns": [
+            "node_id"
+          ],
+          "unique": false
+        },
+        "proxy_telemetry_proxy_node_id_index": {
+          "columns": [
+            "proxy_node_id"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "replicas": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "did": {
+          "column_type": "varchar(253)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "endpoint": {
+          "column_type": "varchar(255)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "expires_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "id": {
+          "column_type": "bigint unsigned",
+          "default": null,
+          "extra": "auto_increment",
+          "nullable": false
+        },
+        "last_seen_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "replica_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "replica_token_hash": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "status": {
+          "column_type": "varchar(16)",
+          "default": "active",
+          "extra": "",
+          "nullable": false
+        },
+        "trust_tier": {
+          "column_type": "varchar(16)",
+          "default": "low",
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "replicas_did_unique": {
+          "columns": [
+            "did"
+          ],
+          "unique": true
+        },
+        "replicas_last_seen_at_index": {
+          "columns": [
+            "last_seen_at"
+          ],
+          "unique": false
+        },
+        "replicas_replica_id_unique": {
+          "columns": [
+            "replica_id"
+          ],
+          "unique": true
+        },
+        "replicas_status_index": {
+          "columns": [
+            "status"
+          ],
+          "unique": false
+        },
+        "replicas_trust_tier_index": {
+          "columns": [
+            "trust_tier"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "reputations": {
+      "columns": {
+        "avg_latency_ms": {
+          "column_type": "double",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "completed_tasks_count": {
+          "column_type": "bigint unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "node_id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "observed_latency_ms": {
+          "column_type": "double",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "score": {
+          "column_type": "double",
+          "default": "0.5",
+          "extra": "",
+          "nullable": false
+        },
+        "tasks_failed": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "tasks_total": {
+          "column_type": "int unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {
+        "reputations_node_id_foreign": {
+          "columns": [
+            "node_id"
+          ],
+          "referenced_columns": [
+            "id"
+          ],
+          "referenced_table": "nodes"
+        }
+      },
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "node_id"
+          ],
+          "unique": true
+        }
+      }
+    }
+  }
+}

@@ -25,6 +25,21 @@ pub struct NodeRecord {
     pub proxy_token: Option<String>,
 }
 
+/// Redacted repository failure surfaced to HTTP handlers. Concrete database
+/// errors stay in the persistence layer and must never leak tokens or SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoError {
+    Persistence,
+}
+
+impl std::fmt::Display for RepoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "repository persistence failed")
+    }
+}
+
+impl std::error::Error for RepoError {}
+
 /// Public-safe result of an accountless operator identity lifecycle action.
 /// Raw keys remain repository-private; callers receive only counts and the
 /// replacement identity needed for internal registration continuity.
@@ -65,7 +80,7 @@ pub trait NodeRepository: Send + Sync {
 
     /// Persist a registration (iicp-dir §3.1). Re-registering an existing `node_id`
     /// replaces the record (idempotent recovery), preserving its reputation_score.
-    async fn register(&self, rec: NodeRecord);
+    async fn register(&self, rec: NodeRecord) -> Result<(), RepoError>;
 
     /// Apply a heartbeat (iicp-dir §3.2): update load/available, add `delta` to the
     /// node's reputation_score (clamped 0..1), return the new score. `None` if unknown.
@@ -752,7 +767,7 @@ impl NodeRepository for InMemoryRepo {
         matched
     }
 
-    async fn register(&self, rec: NodeRecord) {
+    async fn register(&self, rec: NodeRecord) -> Result<(), RepoError> {
         let mut guard = self.records.lock().unwrap();
         if let Some(existing) = guard
             .iter_mut()
@@ -765,6 +780,7 @@ impl NodeRepository for InMemoryRepo {
         } else {
             guard.push(rec);
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

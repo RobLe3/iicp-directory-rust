@@ -2,12 +2,13 @@
 # Used as a federation replica in docker-compose.federation.yml (#437/#436).
 FROM rust:slim AS builder
 WORKDIR /build
-# migrations/ must be present at compile time: sqlx::migrate!("./migrations") embeds
-# them into the binary. Cargo.lock pins the dependency graph (incl. ed25519-compact,
-# reqwest/rustls) for a reproducible build.
+# The Laravel-derived schema baseline and compatibility contract are embedded
+# into the binary. Historical SQLx migrations remain source evidence but are
+# never replayed at runtime.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY schema ./schema
 # Compile-time taxonomy fixtures are part of the directory's policy contract.
 # Keep them in the builder image so a production Docker build cannot silently
 # diverge from the checked-in binary/test build.
@@ -22,6 +23,6 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/iicp-directory-rs /usr/local/bin/iicp-directory-rs
 EXPOSE 8090
 ENV RUST_LOG=info
-# DATABASE_URL → MySqlRepo (migrations auto-run on boot); IICP_REPLICA_MODE=true +
+# DATABASE_URL → MySqlRepo (empty bootstrap or verify-only); IICP_REPLICA_MODE=true +
 # IICP_SEED_URL=<seed> → federate (tail the seed's signed event log, mirror state).
 CMD ["iicp-directory-rs"]

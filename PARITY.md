@@ -1,6 +1,8 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
-Last refreshed: **2026-07-11**. The Laravel seed is currently `v1.10.69`.
+Last refreshed: **2026-07-18**. The local Laravel seed source is `v1.10.75`;
+the route-level parity fixture remains named `contract-v1.10.69.json` and must
+not be mistaken for a current production-version claim.
 
 > **Status:** this Rust implementation is a reconciled parity baseline, not a
 > cutover-ready replacement. It remains behind the seed for operator acceptance/DSR,
@@ -109,6 +111,13 @@ suites.
 
 ## Remaining parity cautions
 
+- **Database startup:** Rust now bootstraps only a truly empty database from
+  `schema/baseline-v1.sql` and verifies every existing database against
+  `schema/contract-v1.json`. It never replays the historical SQLx migration
+  chain, repairs partial schemas, mutates `_sqlx_migrations`, or silently falls
+  back to memory when `DATABASE_URL` is configured. The disposable Docker gate
+  proves fresh bootstrap, Laravel adoption, restart/history preservation,
+  incomplete-schema rejection and atomic registration rollback.
 - **Compliance attestation:** Rust emits a compact signed attestation when configured. Production PHP includes latest REACH conformance probe evidence and cache behavior; Rust needs a real probe-data path before this is production-equivalent.
 - **Operational commands:** Rust has background tasks for core lifecycle behavior, but PHP Artisan remains the richer operator toolbox for genesis key provisioning, probe token issuance, warm caches, founder lock-in scans and deployment-specific operations.
 - **Middleware/deployment behavior:** Replica write redirect exists in Rust. Exact PHP shared-hosting middleware, CDN cache tuning and deploy-script behavior still need live verification before cutover.
@@ -119,7 +128,8 @@ suites.
 ```bash
 cd iicp-directory-rs
 cargo fmt --check && cargo test --locked
-# 214 passed
+cd ..
+bash scripts/docker_rust_schema_reliability_gate.sh
 ```
 
 New parity tests added in this refresh:
