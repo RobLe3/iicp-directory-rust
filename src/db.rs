@@ -90,25 +90,25 @@ fn median_outlier_weight(value: f64, sorted_sample: &[(f64,)]) -> f64 {
 
 // ── DB row ────────────────────────────────────────────────────────────────────
 
-/// Raw row from the `nodes` table. FLOAT columns map to f32 in MySQL via sqlx;
-/// they are widened to f64 in `From<NodeRow> for Node`.
+/// Raw row from the `nodes` table. Numeric SELECTs cast FLOAT/DOUBLE columns to
+/// DOUBLE so this row works against both the standalone and Laravel schemas.
 #[derive(sqlx::FromRow)]
 struct NodeRow {
     id: String,
     endpoint: String,
     region: String,
-    reputation_score: f32,
+    reputation_score: f64,
     available: bool,
-    load: f32,
+    load: f64,
     active_jobs: u32,
     max_concurrent: u32,
     tasks_total: u32,
-    avg_latency_ms: f32,
+    avg_latency_ms: f64,
     exposure_mode: Option<String>,
     transport_endpoint: Option<String>,
     // #400 — discover field parity with PHP (NodeScorer emits these).
     #[sqlx(default)]
-    credit_cost_multiplier: f32,
+    credit_cost_multiplier: f64,
     #[sqlx(default)]
     pricing_model: Option<String>,
     #[sqlx(default)]
@@ -427,8 +427,12 @@ impl NodeRepository for MySqlRepo {
         health_models: Option<Vec<String>>,
     ) -> Option<f64> {
         // RT-01b (#381): fetch velocity window alongside score.
-        let row: Option<(f32, f32, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
-            "SELECT reputation_score, rep_hourly_gain, rep_hourly_window_start \
+        // Laravel stores rep_hourly_gain as DECIMAL(8,4).  sqlx does not decode a
+        // MySQL DECIMAL directly into f32/f64, so cast it explicitly.  Without the
+        // cast a persisted node is incorrectly treated as unknown and heartbeat
+        // returns IICP-E003 even though token verification succeeded.
+        let row: Option<(f64, f64, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
+            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), rep_hourly_window_start \
              FROM nodes WHERE id = ?",
         )
         .bind(node_id)
@@ -437,7 +441,7 @@ impl NodeRepository for MySqlRepo {
         .ok()
         .flatten();
 
-        let (old_score_f32, hourly_gain_f32, window_start) = row?;
+        let (old_score, hourly_gain, window_start) = row?;
 
         // RT-01b: compute effective delta with hourly velocity ceiling (0.20/h/node)
         const MAX_HOURLY_GAIN: f64 = 0.20;
@@ -449,11 +453,7 @@ impl NodeRepository for MySqlRepo {
                 })
                 .unwrap_or(true);
 
-            let current_gain = if window_expired {
-                0.0f64
-            } else {
-                hourly_gain_f32 as f64
-            };
+            let current_gain = if window_expired { 0.0f64 } else { hourly_gain };
 
             let remaining = (MAX_HOURLY_GAIN - current_gain).max(0.0);
             let capped = delta.min(remaining);
@@ -463,10 +463,10 @@ impl NodeRepository for MySqlRepo {
                 window_expired || window_start.is_none(),
             )
         } else {
-            (delta, hourly_gain_f32 as f64, false)
+            (delta, hourly_gain, false)
         };
 
-        let new_score = reputation::apply_delta(old_score_f32 as f64, effective_delta);
+        let new_score = reputation::apply_delta(old_score, effective_delta);
 
         // #494 — encode health_models as JSON when the SDK reported a live list.
         let health_models_json: Option<String> = health_models
@@ -501,10 +501,13 @@ impl NodeRepository for MySqlRepo {
     /// Fetch a single node by id for the node-detail endpoint (iicp-dir §3.4.x).
     async fn get(&self, node_id: &str) -> Option<Node> {
         let row: Option<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, supported_receipt_profiles,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
                       operator_pubkey, operator_verified, operator_trust_tier
                FROM nodes WHERE id = ?"#,
         )
@@ -522,10 +525,13 @@ impl NodeRepository for MySqlRepo {
         // custom name), AVAILABLE only, exact match preferred. The website resolves node
         // detail by 8-hex prefix, so exact-only get() would 404 those.
         let row: Option<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, supported_receipt_profiles,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
                       operator_pubkey, operator_verified, operator_trust_tier
                FROM nodes
                WHERE (id = ? OR id LIKE CONCAT(?, '%')) AND available = 1
@@ -560,10 +566,13 @@ impl NodeRepository for MySqlRepo {
     /// Bootstrap: return recently-seen active nodes sorted by last_seen desc (iicp-dir §3.7).
     async fn bootstrap(&self, limit: usize) -> Vec<Node> {
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, sdk_language, sdk_version, backend, supported_receipt_profiles
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, sdk_language, sdk_version, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -582,10 +591,13 @@ impl NodeRepository for MySqlRepo {
     /// as `bootstrap`/`active_count`, no LIMIT.
     async fn active_nodes(&self) -> Vec<Node> {
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, supported_receipt_profiles
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)"#,
@@ -638,10 +650,13 @@ impl NodeRepository for MySqlRepo {
         // Build the NOT IN clause dynamically — known_ids is caller-bounded (max 20).
         if known_ids.is_empty() {
             let rows: Vec<NodeRow> = sqlx::query_as(
-                r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                          max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                          credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, supported_receipt_profiles
+                r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                          available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                          tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                          exposure_mode, transport_endpoint,
+                          CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                          pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
                    FROM nodes
                    WHERE available = 1
                      AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -658,10 +673,13 @@ impl NodeRepository for MySqlRepo {
         // Fetch all candidates and filter in Rust to avoid dynamic SQL binding complexity.
         // known_ids is bounded (max 20) so this is safe — no unbounded IN clause.
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, supported_receipt_profiles
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -734,10 +752,13 @@ impl NodeRepository for MySqlRepo {
     async fn list_public(&self, offset: u64, limit: usize) -> Vec<Node> {
         let cap = limit.min(100) as u32;
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, supported_receipt_profiles, public_listing, operator_url
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, public_listing, operator_url
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -1065,21 +1086,27 @@ impl NodeRepository for MySqlRepo {
         nonce: &str,
     ) -> Result<f64, CreditError> {
         // Atomic nonce check + insert + balance update via BEGIN/COMMIT.
-        let mut tx = self.pool.begin().await.map_err(|_| CreditError::DbError)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            eprintln!("credit award: begin transaction failed: {error}");
+            CreditError::DbError
+        })?;
 
         let existing: Option<(i64,)> =
             sqlx::query_as("SELECT COUNT(*) FROM credit_transactions WHERE nonce = ?")
                 .bind(nonce)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(|_| CreditError::DbError)?;
+                .map_err(|error| {
+                    eprintln!("credit award: nonce lookup failed: {error}");
+                    CreditError::DbError
+                })?;
         if existing.map(|(n,)| n > 0).unwrap_or(false) {
             return Err(CreditError::NonceReplay);
         }
 
         // WQ-056 / billing §11: an earn stamps the credit TTL horizon (NOW() + 90 DAY).
         // The nightly run_expire_credits_loop sweeps nodes whose newest earn is past TTL.
-        sqlx::query(
+        let insert_result = sqlx::query(
             "INSERT INTO credit_transactions (node_id, amount, type, task_id, nonce, reason, expires_at) \
              VALUES (?, ?, 'credit', ?, ?, 'cip_award', NOW() + INTERVAL 90 DAY)",
         )
@@ -1088,17 +1115,32 @@ impl NodeRepository for MySqlRepo {
         .bind(task_id)
         .bind(nonce)
         .execute(&mut *tx)
-        .await
-        .map_err(|_| CreditError::DbError)?;
+        .await;
+        if let Err(error) = insert_result {
+            if error
+                .as_database_error()
+                .is_some_and(|db_error| db_error.is_unique_violation())
+            {
+                return Err(CreditError::NonceReplay);
+            }
+            eprintln!("credit award: ledger insert failed: {error}");
+            return Err(CreditError::DbError);
+        }
 
         sqlx::query("UPDATE nodes SET credit_balance = credit_balance + ? WHERE id = ?")
             .bind(amount)
             .bind(node_id)
             .execute(&mut *tx)
             .await
-            .map_err(|_| CreditError::DbError)?;
+            .map_err(|error| {
+                eprintln!("credit award: balance update failed: {error}");
+                CreditError::DbError
+            })?;
 
-        tx.commit().await.map_err(|_| CreditError::DbError)?;
+        tx.commit().await.map_err(|error| {
+            eprintln!("credit award: commit failed: {error}");
+            CreditError::DbError
+        })?;
 
         // Fetch updated balance. CAST AS DOUBLE — credit_balance is DECIMAL(15,4) and sqlx
         // cannot decode DECIMAL straight into f64, so a bare SELECT errored → None → the award
@@ -2242,10 +2284,13 @@ impl NodeRepository for MySqlRepo {
     async fn snapshot_records(&self) -> Vec<NodeRecord> {
         // All nodes (the active_nodes row-map without the liveness WHERE) + their intents.
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, reputation_score, available, `load`, active_jobs,
-                      max_concurrent, tasks_total, avg_latency_ms, exposure_mode, transport_endpoint,
-                      credit_cost_multiplier, pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, supported_receipt_profiles
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
                FROM nodes"#,
         )
         .fetch_all(&self.pool)
@@ -2512,54 +2557,108 @@ impl NodeRepository for MySqlRepo {
     /// Both checks and writes are atomic within a single transaction.
     async fn maybe_allocate_free_credits(&self, node_id: &str, ip: &str) -> f64 {
         const FREE_AMOUNT: f64 = 100.0;
+        let Ok(mut tx) = self.pool.begin().await else {
+            return 0.0;
+        };
 
-        // Check IP gate first (read) — blocks even if node_id gate would pass
-        let ip_blocked: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM credit_ip_gates \
-             WHERE ip_address = ? \
-               AND last_allocation_at IS NOT NULL \
-               AND last_allocation_at > NOW() - INTERVAL 6 HOUR",
+        // Materialize both gate rows before locking them.  This closes the
+        // absent-row race where two first allocations from the same source IP
+        // could both pass independent SELECT checks.
+        if sqlx::query(
+            "INSERT INTO credits (node_id, balance, free_credit_last_allocation_at, created_at, updated_at) \
+             VALUES (?, 0, NULL, NOW(), NOW()) \
+             ON DUPLICATE KEY UPDATE node_id = VALUES(node_id)",
+        )
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+        {
+            return 0.0;
+        }
+        if sqlx::query(
+            "INSERT INTO credit_ip_gates (ip_address, last_allocation_at, allocation_count, created_at, updated_at) \
+             VALUES (?, NULL, 0, NOW(), NOW()) \
+             ON DUPLICATE KEY UPDATE ip_address = VALUES(ip_address)",
         )
         .bind(ip)
-        .fetch_one(&self.pool)
+        .execute(&mut *tx)
         .await
-        .unwrap_or(false);
-
-        if ip_blocked {
+        .is_err()
+        {
             return 0.0;
         }
 
-        // Per-node_id gate: atomic UPDATE with WHERE (race-safe)
-        let node_result = sqlx::query(
-            "UPDATE nodes \
-             SET credit_balance = credit_balance + ?, \
-                 free_credit_last_allocation_at = NOW() \
-             WHERE id = ? \
-               AND (free_credit_last_allocation_at IS NULL \
-                    OR free_credit_last_allocation_at < NOW() - INTERVAL 6 HOUR)",
+        let credit_gate: Option<(f64, i64)> = sqlx::query_as(
+            "SELECT CAST(balance AS DOUBLE), \
+                    IF(free_credit_last_allocation_at IS NOT NULL AND \
+                       free_credit_last_allocation_at > NOW() - INTERVAL 6 HOUR, 1, 0) \
+             FROM credits WHERE node_id = ? FOR UPDATE",
         )
-        .bind(FREE_AMOUNT)
         .bind(node_id)
-        .execute(&self.pool)
-        .await;
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()
+        .flatten();
+        let ip_blocked: Option<(i64,)> = sqlx::query_as(
+            "SELECT IF(last_allocation_at IS NOT NULL AND \
+                       last_allocation_at > NOW() - INTERVAL 6 HOUR, 1, 0) \
+             FROM credit_ip_gates WHERE ip_address = ? FOR UPDATE",
+        )
+        .bind(ip)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()
+        .flatten();
+        let Some((balance, node_blocked)) = credit_gate else {
+            return 0.0;
+        };
+        if balance > 0.0 || node_blocked != 0 || ip_blocked.map(|v| v.0 != 0).unwrap_or(true) {
+            return 0.0;
+        }
 
-        match node_result {
-            Ok(r) if r.rows_affected() > 0 => {
-                // Node gate passed — update IP gate (upsert)
-                let _ = sqlx::query(
-                    "INSERT INTO credit_ip_gates (ip_address, last_allocation_at, allocation_count, created_at, updated_at) \
-                     VALUES (?, NOW(), 1, NOW(), NOW()) \
-                     ON DUPLICATE KEY UPDATE \
-                       last_allocation_at = NOW(), \
-                       allocation_count = allocation_count + 1, \
-                       updated_at = NOW()",
-                )
-                .bind(ip)
-                .execute(&self.pool)
-                .await;
-                FREE_AMOUNT
-            }
-            _ => 0.0,
+        let new_balance = balance + FREE_AMOUNT;
+        let writes_ok = sqlx::query(
+            "UPDATE credits SET balance = ?, free_credit_last_allocation_at = NOW(), updated_at = NOW() \
+             WHERE node_id = ?",
+        )
+        .bind(new_balance)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .is_ok()
+            && sqlx::query(
+                "INSERT INTO credit_transactions \
+                 (node_id, amount, type, reason, expires_at, created_at, updated_at) \
+                 VALUES (?, ?, 'credit', 'free_allocation', NOW() + INTERVAL 90 DAY, NOW(), NOW())",
+            )
+            .bind(node_id)
+            .bind(FREE_AMOUNT)
+            .execute(&mut *tx)
+            .await
+            .is_ok()
+            && sqlx::query(
+                "UPDATE nodes SET credit_balance = ?, free_credit_last_allocation_at = NOW() WHERE id = ?",
+            )
+            .bind(new_balance)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected() == 1)
+            .unwrap_or(false)
+            && sqlx::query(
+                "UPDATE credit_ip_gates SET last_allocation_at = NOW(), \
+                 allocation_count = allocation_count + 1, updated_at = NOW() WHERE ip_address = ?",
+            )
+            .bind(ip)
+            .execute(&mut *tx)
+            .await
+            .is_ok();
+
+        if writes_ok && tx.commit().await.is_ok() {
+            FREE_AMOUNT
+        } else {
+            0.0
         }
     }
 }
