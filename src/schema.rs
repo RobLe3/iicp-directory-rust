@@ -152,6 +152,19 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<SchemaStatus, SchemaErr
     Ok(status)
 }
 
+/// Verify a populated database without invoking the empty-database bootstrap.
+///
+/// Operational/read-only commands use this path so an accidentally empty
+/// `DATABASE_URL` can never turn a status query into a schema mutation.
+pub async fn verify_existing_schema(pool: &Pool<MySql>) -> Result<(), SchemaError> {
+    if base_table_count(pool).await? == 0 {
+        return Err(SchemaError::Incompatible(vec![
+            "database is empty; operational commands are verify-only".to_string(),
+        ]));
+    }
+    verify_schema(pool).await
+}
+
 async fn base_table_count(pool: &Pool<MySql>) -> Result<i64, SchemaError> {
     Ok(sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables \

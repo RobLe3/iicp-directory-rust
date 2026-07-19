@@ -439,8 +439,6 @@ pub trait NodeRepository: Send + Sync {
 
     async fn dispatch_usage_summary(&self, days: u32) -> serde_json::Value;
 
-    async fn prune_dispatch_usage(&self, retain_days: u32) -> u32;
-
     /// Directory-owned PolicyKeyLifecycle status by SHA-256(raw Ed25519 key).
     /// Missing records mean no authoritative override; non-active records fail
     /// policy-manifest registration closed.
@@ -1856,17 +1854,6 @@ impl NodeRepository for InMemoryRepo {
             }
         }
         dispatch_usage_summary_value(days, ticketed, legacy, public)
-    }
-
-    async fn prune_dispatch_usage(&self, retain_days: u32) -> u32 {
-        let cutoff =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(i64::from(retain_days.max(1)));
-        let mut usage = self.dispatch_usage.lock().unwrap();
-        let before = usage.len();
-        usage.retain(|(date, _), _| {
-            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_or(true, |date| date >= cutoff)
-        });
-        (before - usage.len()) as u32
     }
 
     async fn policy_key_lifecycle_status(&self, _policy_key_sha256: &str) -> Option<String> {

@@ -2953,17 +2953,6 @@ impl NodeRepository for MySqlRepo {
         )
     }
 
-    async fn prune_dispatch_usage(&self, retain_days: u32) -> u32 {
-        sqlx::query(
-            "DELETE FROM dispatch_usage_daily WHERE usage_date < UTC_DATE() - INTERVAL ? DAY",
-        )
-        .bind(retain_days.max(1))
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() as u32)
-        .unwrap_or(0)
-    }
-
     async fn policy_key_lifecycle_status(&self, policy_key_sha256: &str) -> Option<String> {
         sqlx::query_scalar(
             "SELECT status FROM policy_key_lifecycle_records WHERE policy_key_sha256 = ? LIMIT 1",

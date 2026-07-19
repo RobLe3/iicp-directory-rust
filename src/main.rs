@@ -15,6 +15,7 @@ mod federation;
 mod health;
 #[cfg(test)]
 mod jcs;
+mod maintenance;
 mod policy;
 mod policy_manifest;
 mod recognition;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{net::ToSocketAddrs, time::Duration};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -38,15 +40,82 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use clap::{Args, Parser, Subcommand};
 use repo::{
     AuditResult, ConformanceBadge, CreditError, DiscoverQuery, InMemoryRepo, IntentSummary,
     NodeRepository, OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
 };
 use serde::Deserialize;
+use sqlx::{MySql, Pool};
 use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
 const SDK_BASELINE_VERSION: &str = "0.7.68";
+
+#[derive(Debug, Parser)]
+#[command(name = "iicp-directory-rs", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Report metadata-only database maintenance status.
+    DbMaintenanceStatus {
+        #[command(flatten)]
+        retention: RetentionArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count expired telemetry by default; delete only with explicit --apply.
+    TelemetryPrune {
+        #[command(flatten)]
+        retention: RetentionArgs,
+        #[arg(long, default_value_t = maintenance::DEFAULT_BATCH_SIZE)]
+        batch: u32,
+        #[arg(long, default_value_t = maintenance::DEFAULT_MAX_BATCHES)]
+        max_batches: u32,
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report aggregate strict-E050 readiness without mutating registrations.
+    E050Readiness {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Default, Args)]
+struct RetentionArgs {
+    #[arg(long)]
+    probe_days: Option<u32>,
+    #[arg(long)]
+    aggregate_days: Option<u32>,
+    #[arg(long)]
+    proxy_days: Option<u32>,
+    #[arg(long)]
+    dispatch_days: Option<u32>,
+}
+
+impl RetentionArgs {
+    fn policy(&self) -> maintenance::RetentionPolicy {
+        let mut policy = maintenance::RetentionPolicy::from_env();
+        policy.probe_days = positive_override(self.probe_days, policy.probe_days);
+        policy.aggregate_days = positive_override(self.aggregate_days, policy.aggregate_days);
+        policy.proxy_days = positive_override(self.proxy_days, policy.proxy_days);
+        policy.dispatch_days = positive_override(self.dispatch_days, policy.dispatch_days);
+        policy
+    }
+}
+
+fn positive_override(value: Option<u32>, default: u32) -> u32 {
+    value.filter(|value| *value > 0).unwrap_or(default)
+}
 
 const OPERATOR_CHALLENGE_TTL_SECS: u64 = 300;
 const OPERATOR_TS_WINDOW_SECS: i64 = 300;
@@ -273,7 +342,38 @@ fn app(state: AppState) -> Router {
         .route("/v1/probe", get(probe_node))
         .route("/api/v1/probe", get(probe_node))
         .route("/", get(root_info))
+        .layer(middleware::from_fn(json_error_boundary))
         .with_state(state)
+}
+
+/// Axum extractor rejections otherwise expose plain-text parser details (and
+/// can include the phrase "at line"). Keep every API error JSON-shaped and
+/// content-free, matching the PHP authority's PROTO-MSG-05/SEC-LEAK contract.
+async fn json_error_boundary(req: Request, next: Next) -> Response {
+    let response = next.run(req).await;
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/json"));
+    if (status.is_client_error() || status.is_server_error()) && !is_json {
+        return (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "code": if status == StatusCode::UNPROCESSABLE_ENTITY {
+                        "validation_error"
+                    } else {
+                        "request_error"
+                    },
+                    "message": "request rejected"
+                }
+            })),
+        )
+            .into_response();
+    }
+    response
 }
 
 /// Replica write-gate (DIR-FED-18): when this directory runs as a replica
@@ -3071,7 +3171,7 @@ struct CreditAwardRequest {
 async fn credits_award(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<CreditAwardRequest>,
+    request: Result<Json<CreditAwardRequest>, JsonRejection>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let token = match bearer_token(&headers) {
         Some(t) => t,
@@ -3083,6 +3183,10 @@ async fn credits_award(
                 ),
             )
         }
+    };
+    let Json(req) = match request {
+        Ok(request) => request,
+        Err(_) => return reject("validation_error", "invalid credit award request"),
     };
     if !st.repo.verify_node_token(&req.node_id, &token).await {
         return (
@@ -3968,6 +4072,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 #[derive(Debug, Deserialize)]
 struct PeersRequest {
+    #[serde(alias = "sender_id")]
     node_id: String,
     #[serde(default)]
     known_peers: Vec<String>,
@@ -3981,7 +4086,7 @@ struct PeersRequest {
 async fn peers(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<PeersRequest>,
+    request: Result<Json<PeersRequest>, JsonRejection>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let token = match bearer_token(&headers) {
         Some(t) => t,
@@ -3993,6 +4098,10 @@ async fn peers(
                 ),
             )
         }
+    };
+    let Json(req) = match request {
+        Ok(request) => request,
+        Err(_) => return reject("validation_error", "invalid peer request"),
     };
     if !st.repo.verify_node_token(&req.node_id, &token).await {
         return (
@@ -4506,7 +4615,7 @@ struct TelemetryProbeRequest {
 async fn telemetry_probe(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<TelemetryProbeRequest>,
+    request: Result<Json<TelemetryProbeRequest>, JsonRejection>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let token = match bearer_token(&headers) {
         Some(t) => t,
@@ -4518,6 +4627,11 @@ async fn telemetry_probe(
                 ),
             )
         }
+    };
+
+    let Json(req) = match request {
+        Ok(request) => request,
+        Err(_) => return reject("validation_error", "invalid telemetry probe request"),
     };
 
     // ProbeTokenAuth: SHA-256 hash the bearer token and look up in probe_tokens table.
@@ -4561,7 +4675,7 @@ async fn telemetry_probe(
 async fn telemetry_proxy(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(obs): Json<ProxyObservation>,
+    request: Result<Json<ProxyObservation>, JsonRejection>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let token = match bearer_token(&headers) {
         Some(t) => t,
@@ -4573,6 +4687,10 @@ async fn telemetry_proxy(
                 ),
             )
         }
+    };
+    let Json(obs) = match request {
+        Ok(request) => request,
+        Err(_) => return reject("validation_error", "invalid proxy telemetry request"),
     };
     if obs.proxy_node_id.is_empty() || obs.node_id.is_empty() {
         return (
@@ -5150,7 +5268,12 @@ async fn deregister(
     }
 }
 
-async fn initialize_repository() -> Arc<dyn NodeRepository> {
+struct RepositoryRuntime {
+    repo: Arc<dyn NodeRepository>,
+    mysql_pool: Option<Pool<MySql>>,
+}
+
+async fn initialize_repository() -> RepositoryRuntime {
     // Wire DATABASE_URL → MySqlRepo when present. A configured database is an
     // explicit persistence contract: connection or schema failures are fatal,
     // never a silent downgrade to ephemeral memory.
@@ -5167,7 +5290,10 @@ async fn initialize_repository() -> Arc<dyn NodeRepository> {
                     }
                 }
                 println!("iicp-directory-rs {VERSION}: MySQL pool connected");
-                Arc::new(db::MySqlRepo::new(pool))
+                RepositoryRuntime {
+                    repo: Arc::new(db::MySqlRepo::new(pool.clone())),
+                    mysql_pool: Some(pool),
+                }
             }
             Err(e) => {
                 eprintln!("FATAL: configured MySQL connection failed: {e}");
@@ -5176,12 +5302,91 @@ async fn initialize_repository() -> Arc<dyn NodeRepository> {
         }
     } else {
         println!("iicp-directory-rs {VERSION}: no DATABASE_URL; using InMemoryRepo");
-        Arc::new(InMemoryRepo::default())
+        RepositoryRuntime {
+            repo: Arc::new(InMemoryRepo::default()),
+            mysql_pool: None,
+        }
     }
+}
+
+async fn verified_operational_pool() -> Result<Pool<MySql>, String> {
+    let url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL is required for operational commands".to_string())?;
+    let pool = db::init_pool(&url)
+        .await
+        .map_err(|error| format!("configured MySQL connection failed: {error}"))?;
+    schema::verify_existing_schema(&pool)
+        .await
+        .map_err(|error| format!("MySQL schema verification failed: {error}"))?;
+    Ok(pool)
+}
+
+async fn run_operational_command(command: Command) -> Result<(), String> {
+    let pool = verified_operational_pool().await?;
+    let (value, json_requested) = match command {
+        Command::DbMaintenanceStatus { retention, json } => (
+            serde_json::to_value(
+                maintenance::maintenance_status(&pool, retention.policy())
+                    .await
+                    .map_err(|error| format!("maintenance status failed: {error}"))?,
+            )
+            .map_err(|error| error.to_string())?,
+            json,
+        ),
+        Command::TelemetryPrune {
+            retention,
+            batch,
+            max_batches,
+            dry_run: _,
+            apply,
+            json,
+        } => (
+            serde_json::to_value(
+                maintenance::prune_telemetry(&pool, retention.policy(), batch, max_batches, apply)
+                    .await
+                    .map_err(|error| format!("telemetry prune failed: {error}"))?,
+            )
+            .map_err(|error| error.to_string())?,
+            json,
+        ),
+        Command::E050Readiness { json } => (
+            serde_json::to_value(
+                maintenance::e050_readiness(
+                    &pool,
+                    std::env::var("IICP_E050_STRICT_SECURED").is_ok_and(|value| {
+                        matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    }),
+                )
+                .await
+                .map_err(|error| format!("E050 readiness failed: {error}"))?,
+            )
+            .map_err(|error| error.to_string())?,
+            json,
+        ),
+    };
+    if !json_requested {
+        eprintln!("content-free operational report (use --json for machine-readable mode)");
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+    );
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+    if let Some(command) = cli.command {
+        if let Err(error) = run_operational_command(command).await {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     START_TIME.set(Instant::now()).ok();
     let addr = "0.0.0.0:8090";
     let env = match std::env::var("APP_ENV").as_deref() {
@@ -5190,14 +5395,17 @@ async fn main() {
         Ok("staging") => Env::Staging,
         _ => Env::Production,
     };
-    let repo = initialize_repository().await;
+    let runtime = initialize_repository().await;
+    let repo = runtime.repo;
 
     // Spawn background maintenance tasks before starting the HTTP server.
     tokio::spawn(background::run_expire_nodes_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_reputation_decay_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_node_lifecycle_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_prune_heartbeat_loop(Arc::clone(&repo)));
-    tokio::spawn(background::run_prune_dispatch_usage_loop(Arc::clone(&repo)));
+    if let Some(pool) = runtime.mysql_pool {
+        tokio::spawn(background::run_prune_telemetry_loop(pool));
+    }
     tokio::spawn(background::run_rotate_reputation_window_loop(Arc::clone(
         &repo,
     )));
@@ -5253,6 +5461,31 @@ mod tests {
     use http_body_util::BodyExt;
     use repo::NodeRecord;
     use tower::ServiceExt;
+
+    #[test]
+    fn telemetry_prune_cli_is_read_only_without_apply() {
+        let cli = Cli::try_parse_from(["iicp-directory-rs", "telemetry-prune", "--json"])
+            .expect("parse telemetry prune");
+        assert!(matches!(
+            cli.command,
+            Some(Command::TelemetryPrune {
+                apply: false,
+                dry_run: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn telemetry_prune_cli_rejects_conflicting_modes() {
+        assert!(Cli::try_parse_from([
+            "iicp-directory-rs",
+            "telemetry-prune",
+            "--dry-run",
+            "--apply"
+        ])
+        .is_err());
+    }
 
     fn test_state() -> AppState {
         let chat = "urn:iicp:intent:llm:chat:v1";

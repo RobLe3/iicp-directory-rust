@@ -33,6 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # new transitive surface.
 ct-codecs = "1"
 serde_jcs = "0.2.0"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

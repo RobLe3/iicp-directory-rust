@@ -95,6 +95,14 @@ The public discover/detail wire shape is intentionally not a raw Rust `Node` ser
 - ✅ Signed policy-manifest validation; operator rotation/revocation invalidates stale manifests and records policy-key lifecycle state.
 - ✅ Public-vs-dispatch discovery and bounded anonymous daily dispatch-usage counters.
 - ✅ Shared `dsr-related-records-v1.json` coverage and a disposable dual-MySQL gate prove PHP/Rust export shape, redaction, signed lifecycle, replay/conflict handling, transactional rollback, retained ledger/event evidence and telemetry deletion parity.
+- ✅ Metadata-only DB maintenance status, aggregate strict-E050 readiness and
+  bounded telemetry pruning now have Rust CLI equivalents. Rust pruning is
+  safer by default: it is read-only unless `--apply` is explicit.
+- ✅ The versioned `directory-runtime-parity-v1` REACH profile compares 37
+  environment-neutral probes against isolated PHP and Rust databases. The
+  production `run_all` probe sequence remains unchanged. An empty event log
+  produces the same expected `DIR-FED-07` failure in both candidates; this is
+  fixture state, not evidence of a production pass.
 
 These are control-plane safety features, not cosmetic route aliases. Rust must not claim full directory parity until each has equivalent storage, authorization, redaction and contract tests.
 
@@ -121,7 +129,11 @@ suites.
   proves fresh bootstrap, Laravel adoption, restart/history preservation,
   incomplete-schema rejection and atomic registration rollback.
 - **Compliance attestation:** Rust emits a compact signed attestation when configured. Production PHP includes latest REACH conformance probe evidence and cache behavior; Rust needs a real probe-data path before this is production-equivalent.
-- **Operational commands:** Rust has background tasks for core lifecycle behavior, but PHP Artisan remains the richer operator toolbox for genesis key provisioning, probe token issuance, warm caches, founder lock-in scans and deployment-specific operations.
+- **Operational commands:** Rust now provides maintenance status, bounded
+  telemetry pruning and E050 readiness, and its scheduler uses the PHP
+  retention horizons. PHP Artisan remains the richer operator toolbox for
+  genesis key provisioning, probe-token issuance, warm caches, founder lock-in
+  scans and deployment-specific operations.
 - **Middleware/deployment behavior:** Replica write redirect exists in Rust. Exact PHP shared-hosting middleware, CDN cache tuning and deploy-script behavior still need live verification before cutover.
 - **Live proof:** API shape and unit tests are necessary but not sufficient. Replacement requires REACH probes, live discover/stats comparison and deployment rollback practice.
 
@@ -133,6 +145,7 @@ cargo fmt --check && cargo test --locked
 cd ..
 bash scripts/docker_rust_schema_reliability_gate.sh
 bash scripts/docker_directory_dsr_parity_gate.sh
+bash scripts/docker_directory_runtime_parity_gate.sh
 ```
 
 New parity tests added in this refresh:
@@ -142,6 +155,11 @@ New parity tests added in this refresh:
 - `/api/v1/directory-key` exposes the Ed25519 public key from a libsodium secret key.
 - Registration refuses prohibited capability families before persistence; discovery refuses high-risk public-mesh intents before repository lookup.
 - `/api/v1/consumer-token` and `/api/v1/relay/ticket` issue signed short-lived tokens.
+- Auth-first JSON handling keeps malformed unauthenticated credit, telemetry
+  and peer requests at the same 401 boundary as PHP; extractor errors are
+  normalized to content-free JSON.
+- The runtime-parity fixture and gate prevent production REACH behavior from
+  being inferred from a hand-picked local transcript.
 
 ## Cutover rule
 

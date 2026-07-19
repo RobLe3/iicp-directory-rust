@@ -2,13 +2,15 @@
 //! Background task loops — spawned at startup alongside the HTTP server.
 //!
 //! Each loop runs in its own tokio task and is driven by a `tokio::time::interval`.
-//! They all take `Arc<dyn NodeRepository>` so they work with any repo backend (the
-//! MySQL-backed impl does real DB work; InMemoryRepo impls are no-ops).
+//! Repository lifecycle loops take `Arc<dyn NodeRepository>`. The bounded
+//! telemetry-retention loop takes a MySQL pool and is spawned only for the
+//! persistent backend; in-memory mode has no retained telemetry to prune.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::repo::NodeRepository;
+use sqlx::{MySql, Pool};
 
 /// ProbeNodes: actively probe each registered node's endpoint (#373 Phase B).
 ///
@@ -122,32 +124,50 @@ fn is_private_host(host: &str) -> bool {
     PRIVATE_PREFIXES.iter().any(|p| h.starts_with(p))
 }
 
-/// PruneHeartbeatEvents: delete HEARTBEAT events older than 7 days (db-D4prime retention).
+/// PruneHeartbeatEvents: delete HEARTBEAT events older than the configured
+/// one-day default (PHP target-operation parity).
 ///
-/// Fires weekly (604800s). Without this, node_events grows unboundedly on active meshes.
+/// Fires daily. Without this, node_events grows unboundedly on active meshes.
 pub async fn run_prune_heartbeat_loop(repo: Arc<dyn NodeRepository>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(604_800));
+    let policy = crate::maintenance::RetentionPolicy::from_env();
+    let mut interval = tokio::time::interval(Duration::from_secs(86_400));
     interval.tick().await;
     loop {
         interval.tick().await;
-        let pruned = repo.prune_heartbeat_events(7).await;
+        let pruned = repo
+            .prune_heartbeat_events(policy.heartbeat_event_days)
+            .await;
         if pruned > 0 {
             eprintln!("[prune_heartbeat] deleted {pruned} stale HEARTBEAT event(s)");
         }
     }
 }
 
-/// DispatchUsage retention: anonymous daily counters are useful only for the
-/// migration window and are bounded to 30 days. Run daily; never retain caller
-/// or route-level data.
-pub async fn run_prune_dispatch_usage_loop(repo: Arc<dyn NodeRepository>) {
+/// Apply the same bounded telemetry-retention policy as the PHP scheduler.
+/// The first tick is skipped, and each table deletes at most 5,000 rows per
+/// daily pass. Failures are logged and retried on the next scheduled pass.
+pub async fn run_prune_telemetry_loop(pool: Pool<MySql>) {
+    let policy = crate::maintenance::RetentionPolicy::from_env();
     let mut interval = tokio::time::interval(Duration::from_secs(86_400));
     interval.tick().await;
     loop {
         interval.tick().await;
-        let pruned = repo.prune_dispatch_usage(30).await;
-        if pruned > 0 {
-            eprintln!("[prune_dispatch_usage] deleted {pruned} expired aggregate row(s)");
+        match crate::maintenance::prune_telemetry(
+            &pool,
+            policy,
+            crate::maintenance::DEFAULT_BATCH_SIZE,
+            crate::maintenance::DEFAULT_MAX_BATCHES,
+            true,
+        )
+        .await
+        {
+            Ok(report) => {
+                let deleted: u64 = report.tables.iter().map(|table| table.deleted).sum();
+                if deleted > 0 {
+                    eprintln!("[prune_telemetry] deleted {deleted} expired telemetry row(s)");
+                }
+            }
+            Err(error) => eprintln!("[prune_telemetry] pass failed: {error}"),
         }
     }
 }
