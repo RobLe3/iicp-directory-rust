@@ -142,6 +142,11 @@ pub struct Node {
     pub public_listing: bool,
     #[serde(default, skip_serializing)]
     pub operator_url: Option<String>,
+    /// Public node policy declaration. The directory validates any detached
+    /// signature before persistence; callers receive the declaration plus a
+    /// separately computed verification summary, never private policy material.
+    #[serde(default, skip_serializing)]
+    pub policy_manifest: Option<serde_json::Value>,
     #[serde(default)]
     pub operator_verified: bool,
     #[serde(default)]

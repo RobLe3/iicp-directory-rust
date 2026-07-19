@@ -2,7 +2,7 @@
 
 Rust reference implementation of the IICP directory control plane.
 
-**Status:** Rust is a reconciled parity baseline, not a cutover-ready replacement for the Laravel production seed. It implements broad public-route compatibility and key control-plane safeguards, while operational proof and remaining parity work still require verification. See [`PARITY.md`](PARITY.md) and the versioned parity fixtures before making any cutover claim.
+**Status as of 2026-07-19:** Rust is a reconciled parity baseline, not a cutover-ready replacement for the Laravel production seed. It implements broad public-route compatibility plus public-vs-route discovery, anonymous dispatch counters, signed operator acceptance/DSR, signed policy manifests and fail-closed policy-key lifecycle handling. Related-record DSR export fixtures and live operational equivalence remain open gates. See [`PARITY.md`](PARITY.md) and the versioned parity fixtures before making any cutover claim.
 
 The PHP/Laravel directory remains the production seed. Rust is the typed replacement candidate and must continue to pass the same REACH/live conformance probes before it can own production traffic.
 

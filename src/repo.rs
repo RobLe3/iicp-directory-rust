@@ -9,6 +9,36 @@ use crate::types::Node;
 use async_trait::async_trait;
 use std::cmp::Reverse;
 
+pub(crate) const DSR_RETENTION_REASON: &str = "Minimal ledger/security/accounting records retained; public/operator-identifying fields removed or restricted where possible.";
+
+pub(crate) fn dispatch_usage_summary_value(
+    days: u32,
+    ticketed: u64,
+    legacy: u64,
+    public: u64,
+) -> serde_json::Value {
+    let dispatch_total = ticketed.saturating_add(legacy);
+    serde_json::json!({
+        "basis": "anonymous_daily_request_counts",
+        "window_days": days,
+        "ticketed_requests": ticketed,
+        "legacy_route_discovery_requests": legacy,
+        "public_view_requests": public,
+        "ticketed_share": (dispatch_total > 0).then(|| (ticketed as f64 / dispatch_total as f64 * 10_000.0).round() / 10_000.0),
+        "retention_days": 30,
+        "contains_caller_identifiers": false,
+        "measurement_valid_since": serde_json::Value::Null,
+        "measurement_days_observed": 0,
+        "measurement_window_complete": false,
+        "minimum_sample_requests": 100,
+        "sample_eligible": dispatch_total >= 100,
+        "cutover_share_threshold": 0.90,
+        "cutover_sustained_days": 14,
+        "cutover_eligible": false,
+        "measurement_limits": "Anonymous request-path counts can include manual or automated callers; use only after read-only tooling has moved to public view."
+    })
+}
+
 /// A node plus the intent URNs it serves (the `capabilities[].intent` set).
 #[derive(Debug, Clone)]
 pub struct NodeRecord {
@@ -56,6 +86,17 @@ pub enum OperatorLifecycleError {
     Inactive,
     SuccessorExists,
     Invalid,
+    Storage,
+}
+
+/// Accountless operator governance/DSR failures.  The HTTP layer deliberately
+/// maps these to stable, non-diagnostic responses so storage details and raw
+/// operator identifiers never escape the control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorSelfServiceError {
+    Unknown,
+    Inactive,
+    DuplicateTrackingId,
     Storage,
 }
 
@@ -370,6 +411,40 @@ pub trait NodeRepository: Send + Sync {
         operator_pubkey: &str,
         reason_class: &str,
     ) -> Result<OperatorLifecycleResult, OperatorLifecycleError>;
+
+    /// Persist current-version governance acceptance authenticated by the
+    /// accountless operator challenge.  This is evidence of acceptance, not a
+    /// legal certification or user-account system.
+    async fn accept_operator_governance(
+        &self,
+        operator_pubkey: &str,
+        terms_version: &str,
+        dpa_version: &str,
+        nonce_sha256: &str,
+    ) -> Result<String, OperatorSelfServiceError>;
+
+    /// DataSubjectRights: execute a redacted operator-scoped data-subject action. Implementations
+    /// must preserve ledger/security evidence while removing or restricting
+    /// public/operator-identifying fields where possible.
+    async fn operator_dsr(
+        &self,
+        operator_pubkey: &str,
+        action: &str,
+        tracking_id: &str,
+    ) -> Result<serde_json::Value, OperatorSelfServiceError>;
+
+    /// DispatchUsage: record one anonymous request-path count. Implementations
+    /// must not retain caller, route, endpoint, ticket or payload identifiers.
+    async fn record_dispatch_usage(&self, mode: &str);
+
+    async fn dispatch_usage_summary(&self, days: u32) -> serde_json::Value;
+
+    async fn prune_dispatch_usage(&self, retain_days: u32) -> u32;
+
+    /// Directory-owned PolicyKeyLifecycle status by SHA-256(raw Ed25519 key).
+    /// Missing records mean no authoritative override; non-active records fail
+    /// policy-manifest registration closed.
+    async fn policy_key_lifecycle_status(&self, policy_key_sha256: &str) -> Option<String>;
 
     /// #310 — assign founder recognition state (ordinal/tier/badge) to a known operator. Called
     /// by the founder lock-in detector (§5.4); no-op if the operator does not exist. (Forward
@@ -696,6 +771,7 @@ pub struct InMemoryRepo {
     events: std::sync::Mutex<Vec<EventRow>>,
     /// #463/#310: operator-identity records keyed by operator_pubkey → [`OperatorRow`].
     operators: std::sync::Mutex<std::collections::HashMap<String, OperatorRow>>,
+    dispatch_usage: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
 }
 
 /// In-memory operator-identity record (#463/#310). `ordinal`/`tier`/`badge` are the founder
@@ -714,6 +790,12 @@ struct OperatorRow {
     badge: Option<String>,
     identity_status: String,
     rotation_epoch: Option<u32>,
+    terms_version: Option<String>,
+    terms_accepted_at: Option<String>,
+    dpa_version: Option<String>,
+    dpa_accepted_at: Option<String>,
+    acceptance_method: Option<String>,
+    acceptance_nonce_sha256: Option<String>,
 }
 
 impl InMemoryRepo {
@@ -726,8 +808,153 @@ impl InMemoryRepo {
             replicas: std::sync::Mutex::new(Vec::new()),
             events: std::sync::Mutex::new(Vec::new()),
             operators: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dispatch_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
+}
+
+struct InMemoryDsrSubject {
+    row: OperatorRow,
+    node_ids: Vec<String>,
+    fingerprint: String,
+    pubkey_sha256: String,
+    selector: serde_json::Value,
+    subject_hash: String,
+}
+
+fn in_memory_dsr_subject(
+    repo: &InMemoryRepo,
+    operator_pubkey: &str,
+) -> Result<InMemoryDsrSubject, OperatorSelfServiceError> {
+    use sha2::{Digest, Sha256};
+    let row = repo
+        .operators
+        .lock()
+        .unwrap()
+        .get(operator_pubkey)
+        .cloned()
+        .ok_or(OperatorSelfServiceError::Unknown)?;
+    if row.identity_status != "active" {
+        return Err(OperatorSelfServiceError::Inactive);
+    }
+    let fingerprint = crate::public_operator_fingerprint(operator_pubkey);
+    let pubkey_sha256 = hex::encode(Sha256::digest(operator_pubkey.as_bytes()));
+    let selector = serde_json::json!({
+        "operator_pubkey": {"sha256": pubkey_sha256, "fingerprint": fingerprint}
+    });
+    let subject_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&selector).unwrap_or_default(),
+    ));
+    let node_ids = repo
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|record| record.node.operator_pubkey.as_deref() == Some(operator_pubkey))
+        .map(|record| record.node.node_id.clone())
+        .collect();
+    Ok(InMemoryDsrSubject {
+        row,
+        node_ids,
+        fingerprint,
+        pubkey_sha256,
+        selector,
+        subject_hash,
+    })
+}
+
+fn in_memory_dsr_export(subject: &InMemoryDsrSubject, tracking_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "iicp.dsr.export.v1",
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "tracking_id": tracking_id,
+        "selector": subject.selector,
+        "subject_hash": subject.subject_hash,
+        "retention_notice": DSR_RETENTION_REASON,
+        "records": {
+            "operators": [{"operator_fingerprint": subject.fingerprint, "operator_pubkey_sha256": subject.pubkey_sha256, "display_name": subject.row.display_name, "terms_version": subject.row.terms_version, "dpa_version": subject.row.dpa_version, "acceptance_method": subject.row.acceptance_method}],
+            "nodes": subject.node_ids.iter().map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>(),
+            "capabilities": [], "credits": [], "credit_transactions": [], "reputations": [],
+            "node_address_history": [], "telemetry_probes": [], "proxy_telemetry": [],
+            "node_events": [], "data_subject_actions": []
+        }
+    })
+}
+
+fn apply_in_memory_dsr(
+    repo: &InMemoryRepo,
+    operator_pubkey: &str,
+    action: &str,
+    tracking_id: &str,
+    subject: &InMemoryDsrSubject,
+) -> Result<serde_json::Value, OperatorSelfServiceError> {
+    clear_in_memory_operator_subject(repo, operator_pubkey)?;
+    clear_in_memory_node_subjects(repo, operator_pubkey, action);
+    if action == "anonymize" {
+        anonymize_in_memory_operator(repo, operator_pubkey, tracking_id);
+    }
+    Ok(serde_json::json!({
+        "action": action, "dry_run": false, "tracking_id": tracking_id,
+        "selector": subject.selector, "subject_hash": subject.subject_hash,
+        "affected_counts": {"nodes": subject.node_ids.len(), "operators": 1, "credits": 0, "credit_transactions": 0, "node_events_retained": 0, "node_address_history": 0, "telemetry_probes": 0, "proxy_telemetry": 0},
+        "retention_reason": DSR_RETENTION_REASON
+    }))
+}
+
+fn clear_in_memory_operator_subject(
+    repo: &InMemoryRepo,
+    operator_pubkey: &str,
+) -> Result<(), OperatorSelfServiceError> {
+    let mut operators = repo.operators.lock().unwrap();
+    let row = operators
+        .get_mut(operator_pubkey)
+        .ok_or(OperatorSelfServiceError::Unknown)?;
+    row.display_name = None;
+    row.attested_created_at = None;
+    row.integrity_hash = None;
+    row.tier = None;
+    row.badge = None;
+    row.terms_version = None;
+    row.terms_accepted_at = None;
+    row.dpa_version = None;
+    row.dpa_accepted_at = None;
+    row.acceptance_method = None;
+    row.acceptance_nonce_sha256 = None;
+    Ok(())
+}
+
+fn clear_in_memory_node_subjects(repo: &InMemoryRepo, operator_pubkey: &str, action: &str) {
+    for record in repo
+        .records
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|record| record.node.operator_pubkey.as_deref() == Some(operator_pubkey))
+    {
+        record.node.available = false;
+        record.node.public_listing = false;
+        record.node.operator_url = None;
+        if action == "anonymize" {
+            record.node.operator_pubkey = None;
+            record.node.operator_verified = false;
+            record.node.operator_trust_tier = None;
+        }
+    }
+}
+
+fn anonymize_in_memory_operator(repo: &InMemoryRepo, operator_pubkey: &str, tracking_id: &str) {
+    use sha2::{Digest, Sha256};
+    let Some(mut row) = repo.operators.lock().unwrap().remove(operator_pubkey) else {
+        return;
+    };
+    let anonymized = format!(
+        "dsr_{}",
+        &hex::encode(Sha256::digest(
+            format!("operator:{tracking_id}:{operator_pubkey}").as_bytes()
+        ))[..60]
+    );
+    row.identity_status = "restricted".to_string();
+    repo.operators.lock().unwrap().insert(anonymized, row);
 }
 
 const MIN_SCORE: f64 = 0.1; // iicp-semantics §3.3
@@ -1516,6 +1743,9 @@ impl NodeRepository for InMemoryRepo {
             if rec.node.operator_pubkey.as_deref() == Some(old_operator_pubkey) {
                 rec.node.operator_pubkey = Some(new_operator_pubkey.to_string());
                 rec.node.operator_verified = true;
+                // PolicyKeyLifecycle: the operator successor must re-issue its
+                // independently signed policy; never silently rewrite it.
+                rec.node.policy_manifest = None;
                 linked_nodes = linked_nodes.saturating_add(1);
             }
         }
@@ -1547,6 +1777,7 @@ impl NodeRepository for InMemoryRepo {
             if rec.node.operator_pubkey.as_deref() == Some(operator_pubkey) {
                 rec.node.operator_verified = false;
                 rec.node.operator_trust_tier = None;
+                rec.node.policy_manifest = None;
                 linked_nodes = linked_nodes.saturating_add(1);
             }
         }
@@ -1555,6 +1786,91 @@ impl NodeRepository for InMemoryRepo {
             rotation_epoch: None,
             revoked_at_unix: Some(now_ms() / 1000),
         })
+    }
+
+    async fn accept_operator_governance(
+        &self,
+        operator_pubkey: &str,
+        terms_version: &str,
+        dpa_version: &str,
+        nonce_sha256: &str,
+    ) -> Result<String, OperatorSelfServiceError> {
+        let accepted_at = chrono::Utc::now().to_rfc3339();
+        let mut operators = self.operators.lock().unwrap();
+        let row = operators
+            .get_mut(operator_pubkey)
+            .ok_or(OperatorSelfServiceError::Unknown)?;
+        if row.identity_status != "active" {
+            return Err(OperatorSelfServiceError::Inactive);
+        }
+        row.terms_version = Some(terms_version.to_string());
+        row.terms_accepted_at = Some(accepted_at.clone());
+        row.dpa_version = Some(dpa_version.to_string());
+        row.dpa_accepted_at = Some(accepted_at.clone());
+        row.acceptance_method = Some("operator_key_challenge".to_string());
+        row.acceptance_nonce_sha256 = Some(nonce_sha256.to_string());
+        Ok(accepted_at)
+    }
+
+    async fn operator_dsr(
+        &self,
+        operator_pubkey: &str,
+        action: &str,
+        tracking_id: &str,
+    ) -> Result<serde_json::Value, OperatorSelfServiceError> {
+        let subject = in_memory_dsr_subject(self, operator_pubkey)?;
+        if action == "export" {
+            return Ok(in_memory_dsr_export(&subject, tracking_id));
+        }
+        apply_in_memory_dsr(self, operator_pubkey, action, tracking_id, &subject)
+    }
+
+    async fn record_dispatch_usage(&self, mode: &str) {
+        if !matches!(
+            mode,
+            "public_view" | "legacy_dispatch" | "ticketed_dispatch"
+        ) {
+            return;
+        }
+        let date = chrono::Utc::now().date_naive().to_string();
+        let mut usage = self.dispatch_usage.lock().unwrap();
+        *usage.entry((date, mode.to_string())).or_default() += 1;
+    }
+
+    async fn dispatch_usage_summary(&self, days: u32) -> serde_json::Value {
+        let days = days.clamp(1, 30);
+        let start = chrono::Utc::now().date_naive()
+            - chrono::Duration::days(i64::from(days.saturating_sub(1)));
+        let usage = self.dispatch_usage.lock().unwrap();
+        let mut ticketed = 0u64;
+        let mut legacy = 0u64;
+        let mut public = 0u64;
+        for ((date, mode), count) in usage.iter() {
+            if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|date| date >= start) {
+                match mode.as_str() {
+                    "ticketed_dispatch" => ticketed += count,
+                    "legacy_dispatch" => legacy += count,
+                    "public_view" => public += count,
+                    _ => {}
+                }
+            }
+        }
+        dispatch_usage_summary_value(days, ticketed, legacy, public)
+    }
+
+    async fn prune_dispatch_usage(&self, retain_days: u32) -> u32 {
+        let cutoff =
+            chrono::Utc::now().date_naive() - chrono::Duration::days(i64::from(retain_days.max(1)));
+        let mut usage = self.dispatch_usage.lock().unwrap();
+        let before = usage.len();
+        usage.retain(|(date, _), _| {
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_or(true, |date| date >= cutoff)
+        });
+        (before - usage.len()) as u32
+    }
+
+    async fn policy_key_lifecycle_status(&self, _policy_key_sha256: &str) -> Option<String> {
+        None
     }
 
     async fn set_operator_recognition(
@@ -1739,6 +2055,7 @@ mod tests {
             operator_trust_tier: None,
             public_listing: false,
             operator_url: None,
+            policy_manifest: None,
             health_models: None,
         }
     }

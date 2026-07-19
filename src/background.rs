@@ -137,6 +137,21 @@ pub async fn run_prune_heartbeat_loop(repo: Arc<dyn NodeRepository>) {
     }
 }
 
+/// DispatchUsage retention: anonymous daily counters are useful only for the
+/// migration window and are bounded to 30 days. Run daily; never retain caller
+/// or route-level data.
+pub async fn run_prune_dispatch_usage_loop(repo: Arc<dyn NodeRepository>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(86_400));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let pruned = repo.prune_dispatch_usage(30).await;
+        if pruned > 0 {
+            eprintln!("[prune_dispatch_usage] deleted {pruned} expired aggregate row(s)");
+        }
+    }
+}
+
 /// NodeLifecycle: archive dormant nodes older than 90 days.
 ///
 /// Fires daily (86400s). Mirrors PHP `NodeLifecycleCommand` — transitions

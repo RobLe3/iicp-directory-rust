@@ -1,15 +1,15 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
-Last refreshed: **2026-07-18**. The local Laravel seed source is `v1.10.75`;
-the route-level parity fixture remains named `contract-v1.10.69.json` and must
-not be mistaken for a current production-version claim.
+Last refreshed: **2026-07-19**. The local Laravel seed source and current
+route-level parity fixture are `v1.10.75`. Historical contracts remain immutable
+evidence and are not current production-version claims.
 
 > **Status:** this Rust implementation is a reconciled parity baseline, not a
-> cutover-ready replacement. It remains behind the seed for operator acceptance/DSR,
-> policy-key lifecycle, and
-> dispatch-usage accounting. Public-mesh intent-policy refusal is now implemented
-> from the shared canonical taxonomy. `directory/parity/contract-v1.10.69.json` is the
-> authoritative gap checklist; do not infer parity from route count alone.
+> cutover-ready replacement. Operator acceptance/DSR routes, signed policy-manifest
+> validation with fail-closed key lifecycle, public-vs-dispatch discovery and bounded
+> anonymous dispatch counters are implemented. Public-mesh intent-policy refusal uses
+> the shared canonical taxonomy. `directory/parity/contract-v1.10.75.json` is the
+> authoritative checklist; do not infer operational parity from route count alone.
 
 The goal is not merely to compile a Rust server. The Rust directory must be wire-compatible with the PHP/Laravel directory for clients, nodes, relays, the website and future replicas. The PHP seed remains production authority until live conformance and operational evidence justify a cutover.
 
@@ -43,6 +43,7 @@ Status legend: ✅ done · 🔶 present but not full production equivalent · �
 | `POST /api/v1/peers` + legacy `/v1/peers` | ✅ |
 | `POST /api/v1/operator/rename` + legacy `/v1/operator/rename` | ✅ |
 | `POST /api/v1/operator/challenge`, `/key/rotate`, `/key/revoke` + legacy `/v1` | ✅ signed dual-key lifecycle; no-store/redacted receipts |
+| `POST /api/v1/operator/acceptance`, `/dsr/{export,restrict,anonymize}` + legacy `/v1` | 🔶 signed/no-store routes; related-record export fixtures remain |
 | `GET /api/v1/leaderboards/{board_id}` + legacy `/v1/leaderboards/{board_id}` | ✅ |
 
 ### Registry, credits, conformance and telemetry
@@ -86,13 +87,14 @@ This closes the biggest practical Rust-vs-live drift: older Rust discovery expos
 
 The public discover/detail wire shape is intentionally not a raw Rust `Node` serialization. Internal fields such as task counters, pricing scalar columns, operator verification internals and `health_models` stay available to Rust scoring/storage, but are hidden from the public response when live PHP exposes the same information only through public summary blocks.
 
-## v1.10.69 required gaps
+## v1.10.75 control-plane parity
 
 - ✅ `POST /api/v1/dispatch/ticket`: prompt-free, signed, intent/node/expiry-scoped route disclosure ticket. V1 is disclosure-only; stateful redemption/node admission is deferred.
 - ✅ Intent-policy refusal for prohibited and high-risk capability/discovery intent families; transparency and general/custom intents remain routable.
-- Operator acceptance plus signed DSR export, restriction and anonymisation.
-- Policy-manifest verification and policy-key lifecycle records.
-- Dispatch usage accounting, telemetry retention and the matching operational commands.
+- ✅ Operator acceptance plus signed, no-store DSR export, restriction and anonymisation routes.
+- ✅ Signed policy-manifest validation; operator rotation/revocation invalidates stale manifests and records policy-key lifecycle state.
+- ✅ Public-vs-dispatch discovery and bounded anonymous daily dispatch-usage counters.
+- 🔶 Rust DSR export currently provides the redacted operator/node core; Laravel remains the richer export authority for related ledger and telemetry rows until shared database fixtures prove full record-shape parity.
 
 These are control-plane safety features, not cosmetic route aliases. Rust must not claim full directory parity until each has equivalent storage, authorization, redaction and contract tests.
 

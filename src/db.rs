@@ -13,8 +13,8 @@ use crate::repo::{
     operator_fingerprint, AuditResult, ConformanceBadge, CreditError, CreditSummary,
     CreditTransaction, DiscoverQuery, EffectiveCreditBalance, EventRow, FounderEntry,
     IntentSummary, NodeRecord, NodeRepository, OperatorLifecycleError, OperatorLifecycleResult,
-    OperatorWalletSummary, PendingFounderEntry, ProbeResult, ProxyObservation, RegistryStats,
-    RepoError, WalletDebitResult,
+    OperatorSelfServiceError, OperatorWalletSummary, PendingFounderEntry, ProbeResult,
+    ProxyObservation, RegistryStats, RepoError, WalletDebitResult,
 };
 use crate::reputation;
 use crate::types::Node;
@@ -143,6 +143,8 @@ struct NodeRow {
     public_listing: bool,
     #[sqlx(default)]
     operator_url: Option<String>,
+    #[sqlx(default)]
+    policy_manifest: Option<String>,
     // #494 — runtime model list from the node's last heartbeat. JSON-encoded array.
     // null = not yet reported (backward compat); []/"[]" = no models live.
     #[sqlx(default)]
@@ -247,6 +249,10 @@ impl From<NodeRow> for Node {
             operator_trust_tier: r.operator_trust_tier,
             public_listing: r.public_listing,
             operator_url: r.operator_url,
+            policy_manifest: r
+                .policy_manifest
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok()),
             // #494 — decode JSON-encoded health_models from DB (null → None, "[]" → Some([])).
             health_models: r
                 .health_models
@@ -313,8 +319,8 @@ async fn upsert_registered_node(
              (id, endpoint, region, available, relay_capable, node_token_hash, node_hmac_key,
               proxy_token_hash, max_concurrent, tokens_per_min, reputation_score, status,
               operator_pubkey, operator_verified, operator_trust_tier, backend,
-              supported_receipt_profiles, public_listing, operator_url)
-           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+              supported_receipt_profiles, public_listing, operator_url, policy_manifest)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE
              endpoint = VALUES(endpoint), region = VALUES(region), available = 1,
              relay_capable = VALUES(relay_capable), status = 'active',
@@ -327,7 +333,8 @@ async fn upsert_registered_node(
              backend = VALUES(backend),
              supported_receipt_profiles = VALUES(supported_receipt_profiles),
              public_listing = VALUES(public_listing),
-             operator_url = VALUES(operator_url)
+             operator_url = VALUES(operator_url),
+             policy_manifest = VALUES(policy_manifest)
              -- reputation_score intentionally NOT updated (ADR-026 anti-laundering)"#,
     )
     .bind(&rec.node.node_id)
@@ -350,6 +357,12 @@ async fn upsert_registered_node(
     )
     .bind(rec.node.public_listing)
     .bind(&rec.node.operator_url)
+    .bind(
+        rec.node
+            .policy_manifest
+            .as_ref()
+            .map(serde_json::Value::to_string),
+    )
     .execute(&mut **transaction)
     .await
     .map_err(|_| RepoError::Persistence)?;
@@ -405,6 +418,264 @@ async fn persist_registration(
         .map_err(|_| RepoError::Persistence)
 }
 
+struct MysqlDsrSubject {
+    display_name: Option<String>,
+    terms_version: Option<String>,
+    dpa_version: Option<String>,
+    acceptance_method: Option<String>,
+    node_ids: Vec<String>,
+    fingerprint: String,
+    pubkey_sha256: String,
+    selector: serde_json::Value,
+    subject_hash: String,
+}
+
+async fn mysql_operator_dsr(
+    pool: &Pool<MySql>,
+    operator_pubkey: &str,
+    action: &str,
+    tracking_id: &str,
+) -> Result<serde_json::Value, OperatorSelfServiceError> {
+    let subject = load_mysql_dsr_subject(pool, operator_pubkey).await?;
+    if action == "export" {
+        return Ok(mysql_dsr_export(&subject, tracking_id));
+    }
+    mutate_mysql_dsr(pool, operator_pubkey, action, tracking_id, &subject).await
+}
+
+async fn load_mysql_dsr_subject(
+    pool: &Pool<MySql>,
+    operator_pubkey: &str,
+) -> Result<MysqlDsrSubject, OperatorSelfServiceError> {
+    use sha2::{Digest, Sha256};
+    let active: Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT display_name, terms_version, dpa_version, acceptance_method FROM operators \
+         WHERE operator_pubkey = ? AND identity_status = 'active' LIMIT 1",
+    )
+    .bind(operator_pubkey)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| OperatorSelfServiceError::Storage)?;
+    let Some((display_name, terms_version, dpa_version, acceptance_method)) = active else {
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
+                .bind(operator_pubkey)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| OperatorSelfServiceError::Storage)?;
+        return Err(if exists.is_some() {
+            OperatorSelfServiceError::Inactive
+        } else {
+            OperatorSelfServiceError::Unknown
+        });
+    };
+    let fingerprint = operator_fingerprint(operator_pubkey);
+    let pubkey_sha256 = hex::encode(Sha256::digest(operator_pubkey.as_bytes()));
+    let selector = serde_json::json!({"operator_pubkey": {"sha256": pubkey_sha256, "fingerprint": fingerprint}});
+    let subject_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&selector).unwrap_or_default(),
+    ));
+    let node_ids = sqlx::query_scalar("SELECT id FROM nodes WHERE operator_pubkey = ? ORDER BY id")
+        .bind(operator_pubkey)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| OperatorSelfServiceError::Storage)?;
+    Ok(MysqlDsrSubject {
+        display_name,
+        terms_version,
+        dpa_version,
+        acceptance_method,
+        node_ids,
+        fingerprint,
+        pubkey_sha256,
+        selector,
+        subject_hash,
+    })
+}
+
+fn mysql_dsr_export(subject: &MysqlDsrSubject, tracking_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "iicp.dsr.export.v1",
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "tracking_id": tracking_id,
+        "selector": subject.selector,
+        "subject_hash": subject.subject_hash,
+        "retention_notice": crate::repo::DSR_RETENTION_REASON,
+        "records": {
+            "operators": [{"operator_fingerprint": subject.fingerprint, "operator_pubkey_sha256": subject.pubkey_sha256, "display_name": subject.display_name, "terms_version": subject.terms_version, "dpa_version": subject.dpa_version, "acceptance_method": subject.acceptance_method}],
+            "nodes": subject.node_ids.iter().map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>(),
+            "capabilities": [], "credits": [], "credit_transactions": [], "reputations": [],
+            "node_address_history": [], "telemetry_probes": [], "proxy_telemetry": [],
+            "node_events": [], "data_subject_actions": []
+        }
+    })
+}
+
+async fn mutate_mysql_dsr(
+    pool: &Pool<MySql>,
+    operator_pubkey: &str,
+    action: &str,
+    tracking_id: &str,
+    subject: &MysqlDsrSubject,
+) -> Result<serde_json::Value, OperatorSelfServiceError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| OperatorSelfServiceError::Storage)?;
+    apply_mysql_dsr_restriction(&mut tx, operator_pubkey, action).await?;
+    if action == "anonymize" {
+        apply_mysql_dsr_anonymization(&mut tx, operator_pubkey, tracking_id, &subject.node_ids)
+            .await?;
+    }
+    let counts = serde_json::json!({
+        "nodes": subject.node_ids.len(), "operators": 1, "credits": 0,
+        "credit_transactions": 0, "node_events_retained": 0,
+        "node_address_history": 0, "telemetry_probes": 0, "proxy_telemetry": 0
+    });
+    insert_mysql_dsr_action(
+        &mut tx,
+        tracking_id,
+        action,
+        &subject.subject_hash,
+        &subject.selector,
+        &counts,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| OperatorSelfServiceError::Storage)?;
+    Ok(serde_json::json!({
+        "action": action, "dry_run": false, "tracking_id": tracking_id,
+        "selector": subject.selector, "subject_hash": subject.subject_hash,
+        "affected_counts": counts, "retention_reason": crate::repo::DSR_RETENTION_REASON
+    }))
+}
+
+async fn apply_mysql_dsr_restriction(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    operator_pubkey: &str,
+    action: &str,
+) -> Result<(), OperatorSelfServiceError> {
+    sqlx::query(
+        "UPDATE nodes SET available = 0, public_reachable = 0, public_listing = 0, \
+         operator_url = NULL, operator_contact = NULL, status = 'archived', dormant_since = NOW(), \
+         transport_endpoint = NULL, endpoint_verified_dead_at = NOW(), updated_at = NOW() \
+         WHERE operator_pubkey = ?",
+    )
+    .bind(operator_pubkey)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| OperatorSelfServiceError::Storage)?;
+    sqlx::query(
+        "UPDATE operators SET display_name = NULL, attested_created_at = NULL, \
+         operator_integrity_hash = NULL, terms_version = NULL, terms_accepted_at = NULL, \
+         dpa_version = NULL, dpa_accepted_at = NULL, acceptance_method = NULL, \
+         acceptance_nonce_sha256 = NULL, tier = NULL, badge = NULL, \
+         provenance = JSON_OBJECT('dsr', ?), updated_at = NOW() WHERE operator_pubkey = ?",
+    )
+    .bind(if action == "anonymize" {
+        "anonymized"
+    } else {
+        "restricted"
+    })
+    .bind(operator_pubkey)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| OperatorSelfServiceError::Storage)?;
+    Ok(())
+}
+
+async fn apply_mysql_dsr_anonymization(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    operator_pubkey: &str,
+    tracking_id: &str,
+    node_ids: &[String],
+) -> Result<(), OperatorSelfServiceError> {
+    sqlx::query(
+        "UPDATE nodes SET endpoint = CONCAT('https://dsr-anonymized.invalid/node-', LEFT(id, 8)), \
+         observed_source_ip = NULL, operator_pubkey = NULL, operator_verified = 0, \
+         operator_trust_tier = NULL, identity_key = SHA2(CONCAT('dsr:', ?, ':', id), 256), \
+         liveness_challenge = NULL, liveness_verified_at = NULL, policy_manifest = NULL, \
+         cx_public_key = NULL, gossip_public_key = NULL, \
+         node_token_hash = SHA2(CONCAT(UUID(), RAND()), 256), \
+         proxy_token_hash = SHA2(CONCAT(UUID(), RAND()), 256), \
+         node_hmac_key = SHA2(CONCAT(UUID(), RAND()), 256), updated_at = NOW() \
+         WHERE operator_pubkey = ?",
+    )
+    .bind(tracking_id)
+    .bind(operator_pubkey)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| OperatorSelfServiceError::Storage)?;
+    delete_mysql_dsr_telemetry(tx, node_ids).await?;
+    sqlx::query(
+        "UPDATE operators SET operator_pubkey = CONCAT('dsr_', LEFT(SHA2(CONCAT('operator:', ?, ':', ?), 256), 60)), identity_status = 'restricted', updated_at = NOW() WHERE operator_pubkey = ?",
+    )
+    .bind(tracking_id)
+    .bind(operator_pubkey)
+    .bind(operator_pubkey)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| OperatorSelfServiceError::Storage)?;
+    Ok(())
+}
+
+async fn delete_mysql_dsr_telemetry(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    node_ids: &[String],
+) -> Result<(), OperatorSelfServiceError> {
+    for node_id in node_ids {
+        for table in [
+            "node_address_history",
+            "iicp_telemetry_probes",
+            "proxy_telemetry",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE node_id = ?"))
+                .bind(node_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|_| OperatorSelfServiceError::Storage)?;
+        }
+    }
+    Ok(())
+}
+
+async fn insert_mysql_dsr_action(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    tracking_id: &str,
+    action: &str,
+    subject_hash: &str,
+    selector: &serde_json::Value,
+    counts: &serde_json::Value,
+) -> Result<(), OperatorSelfServiceError> {
+    let result = sqlx::query(
+        "INSERT INTO data_subject_actions (tracking_id, action, subject_hash, selector, affected_counts, retention_reason, applied_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())",
+    )
+    .bind(tracking_id)
+    .bind(action)
+    .bind(subject_hash)
+    .bind(selector.to_string())
+    .bind(counts.to_string())
+    .bind(crate::repo::DSR_RETENTION_REASON)
+    .execute(&mut **tx)
+    .await;
+    result.map(|_| ()).map_err(|error| {
+        if error
+            .as_database_error()
+            .is_some_and(|database| database.is_unique_violation())
+        {
+            OperatorSelfServiceError::DuplicateTrackingId
+        } else {
+            OperatorSelfServiceError::Storage
+        }
+    })
+}
+
 // ── discover constants (mirrors repo.rs) ─────────────────────────────────────
 const MIN_SCORE: f64 = 0.1;
 const DEFAULT_LIMIT: u32 = 10;
@@ -426,7 +697,7 @@ impl NodeRepository for MySqlRepo {
                       n.load, n.active_jobs, n.max_concurrent, n.tasks_total,
                       n.avg_latency_ms, n.exposure_mode, n.transport_endpoint,
                       n.credit_cost_multiplier, n.pricing_model, n.attested, n.tasks_failed,
-                      n.public_reachable, n.relay_capable, n.backend
+                      n.public_reachable, n.relay_capable, n.backend, CAST(n.policy_manifest AS CHAR) AS policy_manifest
                FROM nodes n
                INNER JOIN capabilities c ON c.node_id = n.id
                WHERE c.intent = ?
@@ -553,7 +824,7 @@ impl NodeRepository for MySqlRepo {
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
                       public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
-                      operator_pubkey, operator_verified, operator_trust_tier
+                      operator_pubkey, operator_verified, operator_trust_tier, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes WHERE id = ?"#,
         )
         .bind(node_id)
@@ -577,7 +848,7 @@ impl NodeRepository for MySqlRepo {
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
                       public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
-                      operator_pubkey, operator_verified, operator_trust_tier
+                      operator_pubkey, operator_verified, operator_trust_tier, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes
                WHERE (id = ? OR id LIKE CONCAT(?, '%')) AND available = 1
                ORDER BY (id = ?) DESC
@@ -617,7 +888,7 @@ impl NodeRepository for MySqlRepo {
                       exposure_mode, transport_endpoint,
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, sdk_language, sdk_version, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
+                      public_reachable, relay_capable, sdk_language, sdk_version, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -642,7 +913,7 @@ impl NodeRepository for MySqlRepo {
                       exposure_mode, transport_endpoint,
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)"#,
@@ -701,7 +972,7 @@ impl NodeRepository for MySqlRepo {
                           exposure_mode, transport_endpoint,
                           CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                           pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, CAST(policy_manifest AS CHAR) AS policy_manifest
                    FROM nodes
                    WHERE available = 1
                      AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -724,7 +995,7 @@ impl NodeRepository for MySqlRepo {
                       exposure_mode, transport_endpoint,
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -803,7 +1074,7 @@ impl NodeRepository for MySqlRepo {
                       exposure_mode, transport_endpoint,
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, public_listing, operator_url
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, public_listing, operator_url, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)
@@ -2159,7 +2430,7 @@ impl NodeRepository for MySqlRepo {
         .bind(new_operator_pubkey).bind(display_name).bind(attested_created_at).bind(integrity_hash)
         .bind(first_seen_ms).bind(ordinal).bind(tier).bind(badge).bind(provenance)
         .execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
-        let linked = sqlx::query("UPDATE nodes SET operator_pubkey = ?, operator_verified = 1, updated_at = NOW() WHERE operator_pubkey = ?")
+        let linked = sqlx::query("UPDATE nodes SET operator_pubkey = ?, operator_verified = 1, policy_manifest = NULL, updated_at = NOW() WHERE operator_pubkey = ?")
             .bind(new_operator_pubkey).bind(old_operator_pubkey).execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?.rows_affected() as u32;
         use ct_codecs::{Base64, Decoder};
         let successor_raw = Base64::decode_to_vec(new_operator_pubkey, None)
@@ -2168,6 +2439,18 @@ impl NodeRepository for MySqlRepo {
             return Err(OperatorLifecycleError::Invalid);
         }
         let successor_hash = hex::encode(sha2::Sha256::digest(successor_raw));
+        let predecessor_raw = Base64::decode_to_vec(old_operator_pubkey, None)
+            .map_err(|_| OperatorLifecycleError::Invalid)?;
+        if predecessor_raw.len() != 32 {
+            return Err(OperatorLifecycleError::Invalid);
+        }
+        let predecessor_hash = hex::encode(sha2::Sha256::digest(predecessor_raw));
+        sqlx::query(
+            "INSERT INTO policy_key_lifecycle_records (policy_key_sha256, status, rotation_epoch, revocation_reason_class, superseded_by_policy_key_sha256, created_at, updated_at) \
+             VALUES (?, 'superseded', ?, ?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE status = 'superseded', rotation_epoch = VALUES(rotation_epoch), revocation_reason_class = VALUES(revocation_reason_class), superseded_by_policy_key_sha256 = VALUES(superseded_by_policy_key_sha256), updated_at = NOW()",
+        )
+        .bind(predecessor_hash).bind(epoch).bind(reason_class).bind(&successor_hash)
+        .execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
         sqlx::query(
             "UPDATE operators SET identity_status = 'rotated', successor_operator_pubkey_sha256 = ?, rotation_epoch = ?, identity_reason_class = ?, updated_at = NOW() WHERE operator_pubkey = ?",
         )
@@ -2208,8 +2491,20 @@ impl NodeRepository for MySqlRepo {
                 OperatorLifecycleError::Unknown
             });
         }
-        let linked = sqlx::query("UPDATE nodes SET operator_verified = 0, operator_trust_tier = NULL, updated_at = NOW() WHERE operator_pubkey = ?")
+        let linked = sqlx::query("UPDATE nodes SET operator_verified = 0, operator_trust_tier = NULL, policy_manifest = NULL, updated_at = NOW() WHERE operator_pubkey = ?")
             .bind(operator_pubkey).execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?.rows_affected() as u32;
+        use ct_codecs::{Base64, Decoder};
+        let policy_raw = Base64::decode_to_vec(operator_pubkey, None)
+            .map_err(|_| OperatorLifecycleError::Invalid)?;
+        if policy_raw.len() != 32 {
+            return Err(OperatorLifecycleError::Invalid);
+        }
+        let policy_hash = hex::encode(sha2::Sha256::digest(policy_raw));
+        sqlx::query(
+            "INSERT INTO policy_key_lifecycle_records (policy_key_sha256, status, revoked_at, revocation_reason_class, created_at, updated_at) \
+             VALUES (?, 'revoked', NOW(), ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE status = 'revoked', revoked_at = NOW(), revocation_reason_class = VALUES(revocation_reason_class), updated_at = NOW()",
+        )
+        .bind(policy_hash).bind(reason_class).execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
         sqlx::query("UPDATE operators SET identity_status = 'revoked', identity_revoked_at = NOW(), identity_reason_class = ?, updated_at = NOW() WHERE operator_pubkey = ?")
             .bind(reason_class).bind(operator_pubkey).execute(&mut *tx).await.map_err(|_| OperatorLifecycleError::Storage)?;
         tx.commit()
@@ -2220,6 +2515,115 @@ impl NodeRepository for MySqlRepo {
             rotation_epoch: None,
             revoked_at_unix: Some(chrono::Utc::now().timestamp()),
         })
+    }
+
+    async fn accept_operator_governance(
+        &self,
+        operator_pubkey: &str,
+        terms_version: &str,
+        dpa_version: &str,
+        nonce_sha256: &str,
+    ) -> Result<String, OperatorSelfServiceError> {
+        let result = sqlx::query(
+            "UPDATE operators SET terms_version = ?, terms_accepted_at = NOW(), \
+             dpa_version = ?, dpa_accepted_at = NOW(), acceptance_method = \
+             'operator_key_challenge', acceptance_nonce_sha256 = ?, updated_at = NOW() \
+             WHERE operator_pubkey = ? AND identity_status = 'active'",
+        )
+        .bind(terms_version)
+        .bind(dpa_version)
+        .bind(nonce_sha256)
+        .bind(operator_pubkey)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| OperatorSelfServiceError::Storage)?;
+        if result.rows_affected() == 0 {
+            return match self.operator_identity_active(operator_pubkey).await {
+                None => Err(OperatorSelfServiceError::Unknown),
+                Some(false) => Err(OperatorSelfServiceError::Inactive),
+                Some(true) => Err(OperatorSelfServiceError::Storage),
+            };
+        }
+        let accepted_at: Option<String> = sqlx::query_scalar(
+            "SELECT CAST(terms_accepted_at AS CHAR) FROM operators WHERE operator_pubkey = ?",
+        )
+        .bind(operator_pubkey)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| OperatorSelfServiceError::Storage)?;
+        accepted_at.ok_or(OperatorSelfServiceError::Storage)
+    }
+
+    async fn operator_dsr(
+        &self,
+        operator_pubkey: &str,
+        action: &str,
+        tracking_id: &str,
+    ) -> Result<serde_json::Value, OperatorSelfServiceError> {
+        mysql_operator_dsr(&self.pool, operator_pubkey, action, tracking_id).await
+    }
+
+    async fn record_dispatch_usage(&self, mode: &str) {
+        if !matches!(
+            mode,
+            "public_view" | "legacy_dispatch" | "ticketed_dispatch"
+        ) {
+            return;
+        }
+        let _ = sqlx::query(
+            "INSERT INTO dispatch_usage_daily (usage_date, mode, request_count, created_at, updated_at) \
+             VALUES (UTC_DATE(), ?, 1, NOW(), NOW()) ON DUPLICATE KEY UPDATE \
+             request_count = request_count + 1, updated_at = NOW()",
+        )
+        .bind(mode)
+        .execute(&self.pool)
+        .await;
+    }
+
+    async fn dispatch_usage_summary(&self, days: u32) -> serde_json::Value {
+        let days = days.clamp(1, 30);
+        let rows: Vec<(String, u64)> = sqlx::query_as(
+            "SELECT mode, CAST(SUM(request_count) AS UNSIGNED) FROM dispatch_usage_daily \
+             WHERE usage_date >= UTC_DATE() - INTERVAL ? DAY GROUP BY mode",
+        )
+        .bind(days.saturating_sub(1))
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        let count = |mode: &str| {
+            rows.iter()
+                .find(|(candidate, _)| candidate == mode)
+                .map(|(_, value)| *value)
+                .unwrap_or(0)
+        };
+        crate::repo::dispatch_usage_summary_value(
+            days,
+            count("ticketed_dispatch"),
+            count("legacy_dispatch"),
+            count("public_view"),
+        )
+    }
+
+    async fn prune_dispatch_usage(&self, retain_days: u32) -> u32 {
+        sqlx::query(
+            "DELETE FROM dispatch_usage_daily WHERE usage_date < UTC_DATE() - INTERVAL ? DAY",
+        )
+        .bind(retain_days.max(1))
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() as u32)
+        .unwrap_or(0)
+    }
+
+    async fn policy_key_lifecycle_status(&self, policy_key_sha256: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT status FROM policy_key_lifecycle_records WHERE policy_key_sha256 = ? LIMIT 1",
+        )
+        .bind(policy_key_sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn set_operator_recognition(
@@ -2335,7 +2739,7 @@ impl NodeRepository for MySqlRepo {
                       exposure_mode, transport_endpoint,
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles
+                      public_reachable, relay_capable, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes"#,
         )
         .fetch_all(&self.pool)

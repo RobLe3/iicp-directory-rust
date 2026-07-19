@@ -16,6 +16,7 @@ mod health;
 #[cfg(test)]
 mod jcs;
 mod policy;
+mod policy_manifest;
 mod recognition;
 mod replica;
 mod repo;
@@ -39,7 +40,7 @@ use axum::{
 };
 use repo::{
     AuditResult, ConformanceBadge, CreditError, DiscoverQuery, InMemoryRepo, IntentSummary,
-    NodeRepository, ProbeResult, ProxyObservation, RegistryStats,
+    NodeRepository, OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
 };
 use serde::Deserialize;
 use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
@@ -202,6 +203,17 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/operator/rename", post(operator_rename))
         .route("/v1/operator/challenge", post(operator_challenge))
         .route("/api/v1/operator/challenge", post(operator_challenge))
+        .route("/v1/operator/acceptance", post(operator_acceptance))
+        .route("/api/v1/operator/acceptance", post(operator_acceptance))
+        .route("/v1/operator/dsr/export", post(operator_dsr_export))
+        .route("/api/v1/operator/dsr/export", post(operator_dsr_export))
+        .route("/v1/operator/dsr/restrict", post(operator_dsr_restrict))
+        .route("/api/v1/operator/dsr/restrict", post(operator_dsr_restrict))
+        .route("/v1/operator/dsr/anonymize", post(operator_dsr_anonymize))
+        .route(
+            "/api/v1/operator/dsr/anonymize",
+            post(operator_dsr_anonymize),
+        )
         .route("/v1/operator/key/rotate", post(operator_key_rotate))
         .route("/api/v1/operator/key/rotate", post(operator_key_rotate))
         .route("/v1/operator/key/revoke", post(operator_key_revoke))
@@ -328,6 +340,9 @@ struct DiscoverParams {
     profile_fixture_sha256: Option<String>,
     #[serde(default)]
     profile_required: Option<bool>,
+    /// Public presentation strips endpoints, full node IDs and key material.
+    #[serde(default)]
+    view: Option<String>,
 }
 
 fn profile_negotiation(p: &DiscoverParams) -> Option<serde_json::Value> {
@@ -366,6 +381,7 @@ async fn discover(
     Query(p): Query<DiscoverParams>,
 ) -> axum::response::Response {
     let negotiated_profile = profile_negotiation(&p);
+    let public_view = p.view.as_deref() == Some("public");
     if negotiated_profile
         .as_ref()
         .is_some_and(|n| n.get("dispatch_allowed") == Some(&serde_json::Value::Bool(false)))
@@ -472,14 +488,50 @@ async fn discover(
         n.operator_fingerprint = operator_fingerprint_for(n.operator_pubkey.as_deref());
         enriched.push(n);
     }
-    let nodes = enriched;
+    build_discover_response(&st, public_view, enriched, negotiated_profile, started).await
+}
+
+async fn build_discover_response(
+    state: &AppState,
+    public_view: bool,
+    nodes: Vec<types::Node>,
+    negotiated_profile: Option<serde_json::Value>,
+    started: Instant,
+) -> axum::response::Response {
     let count = nodes.len() as u32;
     let relay_available = nodes.iter().any(|n| n.relay_capable.unwrap_or(false));
+    state
+        .repo
+        .record_dispatch_usage(if public_view {
+            "public_view"
+        } else {
+            "legacy_dispatch"
+        })
+        .await;
+    let response_nodes = nodes
+        .iter()
+        .map(|node| {
+            let value = live_node_value(node);
+            if public_view {
+                public_discover_node(value)
+            } else {
+                value
+            }
+        })
+        .collect::<Vec<_>>();
+    let data_class = if public_view {
+        "public_presentation"
+    } else {
+        "route_dispatch"
+    };
     let mut body = serde_json::json!({
-        "nodes": nodes.iter().map(live_node_value).collect::<Vec<_>>(),
+        "nodes": response_nodes,
         "count": count,
         "relay_available": relay_available,
         "query_ms": started.elapsed().as_millis() as u32,
+        "view": if public_view { "public" } else { "dispatch" },
+        "data_class": data_class,
+        "route_fields_present": !public_view,
     });
     if let Some(negotiation) = negotiated_profile {
         body["profile_negotiation"] = negotiation;
@@ -496,9 +548,74 @@ async fn discover(
             "public, max-age=5, s-maxage=10, stale-while-revalidate=5",
         )
         .header("x-iicp-discover-origin-cache", "bypass")
+        .header("x-iicp-discover-data-class", data_class)
         .header("vary", "Accept-Encoding")
         .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
+}
+
+fn public_discover_node(value: serde_json::Value) -> serde_json::Value {
+    let Some(source) = value.as_object() else {
+        return serde_json::json!({});
+    };
+    let allowed = [
+        "region",
+        "score",
+        "available",
+        "relay_capable",
+        "transport_method",
+        "nat_type",
+        "address_family",
+        "transport",
+        "reachability_tier",
+        "directory_observed_reachable",
+        "route_evidence",
+        "routing_hint",
+        "browser_usable",
+        "exposure_mode",
+        "key_ready",
+        "response_encryption_ready",
+        "privacy_routing_status",
+        "sdk_language",
+        "sdk_version",
+        "consumer_cosignature_ready",
+        "sdk_status",
+        "sdk_baseline_version",
+        "upgrade_required",
+        "health_label",
+        "health_confidence",
+        "performance",
+        "backend_stability",
+        "reputation_score",
+        "reputation_tier",
+        "trust_progress",
+        "probation",
+        "models",
+        "capability_summary",
+        "input_modalities",
+        "quantization",
+        "inference_engine",
+        "backend",
+        "cip_policy",
+        "cip_conformance_level",
+        "pricing",
+        "operator_display_name",
+        "operator_fingerprint",
+        "node_policy_manifest",
+    ];
+    let mut public = serde_json::Map::new();
+    if let Some(node_id) = source.get("node_id").and_then(serde_json::Value::as_str) {
+        public.insert(
+            "node_id_prefix".to_string(),
+            serde_json::Value::String(node_id[..node_id.len().min(8)].to_string()),
+        );
+    }
+    for field in allowed {
+        if let Some(value) = source.get(field).filter(|value| !value.is_null()) {
+            public.insert(field.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(public)
 }
 
 /// `POST /v1/dispatch/ticket` — one short-lived, prompt-free route disclosure.
@@ -772,6 +889,7 @@ async fn dispatch_ticket_issue(
         "route_fields_present": true,
         "prompt_payload_accepted": false,
     });
+    st.repo.record_dispatch_usage("ticketed_dispatch").await;
     axum::response::Response::builder()
         .status(StatusCode::CREATED)
         .header("content-type", "application/json")
@@ -825,6 +943,11 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
     let Some(obj) = v.as_object_mut() else {
         return v;
     };
+
+    obj.insert(
+        "node_policy_manifest".into(),
+        public_policy_manifest(n.policy_manifest.as_ref()),
+    );
 
     let public_key = n.public_key.clone().unwrap_or(serde_json::Value::Null);
     obj.insert("cx_public_key".into(), public_key.clone());
@@ -1001,6 +1124,47 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
     v
 }
 
+fn public_policy_manifest(manifest: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(manifest) = manifest.filter(|value| value.as_object().is_some_and(|v| !v.is_empty()))
+    else {
+        return serde_json::Value::Null;
+    };
+    let verification = policy_manifest::verify(manifest);
+    serde_json::json!({
+        "version": manifest.get("version"),
+        "jurisdiction": manifest.get("jurisdiction"),
+        "policy_url": manifest.get("policy_url"),
+        "contact_url": manifest.get("contact_url"),
+        "remote_executor_can_read_prompt": manifest.get("remote_executor_can_read_prompt").and_then(serde_json::Value::as_bool).unwrap_or(true),
+        "training_use": manifest.get("training_use").and_then(serde_json::Value::as_str).unwrap_or("provider_defined"),
+        "retention": {
+            "task_payload": manifest.pointer("/retention/task_payload").and_then(serde_json::Value::as_str).unwrap_or("provider_defined"),
+            "logs_days": manifest.pointer("/retention/logs_days")
+        },
+        "subprocessors": manifest.get("subprocessors").and_then(serde_json::Value::as_array).cloned().unwrap_or_default(),
+        "unsupported_intents": manifest.get("unsupported_intents").and_then(serde_json::Value::as_array).cloned().unwrap_or_default(),
+        "signed_statement": manifest.get("signed_statement"),
+        "manifest_identity_level": verification.manifest_identity_level,
+        "operator_fingerprint": serde_json::Value::Null,
+        "policy_key_fingerprint": verification.policy_key_fingerprint,
+        "revoked_at": verification.revoked_at,
+        "rotation_epoch": verification.rotation_epoch,
+        "revocation_reason_class": verification.revocation_reason_class,
+        "operator_governance": {"accepted": false, "terms_version": serde_json::Value::Null, "dpa_version": serde_json::Value::Null, "legal_certification": false},
+        "verification": {
+            "status": verification.status,
+            "algorithm": verification.algorithm,
+            "key_id": verification.key_id,
+            "signed_at": verification.signed_at,
+            "expires_at": verification.expires_at,
+            "canonical_sha256": verification.canonical_sha256,
+            "public_key_sha256": verification.public_key_sha256,
+            "error": verification.error
+        },
+        "evidence": verification.evidence
+    })
+}
+
 fn browser_usable_endpoint(endpoint: &str) -> bool {
     let lower = endpoint.to_ascii_lowercase();
     if lower.starts_with("https://") {
@@ -1155,6 +1319,11 @@ struct RegisterRequest {
     /// NAT traversal metadata blob (ADR-043).
     #[serde(default)]
     transport_metadata: Option<serde_json::Value>,
+    /// Public retention/training/jurisdiction declaration. Signed manifests
+    /// are verified before persistence; unsigned manifests remain explicitly
+    /// self-attested.
+    #[serde(default)]
+    policy_manifest: Option<serde_json::Value>,
     /// ADR-045 Phase A (#407) — optional verifiable operator→node delegation (ed25519).
     #[serde(default)]
     operator_delegation: Option<delegation::OperatorDelegation>,
@@ -1348,6 +1517,12 @@ struct OperatorKeyRequest {
     reason_class: Option<String>,
     #[serde(default)]
     confirm: Option<bool>,
+    #[serde(default)]
+    terms_version: Option<String>,
+    #[serde(default)]
+    dpa_version: Option<String>,
+    #[serde(default)]
+    tracking_id: Option<String>,
 }
 
 fn operator_challenges() -> &'static std::sync::Mutex<HashMap<String, u64>> {
@@ -1382,8 +1557,17 @@ fn valid_reason_class(value: &str) -> bool {
         })
 }
 
-fn lifecycle_fields(
+fn operator_terms_version() -> String {
+    std::env::var("IICP_OPERATOR_TERMS_VERSION").unwrap_or_else(|_| "2026-07-09".to_string())
+}
+
+fn operator_dpa_version() -> String {
+    std::env::var("IICP_OPERATOR_DPA_VERSION").unwrap_or_else(|_| "2026-07-09".to_string())
+}
+
+fn self_service_fields(
     req: &OperatorKeyRequest,
+    action: &str,
     include_successor: bool,
 ) -> BTreeMap<String, serde_json::Value> {
     let mut fields = BTreeMap::from([
@@ -1413,6 +1597,28 @@ fn lifecycle_fields(
         );
     } else if let Some(confirm) = req.confirm {
         fields.insert("confirm".to_string(), serde_json::Value::Bool(confirm));
+    }
+    if action == "accept" {
+        if let Some(value) = &req.terms_version {
+            fields.insert(
+                "terms_version".to_string(),
+                serde_json::Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &req.dpa_version {
+            fields.insert(
+                "dpa_version".to_string(),
+                serde_json::Value::String(value.clone()),
+            );
+        }
+    }
+    if action.starts_with("dsr_") {
+        if let Some(value) = &req.tracking_id {
+            fields.insert(
+                "tracking_id".to_string(),
+                serde_json::Value::String(value.clone()),
+            );
+        }
     }
     fields
 }
@@ -1468,6 +1674,8 @@ async fn operator_challenge(
         "nonce": nonce,
         "expires_at": chrono::DateTime::from_timestamp(expires as i64, 0).map(|v| v.to_rfc3339()),
         "operator_fingerprint": public_operator_fingerprint(&req.operator_pub),
+        "terms_version": operator_terms_version(),
+        "dpa_version": operator_dpa_version(),
         "signing_contract": "iicp.operator.self-service.v1"
     }))
 }
@@ -1521,7 +1729,7 @@ async fn validate_operator_key_request(
             "challenge is missing, expired or already used",
         ));
     }
-    let fields = lifecycle_fields(req, include_successor);
+    let fields = self_service_fields(req, action, include_successor);
     let (valid, reason) =
         delegation::verify_self_service(&req.operator_pub, &req.sig, action, &fields);
     if !valid {
@@ -1537,6 +1745,141 @@ async fn validate_operator_key_request(
         ));
     }
     Ok(())
+}
+
+fn operator_self_service_repo_error(error: OperatorSelfServiceError) -> Response {
+    match error {
+        OperatorSelfServiceError::Unknown => {
+            no_store_error(StatusCode::NOT_FOUND, "IICP-E044", "unknown operator")
+        }
+        OperatorSelfServiceError::Inactive => no_store_error(
+            StatusCode::CONFLICT,
+            "IICP-E063",
+            "operator identity is no longer active",
+        ),
+        OperatorSelfServiceError::DuplicateTrackingId => no_store_error(
+            StatusCode::CONFLICT,
+            "IICP-E060",
+            "tracking_id has already been used",
+        ),
+        OperatorSelfServiceError::Storage => no_store_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "IICP-E050",
+            "operator self-service action could not be completed",
+        ),
+    }
+}
+
+async fn operator_acceptance(
+    State(st): State<AppState>,
+    Json(req): Json<OperatorKeyRequest>,
+) -> Response {
+    let (Some(terms), Some(dpa)) = (req.terms_version.as_deref(), req.dpa_version.as_deref())
+    else {
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "terms_version and dpa_version are required",
+        );
+    };
+    if terms.len() > 64 || dpa.len() > 64 {
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "governance version is invalid",
+        );
+    }
+    if terms != operator_terms_version() || dpa != operator_dpa_version() {
+        return no_store_error(
+            StatusCode::CONFLICT,
+            "IICP-E061",
+            "terms or DPA version is not current",
+        );
+    }
+    if let Err(response) = validate_operator_key_request(&st, &req, "accept", false).await {
+        return response;
+    }
+    use sha2::{Digest, Sha256};
+    let nonce_sha256 = hex::encode(Sha256::digest(req.nonce.as_bytes()));
+    match st
+        .repo
+        .accept_operator_governance(&req.operator_pub, terms, dpa, &nonce_sha256)
+        .await
+    {
+        Ok(accepted_at) => {
+            let receipt = hex::encode(Sha256::digest(
+                format!("{}{}", req.nonce, req.operator_pub).as_bytes(),
+            ));
+            no_store_json(serde_json::json!({
+                "status": "accepted",
+                "operator_fingerprint": public_operator_fingerprint(&req.operator_pub),
+                "terms_version": terms,
+                "dpa_version": dpa,
+                "accepted_at": accepted_at,
+                "receipt_id_prefix": &receipt[..12],
+                "legal_certification": false
+            }))
+        }
+        Err(error) => operator_self_service_repo_error(error),
+    }
+}
+
+async fn operator_dsr_action(st: AppState, req: OperatorKeyRequest, action: &str) -> Response {
+    if action != "export" && req.confirm != Some(true) {
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "confirm=true is required",
+        );
+    }
+    if req
+        .tracking_id
+        .as_deref()
+        .is_some_and(|id| id.is_empty() || id.len() > 64)
+    {
+        return no_store_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "tracking_id is invalid",
+        );
+    }
+    let signed_action = format!("dsr_{action}");
+    if let Err(response) = validate_operator_key_request(&st, &req, &signed_action, false).await {
+        return response;
+    }
+    let tracking_id = req
+        .tracking_id
+        .clone()
+        .unwrap_or_else(|| format!("dsr-{}", uuid::Uuid::new_v4()));
+    match st
+        .repo
+        .operator_dsr(&req.operator_pub, action, &tracking_id)
+        .await
+    {
+        Ok(value) => no_store_json(value),
+        Err(error) => operator_self_service_repo_error(error),
+    }
+}
+
+async fn operator_dsr_export(
+    State(st): State<AppState>,
+    Json(req): Json<OperatorKeyRequest>,
+) -> Response {
+    operator_dsr_action(st, req, "export").await
+}
+
+async fn operator_dsr_restrict(
+    State(st): State<AppState>,
+    Json(req): Json<OperatorKeyRequest>,
+) -> Response {
+    operator_dsr_action(st, req, "restrict").await
+}
+
+async fn operator_dsr_anonymize(
+    State(st): State<AppState>,
+    Json(req): Json<OperatorKeyRequest>,
+) -> Response {
+    operator_dsr_action(st, req, "anonymize").await
 }
 
 async fn operator_key_rotate(
@@ -1876,7 +2219,28 @@ fn resolve_registration_node_id(requested: Option<&str>) -> Result<String, &'sta
 fn validate_registration_request(
     request: &RegisterRequest,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    validate_registration_shape(request).or_else(|| validate_registration_capabilities(request))
+    validate_registration_shape(request)
+        .or_else(|| validate_registration_capabilities(request))
+        .or_else(|| validate_registration_policy_manifest(request))
+}
+
+fn validate_registration_policy_manifest(
+    request: &RegisterRequest,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let manifest = request.policy_manifest.as_ref()?;
+    if let Err(message) = policy_manifest::validate_shape(manifest) {
+        return Some(reject("validation_error", message));
+    }
+    let verification = policy_manifest::verify(manifest);
+    (!verification.accepted()).then(|| {
+        reject(
+            "validation_error",
+            &format!(
+                "Invalid node policy manifest signature: {}",
+                verification.status
+            ),
+        )
+    })
 }
 
 fn validate_registration_shape(
@@ -2131,6 +2495,36 @@ async fn registration_ownership_rejection(
     ))
 }
 
+async fn registration_control_rejection(
+    state: &AppState,
+    request: &RegisterRequest,
+    node_id: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if let Some(rejection) = policy_manifest_lifecycle_rejection(state, request).await {
+        return Some(rejection);
+    }
+    registration_ownership_rejection(state, request, node_id).await
+}
+
+async fn policy_manifest_lifecycle_rejection(
+    state: &AppState,
+    request: &RegisterRequest,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let manifest = request.policy_manifest.as_ref()?;
+    let key_sha = policy_manifest::verify(manifest).public_key_sha256?;
+    state
+        .repo
+        .policy_key_lifecycle_status(&key_sha)
+        .await
+        .filter(|status| status != "active")
+        .map(|_| {
+            reject(
+                "validation_error",
+                "Invalid node policy manifest signature: directory lifecycle record is not active",
+            )
+        })
+}
+
 async fn operator_display_name_rejection(
     state: &AppState,
     operator_pubkey: Option<&str>,
@@ -2194,7 +2588,7 @@ async fn register(
     // already exists, protect the two takeover vectors. Ownership = a current_node_token
     // that verifies against the stored hash; computed once and shared. PHP NodeRegistry
     // applyReRegistrationUpdate parity.
-    if let Some(rejection) = registration_ownership_rejection(&st, &req, &node_id).await {
+    if let Some(rejection) = registration_control_rejection(&st, &req, &node_id).await {
         return rejection;
     }
 
@@ -2308,6 +2702,7 @@ async fn register(
             .map(|l| l.public_listing)
             .unwrap_or(false),
         operator_url: req.listing.as_ref().and_then(|l| l.operator_url.clone()),
+        policy_manifest: req.policy_manifest.clone(),
         health_models: None, // #494 — populated by the first heartbeat with a backend URL
     };
     let intents = req.capabilities.iter().map(|c| c.intent.clone()).collect();
@@ -4356,6 +4751,7 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
     let provider_set = st.repo.active_nodes().await;
     let sdk_adoption = sdk_adoption_json(&provider_set);
     let receipt_profile_adoption = receipt_profile_adoption_json(&provider_set);
+    let dispatch_discovery_adoption = st.repo.dispatch_usage_summary(7).await;
     let healths: Vec<health::NodeHealth> = provider_set
         .iter()
         .map(|n| {
@@ -4478,6 +4874,7 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
         "directory_health": directory_health,
         "sdk_adoption": sdk_adoption,
         "receipt_profile_adoption": receipt_profile_adoption,
+        "dispatch_discovery_adoption": dispatch_discovery_adoption,
     }))
 }
 
@@ -4800,6 +5197,7 @@ async fn main() {
     tokio::spawn(background::run_reputation_decay_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_node_lifecycle_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_prune_heartbeat_loop(Arc::clone(&repo)));
+    tokio::spawn(background::run_prune_dispatch_usage_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_rotate_reputation_window_loop(Arc::clone(
         &repo,
     )));
@@ -4908,6 +5306,7 @@ mod tests {
                 operator_trust_tier: None,
                 public_listing: false,
                 operator_url: None,
+                policy_manifest: None,
                 health_models: None,
             },
             intents: vec![chat.into()],
@@ -6272,6 +6671,232 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         body["nonce"].as_str().unwrap().to_string()
+    }
+
+    async fn signed_operator_body(
+        st: AppState,
+        operator_pub: &str,
+        keypair: &ed25519_compact::KeyPair,
+        action: &str,
+        extra: BTreeMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut fields = BTreeMap::from([
+            (
+                "operator_pub".to_string(),
+                serde_json::Value::String(operator_pub.to_string()),
+            ),
+            (
+                "nonce".to_string(),
+                serde_json::Value::String(challenge_nonce(st, operator_pub).await),
+            ),
+            (
+                "ts".to_string(),
+                serde_json::Value::from(delegation::now_unix() as i64),
+            ),
+        ]);
+        fields.extend(extra);
+        let signature = sign_self_service(keypair, action, fields.clone());
+        let mut body = serde_json::Map::from_iter(fields);
+        body.insert("sig".to_string(), serde_json::Value::String(signature));
+        serde_json::Value::Object(body)
+    }
+
+    #[tokio::test]
+    async fn operator_acceptance_and_dsr_are_signed_redacted_and_one_use() {
+        use http_body_util::BodyExt;
+        let st = test_state();
+        let (operator_pub, keypair) = rename_keypair(20);
+        st.repo
+            .upsert_operator(&operator_pub, Some("DSR Test"), None, None)
+            .await;
+
+        let acceptance = signed_operator_body(
+            st.clone(),
+            &operator_pub,
+            &keypair,
+            "accept",
+            BTreeMap::from([
+                (
+                    "terms_version".to_string(),
+                    serde_json::Value::String(operator_terms_version()),
+                ),
+                (
+                    "dpa_version".to_string(),
+                    serde_json::Value::String(operator_dpa_version()),
+                ),
+            ]),
+        )
+        .await;
+        let response = app(st.clone())
+            .oneshot(post_operator(
+                "/api/v1/operator/acceptance",
+                acceptance.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!raw.contains(&operator_pub));
+        assert!(!raw.contains(acceptance["nonce"].as_str().unwrap()));
+        let replay = app(st.clone())
+            .oneshot(post_operator("/api/v1/operator/acceptance", acceptance))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+        let export = signed_operator_body(
+            st.clone(),
+            &operator_pub,
+            &keypair,
+            "dsr_export",
+            BTreeMap::from([(
+                "tracking_id".to_string(),
+                serde_json::Value::String("dsr-rust-export".to_string()),
+            )]),
+        )
+        .await;
+        let response = app(st.clone())
+            .oneshot(post_operator("/api/v1/operator/dsr/export", export))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!raw.contains(&operator_pub));
+        assert!(raw.contains("iicp.dsr.export.v1"));
+
+        let restrict = signed_operator_body(
+            st.clone(),
+            &operator_pub,
+            &keypair,
+            "dsr_restrict",
+            BTreeMap::from([
+                (
+                    "tracking_id".to_string(),
+                    serde_json::Value::String("dsr-rust-restrict".to_string()),
+                ),
+                ("confirm".to_string(), serde_json::Value::Bool(true)),
+            ]),
+        )
+        .await;
+        let response = app(st.clone())
+            .oneshot(post_operator("/api/v1/operator/dsr/restrict", restrict))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(st.repo.operator_display_name(&operator_pub).await, None);
+    }
+
+    #[tokio::test]
+    async fn public_discovery_is_route_redacted_and_counted_anonymously() {
+        use http_body_util::BodyExt;
+        let st = test_state();
+        let response = app(st.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/discover?intent=urn:iicp:intent:llm:chat:v1&view=public")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-iicp-discover-data-class"],
+            "public_presentation"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["route_fields_present"], false);
+        for node in body["nodes"].as_array().unwrap() {
+            assert!(node.get("endpoint").is_none());
+            assert!(node.get("transport_endpoint").is_none());
+            assert!(node.get("node_id").is_none());
+            assert!(node.get("cx_public_key").is_none());
+        }
+        let usage = st.repo.dispatch_usage_summary(7).await;
+        assert_eq!(usage["public_view_requests"], 1);
+        assert_eq!(usage["contains_caller_identifiers"], false);
+    }
+
+    #[tokio::test]
+    async fn registration_policy_manifest_is_exposed_as_verified_summary_not_raw_signature() {
+        use ct_codecs::{Base64, Encoder};
+        use ed25519_compact::{KeyPair, Seed};
+        use http_body_util::BodyExt;
+        let st = test_state();
+        let keypair = KeyPair::from_seed(Seed::new([44; 32]));
+        let mut manifest = serde_json::json!({
+            "version": "1",
+            "jurisdiction": "EU",
+            "training_use": "none",
+            "retention": {"task_payload": "transient", "logs_days": 0},
+            "signature": {
+                "algorithm": "Ed25519",
+                "key_id": "operator-primary",
+                "public_key": Base64::encode_to_string(&keypair.pk[..]).unwrap()
+            }
+        });
+        let signature = keypair
+            .sk
+            .sign(policy_manifest::canonical_payload(&manifest), None);
+        manifest["signature"]["signature"] =
+            serde_json::Value::String(Base64::encode_to_string(&signature[..]).unwrap());
+        let request = serde_json::json!({
+            "node_id": "policy-node",
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "nat_type": "full_cone",
+            "transport_method": "direct",
+            "policy_manifest": manifest,
+        });
+        assert_eq!(
+            app(st.clone())
+                .oneshot(post_register(request))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let response = app(st)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let raw = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(raw.contains("signed_valid"));
+        assert!(!raw.contains(manifest["signature"]["signature"].as_str().unwrap()));
     }
 
     #[tokio::test]
@@ -8377,6 +9002,7 @@ mod tests {
                 operator_trust_tier: None,
                 public_listing: false,
                 operator_url: None,
+                policy_manifest: None,
                 health_models: Some(vec![]), // explicitly empty — no models loaded
             },
             intents: vec![chat.into()],

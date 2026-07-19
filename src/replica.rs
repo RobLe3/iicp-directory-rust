@@ -433,6 +433,7 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         // replica reconstruction defaults to not-listed until then.
         public_listing: false,
         operator_url: None,
+        policy_manifest: payload.get("policy_manifest").cloned(),
         health_models: None, // #494 — populated by heartbeat events, not REGISTER
     })
 }
