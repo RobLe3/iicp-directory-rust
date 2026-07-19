@@ -895,7 +895,7 @@ async fn apply_mysql_dsr_restriction(
         OperatorSelfServiceError::Storage
     })?;
     sqlx::query(
-        "UPDATE operators SET display_name = NULL, attested_created_at = NULL, \
+        "UPDATE operators SET identity_status = 'restricted', display_name = NULL, attested_created_at = NULL, \
          operator_integrity_hash = NULL, terms_version = NULL, terms_accepted_at = NULL, \
          dpa_version = NULL, dpa_accepted_at = NULL, acceptance_method = NULL, \
          acceptance_nonce_sha256 = NULL, tier = NULL, badge = NULL, \

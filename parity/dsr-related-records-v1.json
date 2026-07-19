@@ -2,6 +2,7 @@
   "schema": "iicp.directory.dsr-related-records-parity.v1",
   "export_schema": "iicp.dsr.export.v1",
   "record_limit_per_family": 500,
+  "restricted_identity_status": "restricted",
   "record_families": {
     "operators": ["id", "operator_fingerprint", "operator_pubkey_sha256", "display_name", "attested_created_at", "operator_integrity_hash", "first_seen_ms", "ordinal", "tier", "badge", "provenance", "terms_version", "terms_accepted_at", "dpa_version", "dpa_accepted_at", "acceptance_method", "created_at", "updated_at"],
     "nodes": ["id", "endpoint", "region", "status", "available", "public_listing", "operator_url", "operator_contact", "operator_fingerprint", "operator_verified", "operator_trust_tier", "observed_source_ip", "last_seen", "dormant_since", "policy_manifest", "sdk_language", "sdk_version", "secret_fields_present"],
