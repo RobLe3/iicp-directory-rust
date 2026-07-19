@@ -10,11 +10,11 @@ use sha2::Digest;
 use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, QueryBuilder, Row};
 
 use crate::repo::{
-    operator_fingerprint, AuditResult, ConformanceBadge, CreditError, CreditSummary,
-    CreditTransaction, DiscoverQuery, EffectiveCreditBalance, EventRow, FounderEntry,
-    IntentSummary, NodeRecord, NodeRepository, OperatorLifecycleError, OperatorLifecycleResult,
-    OperatorSelfServiceError, OperatorWalletSummary, PendingFounderEntry, ProbeResult,
-    ProxyObservation, RegistryStats, RepoError, WalletDebitResult,
+    operator_fingerprint, verify_liveness_response, AuditResult, ConformanceBadge, CreditError,
+    CreditSummary, CreditTransaction, DiscoverQuery, EffectiveCreditBalance, EventRow,
+    FounderEntry, IntentSummary, NodeRecord, NodeRepository, OperatorLifecycleError,
+    OperatorLifecycleResult, OperatorSelfServiceError, OperatorWalletSummary, PendingFounderEntry,
+    ProbeResult, ProxyObservation, RegistryStats, RepoError, WalletDebitResult,
 };
 use crate::reputation;
 use crate::types::Node;
@@ -1724,6 +1724,47 @@ impl NodeRepository for MySqlRepo {
             .ok()
             .flatten();
         row.map(|(k,)| k).filter(|k| !k.is_empty())
+    }
+
+    async fn verify_and_rotate_liveness_challenge(
+        &self,
+        node_id: &str,
+        response: Option<&str>,
+        next_challenge: &str,
+    ) -> Option<bool> {
+        let mut transaction = self.pool.begin().await.ok()?;
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT liveness_challenge, node_hmac_key FROM nodes WHERE id = ? FOR UPDATE",
+        )
+        .bind(node_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .ok()?;
+        let (challenge, hmac_key) = row?;
+        let verified = challenge.as_deref().is_some_and(|challenge| {
+            hmac_key.as_deref().is_some_and(|key| {
+                response
+                    .is_some_and(|candidate| verify_liveness_response(key, challenge, candidate))
+            })
+        });
+        let result = if verified {
+            sqlx::query(
+                "UPDATE nodes SET liveness_challenge = ?, liveness_verified_at = NOW() WHERE id = ?",
+            )
+            .bind(next_challenge)
+            .bind(node_id)
+            .execute(&mut *transaction)
+            .await
+        } else {
+            sqlx::query("UPDATE nodes SET liveness_challenge = ? WHERE id = ?")
+                .bind(next_challenge)
+                .bind(node_id)
+                .execute(&mut *transaction)
+                .await
+        };
+        result.ok()?;
+        transaction.commit().await.ok()?;
+        Some(verified)
     }
 
     /// Nonce replay check — looks up the nonce in credit_transactions.

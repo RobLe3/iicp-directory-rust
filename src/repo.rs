@@ -230,6 +230,15 @@ pub trait NodeRepository: Send + Sync {
     /// Fetch the node's HMAC key for credit receipt verification (W-009, iicp-dir §6.2).
     async fn node_hmac_key(&self, node_id: &str) -> Option<String>;
 
+    /// Verify the prior ADR-047 heartbeat challenge and rotate it atomically.
+    /// A response can succeed at most once because every call installs a fresh challenge.
+    async fn verify_and_rotate_liveness_challenge(
+        &self,
+        node_id: &str,
+        response: Option<&str>,
+        next_challenge: &str,
+    ) -> Option<bool>;
+
     /// Check whether a nonce has already been used (replay prevention, RT-02).
     /// InMemoryRepo always returns false (no nonce table in local mode).
     #[allow(dead_code)]
@@ -714,6 +723,20 @@ pub fn operator_fingerprint(operator_pubkey: &str) -> String {
     hex::encode(digest)[..12].to_string()
 }
 
+pub(crate) fn verify_liveness_response(key: &str, challenge: &str, response: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    let Ok(candidate) = hex::decode(response) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(key.as_bytes()) else {
+        return false;
+    };
+    mac.update(challenge.as_bytes());
+    mac.verify_slice(&candidate).is_ok()
+}
+
 /// Result of applying an audit report.
 #[derive(Debug, Clone)]
 pub struct AuditResult {
@@ -760,6 +783,8 @@ pub struct RegistryStats {
 #[derive(Debug, Default)]
 pub struct InMemoryRepo {
     records: std::sync::Mutex<Vec<NodeRecord>>,
+    /// Outstanding ADR-047 challenge by node ID. Kept separate from the public node model.
+    liveness_challenges: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// ADR-048 (#374): per-(node, evaluator) health snapshots —
     /// (node_id, evaluator_did, score, evaluated_at_ms).
     health_obs: std::sync::Mutex<Vec<(String, String, f64, i64)>>,
@@ -802,6 +827,7 @@ impl InMemoryRepo {
     pub fn new(records: Vec<NodeRecord>) -> Self {
         Self {
             records: std::sync::Mutex::new(records),
+            liveness_challenges: std::sync::Mutex::new(std::collections::HashMap::new()),
             health_obs: std::sync::Mutex::new(Vec::new()),
             replicas: std::sync::Mutex::new(Vec::new()),
             events: std::sync::Mutex::new(Vec::new()),
@@ -1296,6 +1322,30 @@ impl NodeRepository for InMemoryRepo {
             .iter()
             .find(|r| r.node.node_id == node_id)
             .and_then(|r| r.node_hmac_key.clone())
+    }
+
+    async fn verify_and_rotate_liveness_challenge(
+        &self,
+        node_id: &str,
+        response: Option<&str>,
+        next_challenge: &str,
+    ) -> Option<bool> {
+        let hmac_key = {
+            let guard = self.records.lock().unwrap();
+            guard
+                .iter()
+                .find(|r| r.node.node_id == node_id)
+                .map(|r| r.node_hmac_key.clone())?
+        };
+        let mut challenges = self.liveness_challenges.lock().unwrap();
+        let verified = challenges.get(node_id).is_some_and(|challenge| {
+            hmac_key.as_deref().is_some_and(|key| {
+                response
+                    .is_some_and(|candidate| verify_liveness_response(key, challenge, candidate))
+            })
+        });
+        challenges.insert(node_id.to_string(), next_challenge.to_string());
+        Some(verified)
     }
 
     /// InMemoryRepo: no nonce tracking — always returns false (no replay detection in test mode).

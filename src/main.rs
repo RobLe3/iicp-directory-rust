@@ -2849,6 +2849,9 @@ struct HeartbeatPricing {
 #[derive(Debug, Deserialize)]
 struct HeartbeatRequest {
     node_id: String,
+    /// ADR-047: lowercase-hex HMAC-SHA256 of the challenge issued by the prior PONG.
+    #[serde(default)]
+    challenge_response: Option<String>,
     #[serde(default)]
     load: f64,
     #[serde(default)]
@@ -2943,6 +2946,27 @@ async fn heartbeat(
         .await
     {
         Some(score) => {
+            let next_challenge = hex::encode(uuid::Uuid::new_v4().as_bytes());
+            if st
+                .repo
+                .verify_and_rotate_liveness_challenge(
+                    &req.node_id,
+                    req.challenge_response.as_deref(),
+                    &next_challenge,
+                )
+                .await
+                .is_none()
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "internal_error",
+                            "message": "heartbeat liveness state could not be persisted"
+                        }
+                    })),
+                );
+            }
             // PHP logs REPUTATION_UPDATE event when tasks are reported (Phase 6 prereq).
             if tasks_delta > 0 {
                 let payload = serde_json::json!({
@@ -2966,6 +2990,7 @@ async fn heartbeat(
                 "ok": true,
                 "next_heartbeat_ms": 30000,
                 "reputation_score": (score * 10000.0).round() / 10000.0,
+                "challenge": next_challenge,
             });
             if free_credits > 0.0 {
                 resp["free_credits_awarded"] = serde_json::json!(free_credits);
@@ -8043,6 +8068,41 @@ mod tests {
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["reputation_score"], 0.9); // 0.8 + capped 0.10 (RT-01), not 1.0
+        assert_eq!(v["challenge"].as_str().map(str::len), Some(32));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_challenge_is_single_use_and_rotates_after_replay() {
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let state = test_state();
+        assert_eq!(
+            state
+                .repo
+                .verify_and_rotate_liveness_challenge("a", None, "challenge-one")
+                .await,
+            Some(false)
+        );
+
+        let mut mac = HmacSha256::new_from_slice(b"test-hmac-key").unwrap();
+        mac.update(b"challenge-one");
+        let answer = hex::encode(mac.finalize().into_bytes());
+        assert_eq!(
+            state
+                .repo
+                .verify_and_rotate_liveness_challenge("a", Some(&answer), "challenge-two")
+                .await,
+            Some(true)
+        );
+        assert_eq!(
+            state
+                .repo
+                .verify_and_rotate_liveness_challenge("a", Some(&answer), "challenge-three")
+                .await,
+            Some(false),
+            "the response for challenge-one must not verify after rotation"
+        );
     }
 
     #[tokio::test]
