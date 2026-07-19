@@ -43,7 +43,7 @@ Status legend: ✅ done · 🔶 present but not full production equivalent · �
 | `POST /api/v1/peers` + legacy `/v1/peers` | ✅ |
 | `POST /api/v1/operator/rename` + legacy `/v1/operator/rename` | ✅ |
 | `POST /api/v1/operator/challenge`, `/key/rotate`, `/key/revoke` + legacy `/v1` | ✅ signed dual-key lifecycle; no-store/redacted receipts |
-| `POST /api/v1/operator/acceptance`, `/dsr/{export,restrict,anonymize}` + legacy `/v1` | 🔶 signed/no-store routes; related-record export fixtures remain |
+| `POST /api/v1/operator/acceptance`, `/dsr/{export,restrict,anonymize}` + legacy `/v1` | ✅ signed/no-store routes; shared related-record and disposable MySQL parity gate |
 | `GET /api/v1/leaderboards/{board_id}` + legacy `/v1/leaderboards/{board_id}` | ✅ |
 
 ### Registry, credits, conformance and telemetry
@@ -94,7 +94,7 @@ The public discover/detail wire shape is intentionally not a raw Rust `Node` ser
 - ✅ Operator acceptance plus signed, no-store DSR export, restriction and anonymisation routes.
 - ✅ Signed policy-manifest validation; operator rotation/revocation invalidates stale manifests and records policy-key lifecycle state.
 - ✅ Public-vs-dispatch discovery and bounded anonymous daily dispatch-usage counters.
-- 🔶 Rust DSR export currently provides the redacted operator/node core; Laravel remains the richer export authority for related ledger and telemetry rows until shared database fixtures prove full record-shape parity.
+- ✅ Shared `dsr-related-records-v1.json` coverage and a disposable dual-MySQL gate prove PHP/Rust export shape, redaction, signed lifecycle, replay/conflict handling, transactional rollback, retained ledger/event evidence and telemetry deletion parity.
 
 These are control-plane safety features, not cosmetic route aliases. Rust must not claim full directory parity until each has equivalent storage, authorization, redaction and contract tests.
 
@@ -132,6 +132,7 @@ cd iicp-directory-rs
 cargo fmt --check && cargo test --locked
 cd ..
 bash scripts/docker_rust_schema_reliability_gate.sh
+bash scripts/docker_directory_dsr_parity_gate.sh
 ```
 
 New parity tests added in this refresh:

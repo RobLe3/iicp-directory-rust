@@ -1,0 +1,24 @@
+{
+  "schema": "iicp.directory.dsr-related-records-parity.v1",
+  "export_schema": "iicp.dsr.export.v1",
+  "record_limit_per_family": 500,
+  "record_families": {
+    "operators": ["id", "operator_fingerprint", "operator_pubkey_sha256", "display_name", "attested_created_at", "operator_integrity_hash", "first_seen_ms", "ordinal", "tier", "badge", "provenance", "terms_version", "terms_accepted_at", "dpa_version", "dpa_accepted_at", "acceptance_method", "created_at", "updated_at"],
+    "nodes": ["id", "endpoint", "region", "status", "available", "public_listing", "operator_url", "operator_contact", "operator_fingerprint", "operator_verified", "operator_trust_tier", "observed_source_ip", "last_seen", "dormant_since", "policy_manifest", "sdk_language", "sdk_version", "secret_fields_present"],
+    "capabilities": ["node_id", "intent", "models", "max_tokens", "quantization", "inference_engine", "input_modalities"],
+    "credits": ["node_id", "balance", "free_credit_last_allocation_at", "created_at", "updated_at"],
+    "credit_transactions": ["id", "node_id", "amount", "type", "task_id", "reason", "expires_at", "created_at"],
+    "reputations": ["node_id", "score", "tasks_total", "tasks_failed", "completed_tasks_count", "avg_latency_ms", "observed_latency_ms"],
+    "node_address_history": ["id", "node_id", "ip_address", "request_type", "observed_at"],
+    "telemetry_probes": ["id", "node_id", "run_id", "probe_id", "probe_type", "test_id", "level", "passed", "latency_ms", "probed_at"],
+    "proxy_telemetry": ["id", "node_id", "proxy_node_id", "time_bucket", "latency_ms_observed", "tokens_observed", "status", "qos_advertised", "qos_met"],
+    "node_events": ["event_id", "seq", "event_type", "node_id", "ts_ms", "payload", "prev_hash", "signature_present", "created_at"],
+    "data_subject_actions": ["tracking_id", "action", "subject_hash", "affected_counts", "retention_reason", "applied_at"]
+  },
+  "recursive_redaction_keys": ["node_token", "node_token_hash", "proxy_token", "proxy_token_hash", "node_hmac_key", "current_node_token", "operator_pubkey", "public_key", "did_public_key"],
+  "anonymize_delete_families": ["node_address_history", "telemetry_probes", "proxy_telemetry"],
+  "anonymize_retain_families": ["nodes", "capabilities", "credits", "credit_transactions", "reputations", "node_events", "data_subject_actions"],
+  "negative_controls": ["unrelated_operator_records_excluded", "raw_operator_key_absent", "task_payload_absent", "credential_material_absent"],
+  "mutations_are_transactional": true,
+  "export_is_read_only": true
+}

@@ -38,7 +38,8 @@
     "required_shared_paths": [
       "parity/profile-compatibility-v0.json",
       "parity/intent-risk-taxonomy.json",
-      "parity/dispatch-route-ticket-v1.json"
+      "parity/dispatch-route-ticket-v1.json",
+      "parity/dsr-related-records-v1.json"
     ],
     "required_route_fragments": [
       "/api/v1/dispatch/ticket",
@@ -51,6 +52,7 @@
     "required_capability_markers": [
       "IntentPolicyGuard",
       "DataSubjectRights",
+      "DsrRelatedRecordsV1",
       "PolicyKeyLifecycle",
       "DispatchUsage"
     ]

@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use sha2::Digest;
-use sqlx::{mysql::MySqlPoolOptions, MySql, Pool};
+use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, QueryBuilder, Row};
 
 use crate::repo::{
     operator_fingerprint, AuditResult, ConformanceBadge, CreditError, CreditSummary,
@@ -419,10 +419,7 @@ async fn persist_registration(
 }
 
 struct MysqlDsrSubject {
-    display_name: Option<String>,
-    terms_version: Option<String>,
-    dpa_version: Option<String>,
-    acceptance_method: Option<String>,
+    operator_pubkey: String,
     node_ids: Vec<String>,
     fingerprint: String,
     pubkey_sha256: String,
@@ -438,7 +435,7 @@ async fn mysql_operator_dsr(
 ) -> Result<serde_json::Value, OperatorSelfServiceError> {
     let subject = load_mysql_dsr_subject(pool, operator_pubkey).await?;
     if action == "export" {
-        return Ok(mysql_dsr_export(&subject, tracking_id));
+        return mysql_dsr_export(pool, &subject, tracking_id).await;
     }
     mutate_mysql_dsr(pool, operator_pubkey, action, tracking_id, &subject).await
 }
@@ -448,20 +445,15 @@ async fn load_mysql_dsr_subject(
     operator_pubkey: &str,
 ) -> Result<MysqlDsrSubject, OperatorSelfServiceError> {
     use sha2::{Digest, Sha256};
-    let active: Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
-        "SELECT display_name, terms_version, dpa_version, acceptance_method FROM operators \
+    let active: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM operators \
          WHERE operator_pubkey = ? AND identity_status = 'active' LIMIT 1",
     )
     .bind(operator_pubkey)
     .fetch_optional(pool)
     .await
     .map_err(|_| OperatorSelfServiceError::Storage)?;
-    let Some((display_name, terms_version, dpa_version, acceptance_method)) = active else {
+    let Some(_) = active else {
         let exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
                 .bind(operator_pubkey)
@@ -476,20 +468,25 @@ async fn load_mysql_dsr_subject(
     };
     let fingerprint = operator_fingerprint(operator_pubkey);
     let pubkey_sha256 = hex::encode(Sha256::digest(operator_pubkey.as_bytes()));
-    let selector = serde_json::json!({"operator_pubkey": {"sha256": pubkey_sha256, "fingerprint": fingerprint}});
-    let subject_hash = hex::encode(Sha256::digest(
-        serde_json::to_vec(&selector).unwrap_or_default(),
-    ));
+    // Preserve the Laravel service's established insertion order for the
+    // subject-hash preimage (`sha256`, then `fingerprint`). The response object
+    // itself is semantically unordered, but the stored audit hash is a byte
+    // contract and therefore must not depend on serde map ordering.
+    let selector_json = format!(
+        r#"{{"operator_pubkey":{{"sha256":{},"fingerprint":{}}}}}"#,
+        serde_json::to_string(&pubkey_sha256).unwrap_or_default(),
+        serde_json::to_string(&fingerprint).unwrap_or_default(),
+    );
+    let selector =
+        serde_json::from_str(&selector_json).map_err(|_| OperatorSelfServiceError::Storage)?;
+    let subject_hash = hex::encode(Sha256::digest(selector_json.as_bytes()));
     let node_ids = sqlx::query_scalar("SELECT id FROM nodes WHERE operator_pubkey = ? ORDER BY id")
         .bind(operator_pubkey)
         .fetch_all(pool)
         .await
         .map_err(|_| OperatorSelfServiceError::Storage)?;
     Ok(MysqlDsrSubject {
-        display_name,
-        terms_version,
-        dpa_version,
-        acceptance_method,
+        operator_pubkey: operator_pubkey.to_string(),
         node_ids,
         fingerprint,
         pubkey_sha256,
@@ -498,8 +495,66 @@ async fn load_mysql_dsr_subject(
     })
 }
 
-fn mysql_dsr_export(subject: &MysqlDsrSubject, tracking_id: &str) -> serde_json::Value {
-    serde_json::json!({
+/// Executable DsrRelatedRecordsV1 export surface shared with the Laravel seed.
+async fn mysql_dsr_export(
+    pool: &Pool<MySql>,
+    subject: &MysqlDsrSubject,
+    tracking_id: &str,
+) -> Result<serde_json::Value, OperatorSelfServiceError> {
+    let operators = mysql_dsr_operator_rows(pool, subject).await?;
+    let nodes = mysql_dsr_node_rows(pool, subject).await?;
+    let capabilities = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('node_id',node_id,'intent',intent,'models',models,'max_tokens',max_tokens,'quantization',quantization,'inference_engine',inference_engine,'input_modalities',input_modalities) AS CHAR) AS row_json FROM capabilities",
+        "node_id",
+        &subject.node_ids,
+        "node_id, id",
+    ).await?;
+    let credits = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('node_id',node_id,'balance',CAST(balance AS CHAR),'free_credit_last_allocation_at',free_credit_last_allocation_at,'created_at',created_at,'updated_at',updated_at) AS CHAR) AS row_json FROM credits",
+        "node_id",
+        &subject.node_ids,
+        "node_id",
+    ).await?;
+    let credit_transactions = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('id',id,'node_id',node_id,'amount',CAST(amount AS CHAR),'type',type,'task_id',task_id,'reason',reason,'expires_at',expires_at,'created_at',created_at) AS CHAR) AS row_json FROM credit_transactions",
+        "node_id",
+        &subject.node_ids,
+        "node_id, id",
+    ).await?;
+    let reputations = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('node_id',node_id,'score',score,'tasks_total',tasks_total,'tasks_failed',tasks_failed,'completed_tasks_count',completed_tasks_count,'avg_latency_ms',avg_latency_ms,'observed_latency_ms',observed_latency_ms) AS CHAR) AS row_json FROM reputations",
+        "node_id",
+        &subject.node_ids,
+        "node_id",
+    ).await?;
+    let node_address_history = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('id',id,'node_id',node_id,'ip_address',ip_address,'request_type',request_type,'observed_at',observed_at) AS CHAR) AS row_json FROM node_address_history",
+        "node_id",
+        &subject.node_ids,
+        "node_id, id",
+    ).await?;
+    let telemetry_probes = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('id',id,'node_id',node_id,'run_id',run_id,'probe_id',probe_id,'probe_type',probe_type,'test_id',test_id,'level',level,'passed',passed,'latency_ms',latency_ms,'probed_at',probed_at) AS CHAR) AS row_json FROM iicp_telemetry_probes",
+        "node_id",
+        &subject.node_ids,
+        "node_id, id",
+    ).await?;
+    let proxy_telemetry = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('id',id,'node_id',node_id,'proxy_node_id',proxy_node_id,'time_bucket',time_bucket,'latency_ms_observed',latency_ms_observed,'tokens_observed',tokens_observed,'status',status,'qos_advertised',qos_advertised,'qos_met',qos_met) AS CHAR) AS row_json FROM proxy_telemetry",
+        "node_id",
+        &subject.node_ids,
+        "node_id, id",
+    ).await?;
+    let node_events = mysql_dsr_node_event_rows(pool, &subject.node_ids).await?;
+    let data_subject_actions = mysql_dsr_prior_actions(pool, &subject.subject_hash).await?;
+    Ok(serde_json::json!({
         "schema": "iicp.dsr.export.v1",
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "tracking_id": tracking_id,
@@ -507,13 +562,234 @@ fn mysql_dsr_export(subject: &MysqlDsrSubject, tracking_id: &str) -> serde_json:
         "subject_hash": subject.subject_hash,
         "retention_notice": crate::repo::DSR_RETENTION_REASON,
         "records": {
-            "operators": [{"operator_fingerprint": subject.fingerprint, "operator_pubkey_sha256": subject.pubkey_sha256, "display_name": subject.display_name, "terms_version": subject.terms_version, "dpa_version": subject.dpa_version, "acceptance_method": subject.acceptance_method}],
-            "nodes": subject.node_ids.iter().map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>(),
-            "capabilities": [], "credits": [], "credit_transactions": [], "reputations": [],
-            "node_address_history": [], "telemetry_probes": [], "proxy_telemetry": [],
-            "node_events": [], "data_subject_actions": []
+            "operators": operators,
+            "nodes": nodes,
+            "capabilities": capabilities,
+            "credits": credits,
+            "credit_transactions": credit_transactions,
+            "reputations": reputations,
+            "node_address_history": node_address_history,
+            "telemetry_probes": telemetry_probes,
+            "proxy_telemetry": proxy_telemetry,
+            "node_events": node_events,
+            "data_subject_actions": data_subject_actions
         }
-    })
+    }))
+}
+
+async fn mysql_dsr_operator_rows(
+    pool: &Pool<MySql>,
+    subject: &MysqlDsrSubject,
+) -> Result<Vec<serde_json::Value>, OperatorSelfServiceError> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(JSON_OBJECT('id',id,'display_name',display_name,'attested_created_at',attested_created_at,'operator_integrity_hash',operator_integrity_hash,'first_seen_ms',first_seen_ms,'ordinal',ordinal,'tier',tier,'badge',badge,'provenance',provenance,'terms_version',terms_version,'terms_accepted_at',IF(terms_accepted_at IS NULL,NULL,DATE_FORMAT(terms_accepted_at,'%Y-%m-%dT%H:%i:%s+00:00')),'dpa_version',dpa_version,'dpa_accepted_at',IF(dpa_accepted_at IS NULL,NULL,DATE_FORMAT(dpa_accepted_at,'%Y-%m-%dT%H:%i:%s+00:00')),'acceptance_method',acceptance_method,'created_at',IF(created_at IS NULL,NULL,DATE_FORMAT(created_at,'%Y-%m-%dT%H:%i:%s+00:00')),'updated_at',IF(updated_at IS NULL,NULL,DATE_FORMAT(updated_at,'%Y-%m-%dT%H:%i:%s+00:00'))) AS CHAR) FROM operators WHERE operator_pubkey = ? LIMIT 1",
+    )
+    .bind(&subject.operator_pubkey)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        eprintln!("IICP DSR storage failure at operator export: {error}");
+        OperatorSelfServiceError::Storage
+    })?;
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        eprintln!("IICP DSR JSON decode failure at operator export: {error}");
+        OperatorSelfServiceError::Storage
+    })?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "operator_fingerprint".into(),
+            subject.fingerprint.clone().into(),
+        );
+        object.insert(
+            "operator_pubkey_sha256".into(),
+            subject.pubkey_sha256.clone().into(),
+        );
+    }
+    Ok(vec![value])
+}
+
+async fn mysql_dsr_node_rows(
+    pool: &Pool<MySql>,
+    subject: &MysqlDsrSubject,
+) -> Result<Vec<serde_json::Value>, OperatorSelfServiceError> {
+    let mut rows = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('id',id,'endpoint',endpoint,'region',region,'status',status,'available',available,'public_listing',public_listing,'operator_url',operator_url,'operator_contact',operator_contact,'operator_verified',operator_verified,'operator_trust_tier',operator_trust_tier,'observed_source_ip',observed_source_ip,'last_seen',IF(last_seen IS NULL,NULL,DATE_FORMAT(last_seen,'%Y-%m-%dT%H:%i:%s+00:00')),'dormant_since',IF(dormant_since IS NULL,NULL,DATE_FORMAT(dormant_since,'%Y-%m-%dT%H:%i:%s+00:00')),'policy_manifest',policy_manifest,'sdk_language',sdk_language,'sdk_version',sdk_version,'secret_fields_present',JSON_OBJECT('node_token_hash',node_token_hash IS NOT NULL,'proxy_token_hash',proxy_token_hash IS NOT NULL,'node_hmac_key',node_hmac_key IS NOT NULL)) AS CHAR) AS row_json FROM nodes",
+        "id",
+        &subject.node_ids,
+        "id",
+    ).await?;
+    for row in &mut rows {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "operator_fingerprint".into(),
+            subject.fingerprint.clone().into(),
+        );
+        for field in ["available", "public_listing", "operator_verified"] {
+            normalize_mysql_bool(object, field);
+        }
+        if let Some(secrets) = object
+            .get_mut("secret_fields_present")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for field in ["node_token_hash", "proxy_token_hash", "node_hmac_key"] {
+                normalize_mysql_bool(secrets, field);
+            }
+        }
+        if let Some(manifest) = object.get_mut("policy_manifest") {
+            redact_dsr_payload(manifest);
+        }
+    }
+    Ok(rows)
+}
+
+fn normalize_mysql_bool(object: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
+    if let Some(value) = object.get_mut(field) {
+        if let Some(number) = value.as_i64() {
+            *value = serde_json::Value::Bool(number != 0);
+        } else if let Some(number) = value.as_u64() {
+            *value = serde_json::Value::Bool(number != 0);
+        }
+    }
+}
+
+fn redact_dsr_payload(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let keys = object.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        let Some(item) = object.get_mut(&key) else {
+            continue;
+        };
+        if matches!(
+            key.as_str(),
+            "node_token"
+                | "node_token_hash"
+                | "proxy_token"
+                | "proxy_token_hash"
+                | "node_hmac_key"
+                | "current_node_token"
+        ) {
+            *item = serde_json::Value::String("[redacted]".into());
+            continue;
+        }
+        if matches!(
+            key.as_str(),
+            "operator_pubkey" | "public_key" | "did_public_key"
+        ) {
+            if let Some(raw) = item.as_str().map(str::to_string) {
+                use sha2::{Digest, Sha256};
+                if key == "operator_pubkey" {
+                    object.insert(
+                        "operator_fingerprint".into(),
+                        operator_fingerprint(&raw).into(),
+                    );
+                } else {
+                    object.insert(
+                        format!("{key}_sha256"),
+                        hex::encode(Sha256::digest(raw.as_bytes())).into(),
+                    );
+                }
+                object.insert(key, serde_json::Value::String("[redacted]".into()));
+            }
+            continue;
+        }
+        if item.is_object() {
+            redact_dsr_payload(item);
+        } else if let Some(array) = item.as_array_mut() {
+            for nested in array {
+                redact_dsr_payload(nested);
+            }
+        }
+    }
+}
+
+async fn mysql_dsr_node_table_rows(
+    pool: &Pool<MySql>,
+    select: &'static str,
+    filter_column: &'static str,
+    node_ids: &[String],
+    order_by: &'static str,
+) -> Result<Vec<serde_json::Value>, OperatorSelfServiceError> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = QueryBuilder::<MySql>::new(select);
+    query.push(" WHERE ").push(filter_column).push(" IN (");
+    let mut separated = query.separated(",");
+    for node_id in node_ids {
+        separated.push_bind(node_id);
+    }
+    separated.push_unseparated(") ORDER BY ");
+    query.push(order_by).push(" LIMIT 500");
+    let rows = query.build().fetch_all(pool).await.map_err(|error| {
+        eprintln!("IICP DSR storage failure at related-record export ({order_by}): {error}");
+        OperatorSelfServiceError::Storage
+    })?;
+    decode_dsr_json_rows(rows)
+}
+
+fn decode_dsr_json_rows(
+    rows: Vec<sqlx::mysql::MySqlRow>,
+) -> Result<Vec<serde_json::Value>, OperatorSelfServiceError> {
+    rows.into_iter()
+        .map(|row| {
+            let raw: String = row.try_get("row_json").map_err(|error| {
+                eprintln!("IICP DSR row decode failure: {error}");
+                OperatorSelfServiceError::Storage
+            })?;
+            serde_json::from_str(&raw).map_err(|error| {
+                eprintln!("IICP DSR JSON decode failure: {error}");
+                OperatorSelfServiceError::Storage
+            })
+        })
+        .collect()
+}
+
+async fn mysql_dsr_node_event_rows(
+    pool: &Pool<MySql>,
+    node_ids: &[String],
+) -> Result<Vec<serde_json::Value>, OperatorSelfServiceError> {
+    let mut rows = mysql_dsr_node_table_rows(
+        pool,
+        "SELECT CAST(JSON_OBJECT('event_id',event_id,'seq',seq,'event_type',event_type,'node_id',node_id,'ts_ms',ts_ms,'payload',payload,'prev_hash',prev_hash,'signature_present',signature IS NOT NULL,'created_at',created_at) AS CHAR) AS row_json FROM node_events",
+        "node_id",
+        node_ids,
+        "seq",
+    ).await?;
+    for row in &mut rows {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        normalize_mysql_bool(object, "signature_present");
+        if let Some(payload) = object.get_mut("payload") {
+            redact_dsr_payload(payload);
+        }
+    }
+    Ok(rows)
+}
+
+async fn mysql_dsr_prior_actions(
+    pool: &Pool<MySql>,
+    subject_hash: &str,
+) -> Result<Vec<serde_json::Value>, OperatorSelfServiceError> {
+    let rows = sqlx::query(
+        "SELECT CAST(JSON_OBJECT('tracking_id',tracking_id,'action',action,'subject_hash',subject_hash,'affected_counts',affected_counts,'retention_reason',retention_reason,'applied_at',applied_at) AS CHAR) AS row_json FROM data_subject_actions WHERE subject_hash = ? ORDER BY id LIMIT 500",
+    )
+    .bind(subject_hash)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| {
+        eprintln!("IICP DSR storage failure at prior-action export: {error}");
+        OperatorSelfServiceError::Storage
+    })?;
+    decode_dsr_json_rows(rows)
 }
 
 async fn mutate_mysql_dsr(
@@ -527,16 +803,18 @@ async fn mutate_mysql_dsr(
         .begin()
         .await
         .map_err(|_| OperatorSelfServiceError::Storage)?;
+    let mut counts = mysql_dsr_affected_counts(&mut tx, &subject.node_ids).await?;
     apply_mysql_dsr_restriction(&mut tx, operator_pubkey, action).await?;
     if action == "anonymize" {
-        apply_mysql_dsr_anonymization(&mut tx, operator_pubkey, tracking_id, &subject.node_ids)
-            .await?;
+        let deleted =
+            apply_mysql_dsr_anonymization(&mut tx, operator_pubkey, tracking_id, &subject.node_ids)
+                .await?;
+        if let Some(object) = counts.as_object_mut() {
+            object.insert("deleted_node_address_history".into(), deleted.0.into());
+            object.insert("deleted_telemetry_probes".into(), deleted.1.into());
+            object.insert("deleted_proxy_telemetry".into(), deleted.2.into());
+        }
     }
-    let counts = serde_json::json!({
-        "nodes": subject.node_ids.len(), "operators": 1, "credits": 0,
-        "credit_transactions": 0, "node_events_retained": 0,
-        "node_address_history": 0, "telemetry_probes": 0, "proxy_telemetry": 0
-    });
     insert_mysql_dsr_action(
         &mut tx,
         tracking_id,
@@ -556,6 +834,48 @@ async fn mutate_mysql_dsr(
     }))
 }
 
+async fn mysql_dsr_affected_counts(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    node_ids: &[String],
+) -> Result<serde_json::Value, OperatorSelfServiceError> {
+    Ok(serde_json::json!({
+        "nodes": node_ids.len(),
+        "operators": 1,
+        "credits": mysql_dsr_count(tx, "credits", node_ids).await?,
+        "credit_transactions": mysql_dsr_count(tx, "credit_transactions", node_ids).await?,
+        "node_events_retained": mysql_dsr_count(tx, "node_events", node_ids).await?,
+        "node_address_history": mysql_dsr_count(tx, "node_address_history", node_ids).await?,
+        "telemetry_probes": mysql_dsr_count(tx, "iicp_telemetry_probes", node_ids).await?,
+        "proxy_telemetry": mysql_dsr_count(tx, "proxy_telemetry", node_ids).await?,
+    }))
+}
+
+async fn mysql_dsr_count(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    table: &'static str,
+    node_ids: &[String],
+) -> Result<u64, OperatorSelfServiceError> {
+    if node_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut query = QueryBuilder::<MySql>::new("SELECT COUNT(*) FROM ");
+    query.push(table).push(" WHERE node_id IN (");
+    let mut separated = query.separated(",");
+    for node_id in node_ids {
+        separated.push_bind(node_id);
+    }
+    separated.push_unseparated(")");
+    query
+        .build_query_scalar::<i64>()
+        .fetch_one(&mut **tx)
+        .await
+        .map(|count| count.max(0) as u64)
+        .map_err(|error| {
+            eprintln!("IICP DSR storage failure while counting {table}: {error}");
+            OperatorSelfServiceError::Storage
+        })
+}
+
 async fn apply_mysql_dsr_restriction(
     tx: &mut sqlx::Transaction<'_, MySql>,
     operator_pubkey: &str,
@@ -570,7 +890,10 @@ async fn apply_mysql_dsr_restriction(
     .bind(operator_pubkey)
     .execute(&mut **tx)
     .await
-    .map_err(|_| OperatorSelfServiceError::Storage)?;
+    .map_err(|error| {
+        eprintln!("IICP DSR storage failure while restricting nodes: {error}");
+        OperatorSelfServiceError::Storage
+    })?;
     sqlx::query(
         "UPDATE operators SET display_name = NULL, attested_created_at = NULL, \
          operator_integrity_hash = NULL, terms_version = NULL, terms_accepted_at = NULL, \
@@ -586,7 +909,10 @@ async fn apply_mysql_dsr_restriction(
     .bind(operator_pubkey)
     .execute(&mut **tx)
     .await
-    .map_err(|_| OperatorSelfServiceError::Storage)?;
+    .map_err(|error| {
+        eprintln!("IICP DSR storage failure while restricting operator: {error}");
+        OperatorSelfServiceError::Storage
+    })?;
     Ok(())
 }
 
@@ -595,7 +921,7 @@ async fn apply_mysql_dsr_anonymization(
     operator_pubkey: &str,
     tracking_id: &str,
     node_ids: &[String],
-) -> Result<(), OperatorSelfServiceError> {
+) -> Result<(u64, u64, u64), OperatorSelfServiceError> {
     sqlx::query(
         "UPDATE nodes SET endpoint = CONCAT('https://dsr-anonymized.invalid/node-', LEFT(id, 8)), \
          observed_source_ip = NULL, operator_pubkey = NULL, operator_verified = 0, \
@@ -603,7 +929,7 @@ async fn apply_mysql_dsr_anonymization(
          liveness_challenge = NULL, liveness_verified_at = NULL, policy_manifest = NULL, \
          cx_public_key = NULL, gossip_public_key = NULL, \
          node_token_hash = SHA2(CONCAT(UUID(), RAND()), 256), \
-         proxy_token_hash = SHA2(CONCAT(UUID(), RAND()), 256), \
+         proxy_token_hash = LEFT(SHA2(CONCAT(UUID(), RAND()), 256), 60), \
          node_hmac_key = SHA2(CONCAT(UUID(), RAND()), 256), updated_at = NOW() \
          WHERE operator_pubkey = ?",
     )
@@ -611,8 +937,11 @@ async fn apply_mysql_dsr_anonymization(
     .bind(operator_pubkey)
     .execute(&mut **tx)
     .await
-    .map_err(|_| OperatorSelfServiceError::Storage)?;
-    delete_mysql_dsr_telemetry(tx, node_ids).await?;
+    .map_err(|error| {
+        eprintln!("IICP DSR storage failure while anonymizing nodes: {error}");
+        OperatorSelfServiceError::Storage
+    })?;
+    let deleted = delete_mysql_dsr_telemetry(tx, node_ids).await?;
     sqlx::query(
         "UPDATE operators SET operator_pubkey = CONCAT('dsr_', LEFT(SHA2(CONCAT('operator:', ?, ':', ?), 256), 60)), identity_status = 'restricted', updated_at = NOW() WHERE operator_pubkey = ?",
     )
@@ -621,28 +950,47 @@ async fn apply_mysql_dsr_anonymization(
     .bind(operator_pubkey)
     .execute(&mut **tx)
     .await
-    .map_err(|_| OperatorSelfServiceError::Storage)?;
-    Ok(())
+    .map_err(|error| {
+        eprintln!("IICP DSR storage failure while anonymizing operator: {error}");
+        OperatorSelfServiceError::Storage
+    })?;
+    Ok(deleted)
 }
 
 async fn delete_mysql_dsr_telemetry(
     tx: &mut sqlx::Transaction<'_, MySql>,
     node_ids: &[String],
-) -> Result<(), OperatorSelfServiceError> {
-    for node_id in node_ids {
-        for table in [
-            "node_address_history",
-            "iicp_telemetry_probes",
-            "proxy_telemetry",
-        ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE node_id = ?"))
-                .bind(node_id)
-                .execute(&mut **tx)
-                .await
-                .map_err(|_| OperatorSelfServiceError::Storage)?;
-        }
+) -> Result<(u64, u64, u64), OperatorSelfServiceError> {
+    let address = delete_mysql_dsr_rows(tx, "node_address_history", node_ids).await?;
+    let probes = delete_mysql_dsr_rows(tx, "iicp_telemetry_probes", node_ids).await?;
+    let proxy = delete_mysql_dsr_rows(tx, "proxy_telemetry", node_ids).await?;
+    Ok((address, probes, proxy))
+}
+
+async fn delete_mysql_dsr_rows(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    table: &'static str,
+    node_ids: &[String],
+) -> Result<u64, OperatorSelfServiceError> {
+    if node_ids.is_empty() {
+        return Ok(0);
     }
-    Ok(())
+    let mut query = QueryBuilder::<MySql>::new("DELETE FROM ");
+    query.push(table).push(" WHERE node_id IN (");
+    let mut separated = query.separated(",");
+    for node_id in node_ids {
+        separated.push_bind(node_id);
+    }
+    separated.push_unseparated(")");
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|error| {
+            eprintln!("IICP DSR storage failure while deleting {table}: {error}");
+            OperatorSelfServiceError::Storage
+        })
 }
 
 async fn insert_mysql_dsr_action(
@@ -671,6 +1019,7 @@ async fn insert_mysql_dsr_action(
         {
             OperatorSelfServiceError::DuplicateTrackingId
         } else {
+            eprintln!("IICP DSR storage failure while recording action: {error}");
             OperatorSelfServiceError::Storage
         }
     })

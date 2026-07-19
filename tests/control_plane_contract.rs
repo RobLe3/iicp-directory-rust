@@ -29,6 +29,7 @@ fn rust_source_consumes_current_control_plane_contract() {
         include_str!("../src/db.rs"),
         include_str!("../src/policy_manifest.rs"),
         include_str!("../src/background.rs"),
+        include_str!("../parity/dsr-related-records-v1.json"),
     ]
     .join("\n");
     for route in contract.rust.required_route_fragments {
@@ -40,4 +41,12 @@ fn rust_source_consumes_current_control_plane_contract() {
             "missing capability marker {marker}"
         );
     }
+    let dsr: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/dsr-related-records-v1.json")).unwrap();
+    assert_eq!(
+        dsr["schema"],
+        "iicp.directory.dsr-related-records-parity.v1"
+    );
+    assert_eq!(dsr["record_limit_per_family"], 500);
+    assert_eq!(dsr["record_families"].as_object().unwrap().len(), 11);
 }
