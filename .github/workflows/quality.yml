@@ -1,10 +1,8 @@
 name: Rust directory quality
 
 on:
-  workflow_dispatch:
-
-# Manual-only while private to conserve GitHub Free Actions minutes. Enable
-# push and pull_request triggers when the repository becomes public.
+  push:
+  pull_request:
 
 jobs:
   test:
