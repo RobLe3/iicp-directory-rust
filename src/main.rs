@@ -533,6 +533,7 @@ async fn discover(
         }
     }
     let started = Instant::now();
+    let repository_started = Instant::now();
     let nodes = st
         .repo
         .discover(&DiscoverQuery {
@@ -542,6 +543,7 @@ async fn discover(
             min_reputation: p.min_reputation,
         })
         .await;
+    let repository_ms = repository_started.elapsed().as_secs_f64() * 1000.0;
     // CIP-D1 filter: cip_capable=1 → only return CIP-Provider nodes (DIR-CIP-02).
     let nodes = if matches!(p.cip_capable.as_deref(), Some("1") | Some("true")) {
         nodes
@@ -574,6 +576,7 @@ async fn discover(
         nodes
     };
     // Enrich with server-side derived fields (PHP NodeScorer parity).
+    let enrichment_started = Instant::now();
     let mut enriched = Vec::with_capacity(nodes.len());
     for mut n in nodes {
         n.address_family = Some(detect_address_family(
@@ -588,7 +591,17 @@ async fn discover(
         n.operator_fingerprint = operator_fingerprint_for(n.operator_pubkey.as_deref());
         enriched.push(n);
     }
-    build_discover_response(&st, public_view, enriched, negotiated_profile, started).await
+    let enrichment_ms = enrichment_started.elapsed().as_secs_f64() * 1000.0;
+    build_discover_response(
+        &st,
+        public_view,
+        enriched,
+        negotiated_profile,
+        started,
+        repository_ms,
+        enrichment_ms,
+    )
+    .await
 }
 
 async fn build_discover_response(
@@ -597,7 +610,10 @@ async fn build_discover_response(
     nodes: Vec<types::Node>,
     negotiated_profile: Option<serde_json::Value>,
     started: Instant,
+    repository_ms: f64,
+    enrichment_ms: f64,
 ) -> axum::response::Response {
+    let response_started = Instant::now();
     let count = nodes.len() as u32;
     let relay_available = nodes.iter().any(|n| n.relay_capable.unwrap_or(false));
     state
@@ -640,6 +656,12 @@ async fn build_discover_response(
     // carry rotating tunnel/relay endpoints, so long CDN staleness is unsafe.
     // Rust has no origin result cache yet; advertise that fact safely so
     // conformance telemetry does not invent cache-hit/miss evidence.
+    let encoded = serde_json::to_vec(&body).unwrap();
+    let response_ms = response_started.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let server_timing = format!(
+        "iicp_repository;dur={repository_ms:.3}, iicp_enrichment;dur={enrichment_ms:.3}, iicp_response;dur={response_ms:.3}, iicp_total;dur={total_ms:.3}"
+    );
     axum::response::Response::builder()
         .status(200)
         .header("content-type", "application/json")
@@ -649,8 +671,9 @@ async fn build_discover_response(
         )
         .header("x-iicp-discover-origin-cache", "bypass")
         .header("x-iicp-discover-data-class", data_class)
+        .header("server-timing", server_timing)
         .header("vary", "Accept-Encoding")
-        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .body(axum::body::Body::from(encoded))
         .unwrap()
 }
 
@@ -5756,6 +5779,21 @@ mod tests {
         assert!(cache_control.contains("max-age=5"));
         assert!(cache_control.contains("s-maxage=10"));
         assert!(cache_control.contains("stale-while-revalidate=5"));
+        let server_timing = response
+            .headers()
+            .get("server-timing")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        for metric in [
+            "iicp_repository",
+            "iicp_enrichment",
+            "iicp_response",
+            "iicp_total",
+        ] {
+            assert!(server_timing.contains(&format!("{metric};dur=")));
+        }
+        assert!(!server_timing.contains("urn:iicp"));
     }
 
     #[test]
