@@ -2,6 +2,10 @@
 
 Rust reference implementation of the IICP directory control plane.
 
+The protocol is defined by the public [IICP specification](https://github.com/RobLe3/IICP).
+This repository owns the Rust implementation, not the protocol, website,
+production deployment, or Genesis Seed credentials and data.
+
 **Status as of 2026-07-19:** Rust is a reconciled parity baseline, not a cutover-ready replacement for the Laravel production seed. It implements broad public-route compatibility plus public-vs-route discovery, anonymous dispatch counters, signed operator acceptance/DSR with related-record MySQL parity, signed policy manifests and fail-closed policy-key lifecycle handling. Live operational equivalence and an explicitly approved cutover remain open gates. See [`PARITY.md`](PARITY.md) and the versioned parity fixtures before making any cutover claim.
 
 The PHP/Laravel directory remains the production seed. Rust is the typed replacement candidate and must continue to pass the same REACH/live conformance probes before it can own production traffic.
@@ -88,3 +92,10 @@ The route-alias and live-shape compatibility tests are in `src/main.rs` near the
 ## Relationship to PHP
 
 See [`PARITY.md`](PARITY.md) for the detailed PHP/Rust parity checklist. The versioned parity fixtures define the seed requirements; the dedicated PHP repository remains the easiest way to compare exact Laravel behavior.
+
+## Contributing and security
+
+Run `cargo fmt --check`, `cargo test --locked`, and the parity checks described
+in `PARITY.md` before proposing a change. See `CONTRIBUTING.md`, `SECURITY.md`,
+`OPERATIONS.md`, and `PUBLICATION_READINESS.md` for repository boundaries and
+self-host guidance.

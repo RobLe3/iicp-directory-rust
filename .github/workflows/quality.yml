@@ -1,14 +1,16 @@
 name: Rust directory quality
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
+
+# Manual-only while private to conserve GitHub Free Actions minutes. Enable
+# push and pull_request triggers when the repository becomes public.
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --check
       - run: cargo test --locked
