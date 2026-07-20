@@ -1,14 +1,14 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
 Last refreshed: **2026-07-19**. The local Laravel seed source and current
-route-level parity fixture are `v1.10.75`. Historical contracts remain immutable
+route-level parity fixture are `v1.10.76`. Historical contracts remain immutable
 evidence and are not current production-version claims.
 
 > **Status:** this Rust implementation is a reconciled parity baseline, not a
 > cutover-ready replacement. Operator acceptance/DSR routes, signed policy-manifest
 > validation with fail-closed key lifecycle, public-vs-dispatch discovery and bounded
 > anonymous dispatch counters are implemented. Public-mesh intent-policy refusal uses
-> the shared canonical taxonomy. `directory/parity/contract-v1.10.75.json` is the
+> the shared canonical taxonomy. `directory/parity/contract-v1.10.76.json` is the
 > authoritative checklist; do not infer operational parity from route count alone.
 
 The goal is not merely to compile a Rust server. The Rust directory must be wire-compatible with the PHP/Laravel directory for clients, nodes, relays, the website and future replicas. The PHP seed remains production authority until live conformance and operational evidence justify a cutover.
@@ -87,7 +87,7 @@ This closes the biggest practical Rust-vs-live drift: older Rust discovery expos
 
 The public discover/detail wire shape is intentionally not a raw Rust `Node` serialization. Internal fields such as task counters, pricing scalar columns, operator verification internals and `health_models` stay available to Rust scoring/storage, but are hidden from the public response when live PHP exposes the same information only through public summary blocks.
 
-## v1.10.75 control-plane parity
+## v1.10.76 control-plane parity
 
 - ✅ `POST /api/v1/dispatch/ticket`: prompt-free, signed, intent/node/expiry-scoped route disclosure ticket. V1 is disclosure-only; stateful redemption/node admission is deferred.
 - ✅ Intent-policy refusal for prohibited and high-risk capability/discovery intent families; transparency and general/custom intents remain routable.

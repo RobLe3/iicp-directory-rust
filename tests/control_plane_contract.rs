@@ -20,9 +20,9 @@ struct RustContract {
 
 #[test]
 fn rust_source_consumes_current_control_plane_contract() {
-    let contract: Contract = serde_json::from_str(include_str!("../parity/contract-v1.10.75.json"))
+    let contract: Contract = serde_json::from_str(include_str!("../parity/contract-v1.10.76.json"))
         .expect("valid control-plane contract");
-    assert_eq!(contract.contract_version, "v1.10.75");
+    assert_eq!(contract.contract_version, "v1.10.76");
     let source = [
         include_str!("../src/main.rs"),
         include_str!("../src/repo.rs"),
