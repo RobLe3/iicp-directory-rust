@@ -1,0 +1,6 @@
+.git
+.github
+.env
+.env.*
+backups
+target

@@ -10,3 +10,7 @@ The repository may be published as a pre-1.0 implementation when:
 - the maintainer explicitly authorizes the visibility change.
 
 Publication is not a production cutover.
+
+The dated assessment in `PUBLICATION_ASSESSMENT_2026-07-26.md` records the
+current evidence and remaining authorization gate. Passing technical checks
+does not change repository visibility.
