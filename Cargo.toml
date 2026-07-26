@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Rust reference implementation of the IICP directory control plane (read path first; federation per ADR-013)."
-repository = "https://github.com/RobLe3/iicp.network"
+repository = "https://github.com/RobLe3/iicp-directory-rust"
 
 [dependencies]
 axum = "0.7"
