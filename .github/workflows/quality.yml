@@ -2,6 +2,8 @@ name: Rust directory quality
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -67,6 +69,7 @@ jobs:
 
   credit-debit-concurrency:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       mysql:
         image: mysql:8.0
@@ -138,4 +141,29 @@ jobs:
       - run: >-
           cargo test --locked
           expiry_racing_with_award_keeps_ledger_reconciled
+          -- --ignored
+
+  credit-transient-retries:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: iicp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      IICP_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/iicp?ssl-mode=DISABLED
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - run: >-
+          cargo test --locked
+          transient_credit_mutations_retry_once_and_reconcile
           -- --ignored
