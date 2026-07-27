@@ -2094,6 +2094,7 @@ mod tests {
             operator_url: None,
             policy_manifest: None,
             health_models: None,
+            routing_policy: crate::types::RoutingPolicyState::default(),
         }
     }
 

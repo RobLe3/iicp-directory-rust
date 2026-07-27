@@ -435,6 +435,7 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         operator_url: None,
         policy_manifest: payload.get("policy_manifest").cloned(),
         health_models: None, // #494 — populated by heartbeat events, not REGISTER
+        routing_policy: crate::types::RoutingPolicyState::default(),
     })
 }
 

@@ -28,6 +28,13 @@ fixtures through `contract-v1.10.80.json`. Registration recovery and rollback
 remain database-backed behavior: their shared case declarations complement,
 rather than replace, the disposable dual-MySQL parity gate.
 
+The shared ranking and eligibility primitives now run on the live Rust
+discovery path. Repository selection returns a bounded candidate set; the HTTP
+policy applies model/QoS admission, PHP-compatible scoring, deterministic
+tie-breaking and the caller limit. MySQL candidates carry capability, runtime,
+backend-stability, pricing, readiness and availability inputs internally;
+those inputs are not added to the public wire response.
+
 The goal is not merely to compile a Rust server. The Rust directory must be wire-compatible with the PHP/Laravel directory for clients, nodes, relays, the website and future replicas. The PHP seed remains production authority until live conformance and operational evidence justify a cutover.
 
 Status legend: ✅ done · 🔶 present but not full production equivalent · ⬜ not ported / intentionally PHP-only
