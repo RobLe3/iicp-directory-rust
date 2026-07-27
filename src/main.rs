@@ -12,6 +12,7 @@ mod background;
 mod behavior_contract;
 mod db;
 mod delegation;
+mod discovery_policy;
 mod federation;
 mod health;
 #[cfg(test)]
@@ -20,6 +21,8 @@ mod maintenance;
 mod policy;
 mod policy_manifest;
 mod recognition;
+mod registration;
+mod registration_store;
 mod replica;
 mod repo;
 mod reputation;
@@ -209,7 +212,6 @@ const EXPOSURE_MODES: [&str; 8] = [
 ];
 
 /// ADR-019 pricing_model vocabulary — enum parity with PHP (#401 / AL2).
-const PRICING_MODELS: [&str; 3] = ["per_token", "per_request", "flat"];
 
 /// Process start instant — backs `server.uptime_seconds` in `/v1/stats` (PHP parity).
 /// Set once in `main`; unset in tests (uptime reports 0).
@@ -518,32 +520,11 @@ async fn discover(
     if let Some(classification) = policy::IntentPolicyGuard::public_mesh_refusal(&intent) {
         return policy_reject(&classification).into_response();
     }
-    // DIR-DISC-09: min_reputation out of [0, 1] MUST return 422 (out-of-range input rejected).
-    // PHP validates min:0 AND max:1 — a NEGATIVE value must 422 too (the old check only
-    // caught > 1.0, silently accepting e.g. -0.5 despite the "[0, 1]" error text).
-    if let Some(mr) = p.min_reputation {
-        if !(0.0..=1.0).contains(&mr) {
-            return axum::response::Response::builder()
-                .status(422)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "error": {"code": "validation_error", "message": "min_reputation must be in [0, 1]"}
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap();
-        }
+    if let Err(message) = discovery_policy::validate_min_reputation(p.min_reputation) {
+        return reject("validation_error", message).into_response();
     }
-    if p.qos
-        .as_deref()
-        .is_some_and(|qos| !matches!(qos, "realtime" | "interactive" | "batch" | "best-effort"))
-    {
-        return reject(
-            "validation_error",
-            "qos must be realtime, interactive, batch, or best-effort",
-        )
-        .into_response();
+    if let Err(message) = discovery_policy::validate_qos(p.qos.as_deref()) {
+        return reject("validation_error", message).into_response();
     }
     let requested_limit = p.limit.unwrap_or(10).clamp(1, 50);
     let started = Instant::now();
@@ -560,67 +541,18 @@ async fn discover(
         })
         .await;
     let repository_ms = repository_started.elapsed().as_secs_f64() * 1000.0;
-    // CIP-D1 filter: cip_capable=1 → only return CIP-Provider nodes (DIR-CIP-02).
-    let nodes = if matches!(p.cip_capable.as_deref(), Some("1") | Some("true")) {
-        nodes
-            .into_iter()
-            .filter(|n| n.cip_conformance_level.as_deref() == Some("CIP-Provider"))
-            .collect()
-    } else {
-        nodes
-    };
-    // #494 — health_models=[] means the runtime has no models loaded; exclude from ALL discover.
-    // health_models=None means not yet reported → keep (backward compat). PHP NodeScorer parity.
-    let nodes: Vec<types::Node> = nodes
-        .into_iter()
-        .filter(|n| n.health_models.as_ref().map_or(true, |hm| !hm.is_empty()))
-        .collect();
-    // #494 — ?model= filter: prefer health_models (live); fall back to static models list.
-    // Nodes with health_models=[] are already excluded above.
-    let mut nodes: Vec<types::Node> = nodes
-        .into_iter()
-        .filter(|node| {
-            behavior_contract::eligible(
-                &behavior_contract::EligibilityInput {
-                    health_models: node.health_models.as_deref(),
-                    models: &node.models,
-                    backend_state: node.routing_policy.backend_state.as_deref(),
-                    reputation: node.reputation_score,
-                    tasks: node.completed_tasks_count,
-                },
-                p.model.as_deref(),
-                p.qos.as_deref(),
-                p.min_reputation.unwrap_or(0.0),
-            )
-        })
-        .map(|mut node| {
-            node.score = behavior_contract::ranking_score(
-                &behavior_contract::RankingInput {
-                    availability: node.routing_policy.availability_score,
-                    load: node.load,
-                    active_jobs: node.active_jobs,
-                    max_concurrent: node.max_concurrent,
-                    region: &node.region,
-                    reputation: Some(node.reputation_score),
-                    models: node.health_models.as_deref().unwrap_or(&node.models),
-                    pricing: node.routing_policy.pricing_credits_per_1000,
-                    sdk_current: sdk_status(node.sdk_version.as_deref()) == "current",
-                    cx_key: node.public_key.is_some(),
-                },
-                p.region.as_deref(),
-                p.model.as_deref(),
-            );
-            node
-        })
-        .collect();
-    nodes.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.node_id.cmp(&right.node_id))
-    });
-    nodes.truncate(requested_limit);
+    let nodes = discovery_policy::select_and_rank(
+        nodes,
+        &discovery_policy::SelectionRequest {
+            model: p.model.as_deref(),
+            qos: p.qos.as_deref(),
+            region: p.region.as_deref(),
+            min_reputation: p.min_reputation.unwrap_or(0.0),
+            limit: requested_limit,
+            cip_capable: matches!(p.cip_capable.as_deref(), Some("1") | Some("true")),
+        },
+        |version| sdk_status(version) == "current",
+    );
     // Enrich with server-side derived fields (PHP NodeScorer parity).
     let enrichment_started = Instant::now();
     let mut enriched = Vec::with_capacity(nodes.len());
@@ -2320,45 +2252,6 @@ fn register_rate_step(prev: Option<(u32, u64)>, now_ms: u64, ttl_ms: u64) -> (u3
 /// rotate when its old endpoint is dead (migration-safe); an attacker pointing a victim's
 /// `node_id` at a live, different endpoint is rejected. Pure so the rule is unit-tested;
 /// the handler supplies `old_endpoint_alive` from a liveness probe.
-fn endpoint_change_allowed(
-    endpoint_changed: bool,
-    has_token_ownership: bool,
-    old_endpoint_alive: bool,
-) -> bool {
-    if !endpoint_changed {
-        return true; // same endpoint → ordinary refresh, always fine
-    }
-    if has_token_ownership {
-        return true; // proven owner may rotate even while the old endpoint is alive
-    }
-    !old_endpoint_alive // no token: allow only if the old endpoint is gone
-}
-
-fn e050_routing_change_allowed(
-    strict: bool,
-    secured: bool,
-    endpoint_changed: bool,
-    transport_endpoint_changed: bool,
-    relay_endpoint_changed: bool,
-    has_token_ownership: bool,
-    old_endpoint_alive: bool,
-) -> bool {
-    let routing_changed = endpoint_changed || transport_endpoint_changed || relay_endpoint_changed;
-    if has_token_ownership {
-        return true;
-    }
-    // Strict mode must also protect credential rotation. Otherwise a caller
-    // can first re-register the same route without a token, receive a fresh
-    // token, and then use it to authorize a routing change.
-    if strict && secured {
-        return false;
-    }
-    if !routing_changed {
-        return true;
-    }
-    endpoint_change_allowed(endpoint_changed, false, old_endpoint_alive)
-}
-
 fn relay_endpoint(metadata: Option<&serde_json::Value>) -> Option<&str> {
     metadata
         .and_then(serde_json::Value::as_object)
@@ -2399,25 +2292,6 @@ struct PendingRegistration {
     declared_reachable: bool,
 }
 
-fn resolve_registration_node_id(requested: Option<&str>) -> Result<String, &'static str> {
-    let Some(custom_id) = requested.filter(|value| !value.is_empty()) else {
-        return Ok(uuid::Uuid::new_v4().to_string());
-    };
-    let properties = (
-        custom_id.len() <= 36,
-        custom_id.as_bytes()[0].is_ascii_alphanumeric(),
-        custom_id.chars().all(|character| {
-            matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | ':' | '-')
-        }),
-    );
-    match properties {
-        (true, true, true) => Ok(custom_id.to_string()),
-        _ => Err(
-            "node_id must start with [a-zA-Z0-9] and contain only [a-zA-Z0-9._:-], max 36 chars",
-        ),
-    }
-}
-
 fn validate_registration_request(
     request: &RegisterRequest,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -2454,19 +2328,10 @@ fn validate_registration_shape(
             "at least one capability is required",
         ));
     }
-    const BACKENDS: &[&str] = &[
-        "ollama",
-        "lmstudio",
-        "vllm",
-        "llamacpp",
-        "meshllm",
-        "anthropic",
-        "custom",
-    ];
     if request
         .backend
         .as_deref()
-        .is_some_and(|backend| !BACKENDS.contains(&backend))
+        .is_some_and(|backend| !registration::BACKENDS.contains(&backend))
     {
         return Some(reject(
             "validation_error",
@@ -2673,7 +2538,7 @@ async fn registration_ownership_rejection(
     } else {
         false
     };
-    if e050_routing_change_allowed(
+    if registration::routing_change_allowed(
         state.strict_e050_secured,
         secured,
         endpoint_changed,
@@ -2782,7 +2647,7 @@ async fn register(
     let recovered = req.node_id.as_deref().is_some_and(|s| !s.is_empty());
     // PHP validates node_id format: alphanumeric start, then [a-zA-Z0-9._:-], max 36 chars.
     // If a custom node_id is supplied, validate it before assigning.
-    let node_id = match resolve_registration_node_id(req.node_id.as_deref()) {
+    let node_id = match registration::resolve_node_id(req.node_id.as_deref()) {
         Ok(node_id) => node_id,
         Err(message) => return reject("validation_error", message),
     };
@@ -2830,29 +2695,29 @@ async fn register(
         return rejection;
     }
 
-    if req.availability.iter().any(|window| {
-        !valid_hhmm(&window.start)
-            || !valid_hhmm(&window.end)
-            || !(0.0..=1.0).contains(&window.share)
-    }) {
+    if !registration::valid_availability(
+        req.availability
+            .iter()
+            .map(|window| (window.start.as_str(), window.end.as_str(), window.share)),
+    ) {
         return reject("validation_error", "invalid availability window");
     }
     if req.pricing.as_ref().is_some_and(|pricing| {
-        !(0.0..=1000.0).contains(&pricing.credit_cost_multiplier)
-            || !PRICING_MODELS.contains(&pricing.pricing_model.as_str())
+        !registration::valid_pricing(pricing.credit_cost_multiplier, &pricing.pricing_model)
     }) {
         return reject("validation_error", "invalid pricing declaration");
     }
-    let advertised_models: Vec<String> = req
-        .capabilities
-        .iter()
-        .flat_map(|capability| capability.models.iter().cloned())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    let pricing_multiplier = req.pricing.as_ref().map_or(1.0, |pricing| {
-        behavior_contract::pricing_multiplier(&advertised_models, pricing.credit_cost_multiplier)
-    });
+    let advertised_models = registration::advertised_models(
+        req.capabilities
+            .iter()
+            .map(|capability| capability.models.as_slice()),
+    );
+    let pricing_multiplier = registration::bounded_pricing(
+        &advertised_models,
+        req.pricing
+            .as_ref()
+            .map(|pricing| pricing.credit_cost_multiplier),
+    );
     let node = types::Node {
         node_id: node_id.clone(),
         endpoint: req.endpoint.clone(),
@@ -2970,18 +2835,6 @@ async fn register(
     .await
 }
 
-fn valid_hhmm(value: &str) -> bool {
-    let mut parts = value.split(':');
-    matches!(
-        (
-            parts.next().and_then(|part| part.parse::<u8>().ok()),
-            parts.next().and_then(|part| part.parse::<u8>().ok()),
-            parts.next()
-        ),
-        (Some(0..=23), Some(0..=59), None)
-    )
-}
-
 // ── heartbeat (iicp-dir §3.2) ─────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
@@ -3077,7 +2930,7 @@ async fn heartbeat(
     if let Some(ref pricing) = req.pricing {
         // AL2 (#401) — pricing_model enum parity with PHP: reject out-of-vocabulary values.
         if let Some(ref pm) = pricing.pricing_model {
-            if !PRICING_MODELS.contains(&pm.as_str()) {
+            if !registration::PRICING_MODELS.contains(&pm.as_str()) {
                 return reject("validation_error", &format!("invalid pricing_model: {pm}"));
             }
         }
@@ -3089,7 +2942,7 @@ async fn heartbeat(
                 .filter(|node| node.node_id == req.node_id)
                 .map(|node| node.models)
                 .unwrap_or_default();
-            let multiplier = behavior_contract::pricing_multiplier(&models, multiplier);
+            let multiplier = registration::bounded_pricing(&models, Some(multiplier));
             st.repo
                 .update_pricing(&req.node_id, multiplier, pricing.pricing_model.as_deref())
                 .await;
@@ -8678,17 +8531,17 @@ mod tests {
     #[test]
     fn e050_endpoint_change_ownership_matrix() {
         // Same endpoint → ordinary refresh, always allowed (downlevel re-register).
-        assert!(super::endpoint_change_allowed(false, false, true));
-        assert!(super::endpoint_change_allowed(false, false, false));
+        assert!(registration::endpoint_change_allowed(false, false, true));
+        assert!(registration::endpoint_change_allowed(false, false, false));
         // Endpoint change WITH token ownership → allowed even if the old endpoint is alive
         // (an owner legitimately rotating a live tunnel).
-        assert!(super::endpoint_change_allowed(true, true, true));
+        assert!(registration::endpoint_change_allowed(true, true, true));
         // Endpoint change, NO token, old endpoint dead → allowed (migration-safe rotation
         // for downlevel clients that don't send current_node_token yet).
-        assert!(super::endpoint_change_allowed(true, false, false));
+        assert!(registration::endpoint_change_allowed(true, false, false));
         // Endpoint change, NO token, old endpoint still alive → REJECTED (hijack attempt:
         // pointing a victim's node_id at a live different endpoint).
-        assert!(!super::endpoint_change_allowed(true, false, true));
+        assert!(!registration::endpoint_change_allowed(true, false, true));
     }
 
     #[test]
@@ -8698,7 +8551,7 @@ mod tests {
         assert_eq!(fixture["schema"], "iicp.e050_strict_parity.v0");
         for case in fixture["cases"].as_array().unwrap() {
             let input = &case["input"];
-            let actual = super::e050_routing_change_allowed(
+            let actual = registration::routing_change_allowed(
                 input["strict"].as_bool().unwrap(),
                 input["secured"].as_bool().unwrap(),
                 input["endpoint_changed"].as_bool().unwrap(),
