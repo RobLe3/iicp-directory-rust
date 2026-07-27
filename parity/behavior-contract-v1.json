@@ -1,0 +1,74 @@
+{
+  "authority": {
+    "php_commit": "08fa5f9",
+    "runtime_version": "v1.10.80.1"
+  },
+  "eligibility_cases": [
+    {
+      "candidates": [
+        {"backend": "ollama", "health_models": null, "id": "fallback-capability", "models": ["model-a"], "reputation": 0.7, "tasks": 150},
+        {"backend": "ollama", "health_models": [], "id": "empty-health", "models": ["model-a"], "reputation": 0.9, "tasks": 2000},
+        {"backend_state": "draining", "health_models": ["model-a"], "id": "unstable-backend", "models": ["model-a"], "reputation": 0.9, "tasks": 2000},
+        {"backend": "ollama", "health_models": ["model-a"], "id": "eligible", "models": ["model-a"], "reputation": 0.85, "tasks": 1200}
+      ],
+      "expected_ids": ["fallback-capability", "eligible"],
+      "min_reputation": 0.6,
+      "model": "model-a",
+      "name": "model_and_minimum_reputation",
+      "qos": null
+    },
+    {
+      "candidates": [
+        {"backend": "ollama", "health_models": ["model-a"], "id": "below-realtime", "models": ["model-a"], "reputation": 0.79, "tasks": 999},
+        {"backend": "ollama", "health_models": ["model-a"], "id": "realtime", "models": ["model-a"], "reputation": 0.8, "tasks": 1000}
+      ],
+      "expected_ids": ["realtime"],
+      "min_reputation": 0.0,
+      "model": null,
+      "name": "realtime_boundary",
+      "qos": "realtime"
+    }
+  ],
+  "endpoint_cases": [
+    {"blocked": true, "ip": "127.0.0.1", "name": "loopback_ipv4"},
+    {"blocked": true, "ip": "10.0.0.1", "name": "private_ipv4"},
+    {"blocked": true, "ip": "::1", "name": "loopback_ipv6"},
+    {"blocked": true, "ip": "fc00::1", "name": "private_ipv6"},
+    {"blocked": false, "ip": "8.8.8.8", "name": "public_ipv4"},
+    {"blocked": false, "ip": "2606:4700:4700::1111", "name": "public_ipv6"}
+  ],
+  "pricing_cases": [
+    {"declared": 100.0, "expected": 0.15, "models": ["model-0.5b"], "name": "sub_one_billion_ceiling"},
+    {"declared": 100.0, "expected": 3.0, "models": ["model-7b"], "name": "seven_billion_ceiling"},
+    {"declared": 100.0, "expected": 19.5, "models": ["model-30b"], "name": "thirty_billion_ceiling"},
+    {"declared": 0.1, "expected": 0.1, "models": ["model-70b"], "name": "below_ceiling_unchanged"}
+  ],
+  "ranking_cases": [
+    {
+      "expected": 0.878,
+      "name": "standard_region_match",
+      "node": {"active_jobs": 2, "cx_key": true, "load": 0.2, "max_concurrent": 10, "models": ["model-a"], "pricing": null, "region": "eu-west", "reputation": 0.7, "sdk_current": true},
+      "requested_model": null,
+      "requested_region": "eu-west"
+    },
+    {
+      "expected": 0.88,
+      "name": "model_price_exact_match",
+      "node": {"active_jobs": 2, "cx_key": true, "load": 0.2, "max_concurrent": 10, "models": ["model-a"], "pricing": 2.0, "region": "eu-west", "reputation": 0.7, "sdk_current": true},
+      "requested_model": "model-a",
+      "requested_region": "eu-west"
+    },
+    {
+      "expected": 0.578,
+      "name": "neutral_defaults_readiness_demotion",
+      "node": {"active_jobs": 2, "cx_key": false, "load": 0.2, "max_concurrent": 10, "models": ["model-a"], "pricing": null, "region": "eu-west", "reputation": null, "sdk_current": false},
+      "requested_model": "missing-model",
+      "requested_region": null
+    }
+  ],
+  "registration_cases": [
+    {"expected": {"availability_rows": 1, "capability_rows": 1, "node_rows": 1, "recovered": true}, "name": "recovery_replaces_relations"},
+    {"expected": {"availability_rows": 0, "capability_rows": 0, "node_rows": 0, "status": 422}, "name": "revoked_operator_rolls_back"}
+  ],
+  "schema": "iicp.directory.behavior-contract.v1"
+}
