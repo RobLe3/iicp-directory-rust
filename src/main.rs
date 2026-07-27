@@ -2807,6 +2807,14 @@ async fn register(
         &node_id,
         delegation::now_unix(),
     );
+    if let Some(operator_pubkey) = operator_pubkey.as_deref() {
+        if st.repo.operator_identity_active(operator_pubkey).await == Some(false) {
+            return reject(
+                "validation_error",
+                "operator delegation references an inactive identity",
+            );
+        }
+    }
     // #463/#464 — capture before operator_pubkey moves into the Node, for the operators upsert.
     let operator_pubkey_for_upsert = operator_pubkey.clone();
 
@@ -6839,6 +6847,39 @@ mod tests {
         assert!(node.operator_verified);
         assert_eq!(node.operator_pubkey.as_deref(), Some(op_pub.as_str()));
         assert_eq!(node.operator_trust_tier.as_deref(), Some("did_key"));
+    }
+
+    #[tokio::test]
+    async fn register_with_revoked_operator_delegation_rolls_back() {
+        let state = test_state();
+        let node_id = "revoked-operator-registration";
+        let (delegation, operator_pubkey) =
+            signed_delegation_with_seed(node_id, delegation::now_unix() + 3600, 71);
+        state
+            .repo
+            .upsert_operator(&operator_pubkey, None, None, None)
+            .await;
+        state
+            .repo
+            .revoke_operator_identity(&operator_pubkey, "operator_request")
+            .await
+            .expect("revoke test operator");
+
+        let response = app(state.clone())
+            .oneshot(post_register(serde_json::json!({
+                "node_id": node_id,
+                "endpoint": "https://1.1.1.1",
+                "capabilities": [{
+                    "intent": "urn:iicp:intent:llm:chat:v1",
+                    "models": ["model-a"]
+                }],
+                "availability": [{"start": "08:00", "end": "17:00", "share": 1.0}],
+                "operator_delegation": delegation
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(state.repo.get(node_id).await.is_none());
     }
 
     // #463/#310/#464 (#385 parity with PHP OperatorRecordTest) — a verified delegation +
