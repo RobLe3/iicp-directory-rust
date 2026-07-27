@@ -1,0 +1,354 @@
+{
+  "authority": {
+    "php_commit": "08fa5f9",
+    "runtime_version": "v1.10.80.1"
+  },
+  "canonical_prefix": "/api/v1",
+  "routes": [
+    {
+      "auth": "node_token",
+      "classification": "telemetry_compliance_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/audit-report",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/badge/{tier}",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "federation_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/bootstrap",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "telemetry_compliance_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/compliance-attestation",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/conformance/badges",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/conformance/submit",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/conformance/verify",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/consumer-token",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/credits/award",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/credits/balance",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/credits/quote",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/credits/summary",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/credits/transactions",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/directory-key",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "supported_protocol_api",
+      "method": "GET",
+      "openapi_path": "/discover",
+      "path": "/discover",
+      "success_status": 200
+    },
+    {
+      "auth": "public",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/dispatch/ticket",
+      "path": "/dispatch/ticket",
+      "success_status": 201
+    },
+    {
+      "auth": "public",
+      "classification": "federation_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/events",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/heartbeat",
+      "path": "/heartbeat",
+      "success_status": 200
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/leaderboards/{board_id}",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/me",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "supported_protocol_api",
+      "method": "GET",
+      "openapi_path": "/node/{id}",
+      "path": "/node/{id}",
+      "success_status": 200
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/operator/acceptance",
+      "path": "/operator/acceptance",
+      "success_status": 200
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/operator/challenge",
+      "path": "/operator/challenge",
+      "success_status": 200
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/operator/dsr/anonymize",
+      "path": "/operator/dsr/anonymize",
+      "success_status": 200
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/operator/dsr/export",
+      "path": "/operator/dsr/export",
+      "success_status": 200
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/operator/dsr/restrict",
+      "path": "/operator/dsr/restrict",
+      "success_status": 200
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/operator/key/revoke",
+      "success_status": null
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/operator/key/rotate",
+      "success_status": null
+    },
+    {
+      "auth": "signed_operator_request",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/operator/rename",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "federation_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/peers",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "telemetry_compliance_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/probe",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "DELETE",
+      "openapi_path": null,
+      "path": "/register",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "supported_protocol_api",
+      "method": "POST",
+      "openapi_path": "/register",
+      "path": "/register",
+      "success_status": 201
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/registry/intents",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/registry/nodes",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/registry/nodes/{prefix}",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/registry/stats",
+      "success_status": null
+    },
+    {
+      "auth": "node_token",
+      "classification": "authenticated_protocol_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/relay/ticket",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "federation_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/replicas/register",
+      "success_status": null
+    },
+    {
+      "auth": "replica_token",
+      "classification": "federation_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/snapshot",
+      "success_status": null
+    },
+    {
+      "auth": "public",
+      "classification": "public_directory_extension_unprojected",
+      "method": "GET",
+      "openapi_path": null,
+      "path": "/stats",
+      "success_status": null
+    },
+    {
+      "auth": "proxy_token",
+      "classification": "telemetry_compliance_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/telemetry",
+      "success_status": null
+    },
+    {
+      "auth": "probe_token",
+      "classification": "telemetry_compliance_extension_unprojected",
+      "method": "POST",
+      "openapi_path": null,
+      "path": "/telemetry/probe",
+      "success_status": null
+    }
+  ],
+  "schema": "iicp.directory.http-contract.v1"
+}
