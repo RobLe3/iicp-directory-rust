@@ -1,9 +1,9 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
-Last refreshed: **2026-07-27**. The reconciled route-level fixture remains
-`v1.10.76`; the active refresh target is the hardened PHP source baseline
-`v1.10.80.1` at `08fa5f9`. Historical contracts remain immutable evidence and
-are not current production-version claims.
+Last refreshed: **2026-07-27**. Rust now consumes the PHP authority's normalized
+`parity/http-contract-v1.json` for runtime `v1.10.80.1` at `08fa5f9`. The older
+`contract-v1.10.76.json` remains immutable capability evidence; neither fixture
+is a production cutover claim.
 
 > **Status:** this Rust implementation is a reconciled parity baseline, not a
 > cutover-ready replacement. Operator acceptance/DSR routes, signed policy-manifest
@@ -16,6 +16,11 @@ The post-`v1.10.76` refresh is tracked by issue #1 and its bounded follow-ups.
 Signed-event appends now use the PHP-compatible durable, row-locked chain head;
 credit concurrency, shared policy/registration characterization and operator
 distribution evidence remain open and must not be inferred from this increment.
+
+The HTTP fixture is copied byte-for-byte from the PHP repository. Rust CI pins
+its digest and checks all 43 canonical method/path pairs plus the finite auth
+and documented success-status vocabularies. Behavioral policy parity remains a
+separate gate; route acknowledgement alone does not prove equivalent outcomes.
 
 The goal is not merely to compile a Rust server. The Rust directory must be wire-compatible with the PHP/Laravel directory for clients, nodes, relays, the website and future replicas. The PHP seed remains production authority until live conformance and operational evidence justify a cutover.
 
