@@ -69,6 +69,7 @@ jobs:
 
   credit-debit-concurrency:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       mysql:
         image: mysql:8.0
