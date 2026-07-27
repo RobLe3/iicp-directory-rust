@@ -5,6 +5,7 @@ The repository may be published as a pre-1.0 implementation when:
 - current and full-history secret scans are resolved;
 - `cargo fmt --check` and `cargo test --locked` pass from a clean checkout;
 - PHP/Rust parity fixtures and runtime gates pass;
+- the non-root, read-only operator distribution rehearsal passes locally;
 - production topology, credentials, backups and operator data are absent;
 - the README accurately distinguishes route parity from production equivalence;
 - the maintainer explicitly authorizes the visibility change.

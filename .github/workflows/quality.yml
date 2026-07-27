@@ -1,9 +1,6 @@
 name: Rust directory quality
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
@@ -16,6 +13,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: docker build --pull -t iicp-directory-rust:quality .
+      - run: test "$(docker image inspect iicp-directory-rust:quality --format '{{.Config.User}}')" = "10001:10001"
 
   event-log-concurrency:
     runs-on: ubuntu-latest
