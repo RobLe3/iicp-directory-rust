@@ -14,19 +14,23 @@ is a production cutover claim.
 
 The post-`v1.10.76` refresh is tracked by issue #1 and its bounded follow-ups.
 Signed-event appends now use the PHP-compatible durable, row-locked chain head;
-credit concurrency, shared policy/registration characterization and operator
-distribution evidence remain open and must not be inferred from this increment.
+credit concurrency, transient retries, runtime discovery policy and
+transactional registration recovery/rollback are complete. Maintainability
+extraction and hardened operator-distribution evidence remain separately
+tracked by #12 and #13.
 
 The HTTP fixture is copied byte-for-byte from the PHP repository. Rust CI pins
 its digest and checks all 43 canonical method/path pairs plus the finite auth
-and documented success-status vocabularies. Behavioral policy parity remains a
-separate gate; route acknowledgement alone does not prove equivalent outcomes.
+and documented success-status vocabularies. Route acknowledgement alone does
+not prove equivalent outcomes; executable behavior fixtures and disposable
+database gates provide that separate evidence.
 
 Rust also executes the byte-identical `behavior-contract-v1.json` vectors for
 ranking, eligibility, pricing ceilings and endpoint-IP refusal, and pins both
 fixtures through `contract-v1.10.80.json`. Registration recovery and rollback
-remain database-backed behavior: their shared case declarations complement,
-rather than replace, the disposable dual-MySQL parity gate.
+remain database-backed behavior. The disposable dual-MySQL gate executes both
+named cases and retains the independent atomic persistence-failure rollback
+proof.
 
 The shared ranking and eligibility primitives now run on the live Rust
 discovery path. Repository selection returns a bounded candidate set; the HTTP

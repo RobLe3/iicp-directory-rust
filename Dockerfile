@@ -19,10 +19,13 @@ FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bb
 # rustls (not OpenSSL) → only ca-certificates needed for outbound TLS to the seed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
+    && groupadd --gid 10001 iicp \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin iicp \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/iicp-directory-rs /usr/local/bin/iicp-directory-rs
 EXPOSE 8090
 ENV RUST_LOG=info
+USER 10001:10001
 # DATABASE_URL → MySqlRepo (empty bootstrap or verify-only); IICP_REPLICA_MODE=true +
 # IICP_SEED_URL=<seed> → federate (tail the seed's signed event log, mirror state).
 CMD ["iicp-directory-rs"]
