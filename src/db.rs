@@ -19,6 +19,13 @@ use crate::repo::{
 use crate::reputation;
 use crate::types::Node;
 
+fn is_transient_transaction_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database| database.code())
+        .is_some_and(|code| matches!(code.as_ref(), "1205" | "1213"))
+}
+
 // ── EMA helper ───────────────────────────────────────────────────────────────
 
 /// Apply proxy-observed latency EMA to nodes.avg_latency_ms (iicp-telemetry §4.3).
@@ -2588,52 +2595,109 @@ impl NodeRepository for MySqlRepo {
         node_id: &str,
         payload: &serde_json::Value,
     ) -> Option<i64> {
-        // Next monotonic seq (parity with PHP NodeEventLogger: max(seq)+1).
-        // CAST AS SIGNED: seq is BIGINT UNSIGNED; sqlx's strict decode fails decoding an
-        // unsigned column into i64, and the `.ok()?` silently swallowed it → early-return
-        // None → NO event ever persisted (the signed event log stayed empty). (#459 bug C)
-        // Next monotonic seq + the predecessor's signature, for the hash-chain (#458). The
-        // tip row (MAX(seq)) is the immediate predecessor; its signature seeds this event's
-        // prev_hash. NULL/empty (no prior signed event) → chain starts at GENESIS_ROOT.
-        let (max_seq, prev_sig): (i64, Option<String>) = sqlx::query_as(
-            "SELECT CAST(COALESCE(MAX(seq), 0) AS SIGNED), \
-             (SELECT signature FROM node_events ORDER BY seq DESC LIMIT 1) FROM node_events",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .ok()?;
-        let seq = max_seq + 1;
-        let prev_hash = crate::federation::prev_hash_from(prev_sig.as_deref());
-        let event_id = uuid::Uuid::new_v4().to_string();
-        let ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let sig = crate::federation::sign_event(
-            secret_key_hex,
-            &event_id,
-            event_type,
-            seq,
-            ts_ms,
-            payload,
-            &prev_hash,
-        );
-        sqlx::query(
-            "INSERT INTO node_events (event_id, seq, event_type, node_id, ts_ms, payload, prev_hash, signature) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&event_id)
-        .bind(seq)
-        .bind(event_type)
-        .bind(node_id)
-        .bind(ts_ms)
-        .bind(payload.to_string())
-        .bind(&prev_hash)
-        .bind(&sig)
-        .execute(&self.pool)
-        .await
-        .ok()?;
-        Some(seq)
+        const ATTEMPTS: usize = 3;
+
+        for attempt in 0..ATTEMPTS {
+            let mut tx = match self.pool.begin().await {
+                Ok(tx) => tx,
+                Err(error) => {
+                    eprintln!("signed event: transaction start failed: {error}");
+                    return None;
+                }
+            };
+
+            // The durable head survives event retention and serializes sequence/signature
+            // allocation across all writers. This is the same invariant as PHP
+            // NodeEventLogger; an absent row is a schema error, never a MAX(seq) fallback.
+            let head: Result<(i64, Option<String>), sqlx::Error> = sqlx::query_as(
+                "SELECT CAST(last_seq AS SIGNED), last_signature \
+                 FROM node_event_chain_heads WHERE chain_id = 'genesis' FOR UPDATE",
+            )
+            .fetch_one(&mut *tx)
+            .await;
+            let (last_seq, prev_sig) = match head {
+                Ok(head) => head,
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    eprintln!("signed event: chain head unavailable: {error}");
+                    return None;
+                }
+            };
+
+            let seq = last_seq + 1;
+            let prev_hash = crate::federation::prev_hash_from(prev_sig.as_deref());
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let sig = crate::federation::sign_event(
+                secret_key_hex,
+                &event_id,
+                event_type,
+                seq,
+                ts_ms,
+                payload,
+                &prev_hash,
+            );
+
+            let inserted = sqlx::query(
+                "INSERT INTO node_events \
+                 (event_id, seq, event_type, node_id, ts_ms, payload, prev_hash, signature) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&event_id)
+            .bind(seq)
+            .bind(event_type)
+            .bind(node_id)
+            .bind(ts_ms)
+            .bind(payload.to_string())
+            .bind(&prev_hash)
+            .bind(&sig)
+            .execute(&mut *tx)
+            .await;
+            if let Err(error) = inserted {
+                let retry = is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS;
+                let _ = tx.rollback().await;
+                if retry {
+                    continue;
+                }
+                eprintln!("signed event: append failed: {error}");
+                return None;
+            }
+
+            let advanced = sqlx::query(
+                "UPDATE node_event_chain_heads \
+                 SET last_seq = ?, last_signature = ?, updated_at = NOW() \
+                 WHERE chain_id = 'genesis'",
+            )
+            .bind(seq)
+            .bind(&sig)
+            .execute(&mut *tx)
+            .await;
+            if let Err(error) = advanced {
+                let retry = is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS;
+                let _ = tx.rollback().await;
+                if retry {
+                    continue;
+                }
+                eprintln!("signed event: chain-head update failed: {error}");
+                return None;
+            }
+
+            match tx.commit().await {
+                Ok(()) => return Some(seq),
+                Err(error) if is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS => {
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("signed event: commit failed: {error}");
+                    return None;
+                }
+            }
+        }
+
+        None
     }
 
     async fn upsert_operator(
@@ -3493,7 +3557,9 @@ impl NodeRepository for MySqlRepo {
 
 #[cfg(test)]
 mod tests {
-    use super::{credit_ttl_idle, median_outlier_weight};
+    use super::{credit_ttl_idle, init_pool, median_outlier_weight, MySqlRepo};
+    use crate::repo::NodeRepository;
+    use std::sync::Arc;
 
     fn s(vals: &[f64]) -> Vec<(f64,)> {
         vals.iter().map(|&v| (v,)).collect()
@@ -3555,5 +3621,75 @@ mod tests {
         assert!((median_outlier_weight(400.0, &sample) - 1.0).abs() < 1e-9);
         // 500 > 3*150=450 → outlier
         assert!((median_outlier_weight(500.0, &sample) - 0.1).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn concurrent_signed_event_appends_are_gap_free_and_chain_correct() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        let repo = Arc::new(MySqlRepo::new(pool.clone()));
+        let public_key = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let secret_key = format!("{}{}", "11".repeat(32), public_key);
+
+        let mut tasks = Vec::new();
+        for ordinal in 0..40 {
+            let repo = Arc::clone(&repo);
+            let secret_key = secret_key.clone();
+            tasks.push(tokio::spawn(async move {
+                repo.append_signed_event(
+                    &secret_key,
+                    "REGISTER",
+                    "concurrency-fixture",
+                    &serde_json::json!({"ordinal": ordinal}),
+                )
+                .await
+                .expect("append must succeed")
+            }));
+        }
+        let mut assigned = Vec::new();
+        for task in tasks {
+            assigned.push(task.await.expect("append task must join"));
+        }
+        assigned.sort_unstable();
+        assert_eq!(assigned, (1_i64..=40).collect::<Vec<_>>());
+
+        let events = repo.events_since(0, 100).await;
+        assert_eq!(events.len(), 40);
+        let mut expected_prev = crate::federation::GENESIS_ROOT.to_string();
+        for (offset, event) in events.iter().enumerate() {
+            assert_eq!(event.seq, offset as i64 + 1);
+            assert_eq!(event.prev_hash.as_deref(), Some(expected_prev.as_str()));
+            let signature = event.sig.as_deref().expect("event must be signed");
+            let message = crate::federation::event_message(
+                &event.event_id,
+                &event.event_type,
+                event.seq,
+                event.ts_ms,
+                &event.payload,
+                &expected_prev,
+            );
+            assert!(crate::federation::verify_event(
+                public_key, signature, &message
+            ));
+            expected_prev = crate::federation::prev_hash_from(Some(signature));
+        }
+
+        let head: (i64, Option<String>) = sqlx::query_as(
+            "SELECT CAST(last_seq AS SIGNED), last_signature \
+             FROM node_event_chain_heads WHERE chain_id = 'genesis'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read chain head");
+        assert_eq!(head.0, 40);
+        assert_eq!(
+            head.1.as_deref(),
+            events.last().and_then(|event| event.sig.as_deref())
+        );
     }
 }

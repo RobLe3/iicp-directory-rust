@@ -150,6 +150,16 @@ CREATE TABLE `node_address_history` (
   KEY `node_address_history_observed_at_index` (`observed_at`),
   CONSTRAINT `node_address_history_node_id_foreign` FOREIGN KEY (`node_id`) REFERENCES `nodes` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE `node_event_chain_heads` (
+  `chain_id` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `last_seq` bigint unsigned NOT NULL DEFAULT '0',
+  `last_signature` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT NULL,
+  `updated_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`chain_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+INSERT INTO `node_event_chain_heads` (`chain_id`, `last_seq`, `last_signature`, `created_at`, `updated_at`)
+VALUES ('genesis', 0, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 CREATE TABLE `node_events` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `event_id` char(36) COLLATE utf8mb4_unicode_ci NOT NULL,
