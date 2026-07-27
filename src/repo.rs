@@ -44,6 +44,7 @@ pub(crate) fn dispatch_usage_summary_value(
 pub struct NodeRecord {
     pub node: Node,
     pub intents: Vec<String>,
+    pub availability: Vec<AvailabilityWindow>,
     /// Plain token issued to the caller. The repository SHOULD hash this at rest;
     /// InMemoryRepo ignores it (no token auth in local/test mode).
     pub node_token: Option<String>,
@@ -53,6 +54,13 @@ pub struct NodeRecord {
     /// Separate proxy_token for ProxyTokenAuth (POST /v1/telemetry). Bcrypt-hashed at rest.
     /// PHP NodeRegistry issues this alongside node_token on every registration.
     pub proxy_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AvailabilityWindow {
+    pub start: String,
+    pub end: String,
+    pub share: f64,
 }
 
 /// Redacted repository failure surfaced to HTTP handlers. Concrete database
@@ -2102,6 +2110,7 @@ mod tests {
         NodeRecord {
             node: node(id, score, available, rep),
             intents: intents.iter().map(|s| s.to_string()).collect(),
+            availability: vec![],
             node_token: None,
             node_hmac_key: None,
             proxy_token: None,
