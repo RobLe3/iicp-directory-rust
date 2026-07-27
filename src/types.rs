@@ -156,6 +156,27 @@ pub struct Node {
     /// Used by discover to filter ?model= queries by what's actually running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_models: Option<Vec<String>>,
+    /// Internal PHP-parity inputs. These are never serialized directly; public
+    /// summaries are projected separately by the HTTP layer.
+    #[serde(skip, default)]
+    pub routing_policy: RoutingPolicyState,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutingPolicyState {
+    pub availability_score: f64,
+    pub backend_state: Option<String>,
+    pub pricing_credits_per_1000: Option<f64>,
+}
+
+impl Default for RoutingPolicyState {
+    fn default() -> Self {
+        Self {
+            availability_score: 1.0,
+            backend_state: None,
+            pricing_credits_per_1000: None,
+        }
+    }
 }
 
 /// PHP `credit_cost_multiplier ?? 1.0` default — used when deserialising a

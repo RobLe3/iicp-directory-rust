@@ -464,6 +464,16 @@ struct NodeRow {
     // null = not yet reported (backward compat); []/"[]" = no models live.
     #[sqlx(default)]
     health_models: Option<String>,
+    #[sqlx(default)]
+    capability_models: Option<String>,
+    #[sqlx(default)]
+    backend_stability: Option<String>,
+    #[sqlx(default)]
+    pricing_credits_per_1000: Option<f64>,
+    #[sqlx(default)]
+    cx_public_key: Option<String>,
+    #[sqlx(default)]
+    availability_score: f64,
 }
 
 fn tier_from_score(s: f64) -> String {
@@ -515,7 +525,11 @@ impl From<NodeRow> for Node {
             transport_endpoint: r.transport_endpoint,
             // allow_remote_inference not yet tracked — default CIP-None (S.12 §5.2 REP1).
             cip_conformance_level: Some("CIP-None".to_string()),
-            models: vec![],
+            models: r
+                .capability_models
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default(),
             pricing: None,
             // Phase 5 fields — MySQL columns pending Phase 5 migration; default None/empty.
             nat_type: None,
@@ -537,7 +551,10 @@ impl From<NodeRow> for Node {
             })),
             quantization: vec![],
             inference_engine: vec![],
-            public_key: None,
+            public_key: r
+                .cx_public_key
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok()),
             transport_metadata: None,
             // #400 — discover field parity. credit_cost_multiplier defaults to
             // 1.0 when the column was absent (sqlx default → 0.0 → coerce to 1.0).
@@ -573,6 +590,24 @@ impl From<NodeRow> for Node {
                 .health_models
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
+            routing_policy: crate::types::RoutingPolicyState {
+                availability_score: if r.availability_score > 0.0 {
+                    r.availability_score
+                } else {
+                    1.0
+                },
+                backend_state: r
+                    .backend_stability
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .and_then(|value| {
+                        value
+                            .get("backend_state")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    }),
+                pricing_credits_per_1000: r.pricing_credits_per_1000,
+            },
         }
     }
 }
@@ -1361,7 +1396,23 @@ impl NodeRepository for MySqlRepo {
                       n.load, n.active_jobs, n.max_concurrent, n.tasks_total,
                       n.avg_latency_ms, n.exposure_mode, n.transport_endpoint,
                       n.credit_cost_multiplier, n.pricing_model, n.attested, n.tasks_failed,
-                      n.public_reachable, n.relay_capable, n.backend, CAST(n.policy_manifest AS CHAR) AS policy_manifest
+                      n.public_reachable, n.relay_capable, n.backend,
+                      n.sdk_language, n.sdk_version,
+                      CAST(n.supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
+                      CAST(n.health_models AS CHAR) AS health_models,
+                      CAST(c.models AS CHAR) AS capability_models,
+                      CAST(n.backend_stability AS CHAR) AS backend_stability,
+                      CAST(n.pricing_credits_per_1000 AS DOUBLE) AS pricing_credits_per_1000,
+                      CAST(n.cx_public_key AS CHAR) AS cx_public_key,
+                      CAST(COALESCE(
+                        (SELECT aw.share FROM availability_windows aw
+                         WHERE aw.node_id = n.id AND CURTIME() BETWEEN aw.start_time AND aw.end_time
+                         ORDER BY aw.id ASC LIMIT 1),
+                        CASE WHEN EXISTS (
+                          SELECT 1 FROM availability_windows aw2 WHERE aw2.node_id = n.id
+                        ) THEN 0.5 ELSE 1.0 END
+                      ) AS DOUBLE) AS availability_score,
+                      CAST(n.policy_manifest AS CHAR) AS policy_manifest
                FROM nodes n
                INNER JOIN capabilities c ON c.node_id = n.id
                WHERE c.intent = ?

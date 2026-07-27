@@ -9,6 +9,7 @@
 
 mod auth;
 mod background;
+mod behavior_contract;
 mod db;
 mod delegation;
 mod federation;
@@ -433,6 +434,8 @@ struct DiscoverParams {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    qos: Option<String>,
+    #[serde(default)]
     profile_id: Option<String>,
     #[serde(default)]
     profile_version: Option<String>,
@@ -532,14 +535,27 @@ async fn discover(
                 .unwrap();
         }
     }
+    if p.qos
+        .as_deref()
+        .is_some_and(|qos| !matches!(qos, "realtime" | "interactive" | "batch" | "best-effort"))
+    {
+        return reject(
+            "validation_error",
+            "qos must be realtime, interactive, batch, or best-effort",
+        )
+        .into_response();
+    }
+    let requested_limit = p.limit.unwrap_or(10).clamp(1, 50);
     let started = Instant::now();
     let repository_started = Instant::now();
     let nodes = st
         .repo
         .discover(&DiscoverQuery {
             intent,
-            region: p.region,
-            limit: p.limit.unwrap_or(0),
+            region: p.region.clone(),
+            // Selection policy must see the complete bounded candidate set;
+            // ranking and caller limit are applied below.
+            limit: 50,
             min_reputation: p.min_reputation,
         })
         .await;
@@ -561,20 +577,50 @@ async fn discover(
         .collect();
     // #494 — ?model= filter: prefer health_models (live); fall back to static models list.
     // Nodes with health_models=[] are already excluded above.
-    let nodes: Vec<types::Node> = if let Some(ref model_filter) = p.model {
-        nodes
-            .into_iter()
-            .filter(|n| {
-                if let Some(ref hm) = n.health_models {
-                    hm.contains(model_filter)
-                } else {
-                    n.models.contains(model_filter)
-                }
-            })
-            .collect()
-    } else {
-        nodes
-    };
+    let mut nodes: Vec<types::Node> = nodes
+        .into_iter()
+        .filter(|node| {
+            behavior_contract::eligible(
+                &behavior_contract::EligibilityInput {
+                    health_models: node.health_models.as_deref(),
+                    models: &node.models,
+                    backend_state: node.routing_policy.backend_state.as_deref(),
+                    reputation: node.reputation_score,
+                    tasks: node.completed_tasks_count,
+                },
+                p.model.as_deref(),
+                p.qos.as_deref(),
+                p.min_reputation.unwrap_or(0.0),
+            )
+        })
+        .map(|mut node| {
+            node.score = behavior_contract::ranking_score(
+                &behavior_contract::RankingInput {
+                    availability: node.routing_policy.availability_score,
+                    load: node.load,
+                    active_jobs: node.active_jobs,
+                    max_concurrent: node.max_concurrent,
+                    region: &node.region,
+                    reputation: Some(node.reputation_score),
+                    models: node.health_models.as_deref().unwrap_or(&node.models),
+                    pricing: node.routing_policy.pricing_credits_per_1000,
+                    sdk_current: sdk_status(node.sdk_version.as_deref()) == "current",
+                    cx_key: node.public_key.is_some(),
+                },
+                p.region.as_deref(),
+                p.model.as_deref(),
+            );
+            node
+        })
+        .collect();
+    nodes.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    nodes.truncate(requested_limit);
     // Enrich with server-side derived fields (PHP NodeScorer parity).
     let enrichment_started = Instant::now();
     let mut enriched = Vec::with_capacity(nodes.len());
@@ -2827,6 +2873,7 @@ async fn register(
         operator_url: req.listing.as_ref().and_then(|l| l.operator_url.clone()),
         policy_manifest: req.policy_manifest.clone(),
         health_models: None, // #494 — populated by the first heartbeat with a backend URL
+        routing_policy: types::RoutingPolicyState::default(),
     };
     let intents = req.capabilities.iter().map(|c| c.intent.clone()).collect();
     commit_registration(
@@ -2948,6 +2995,14 @@ async fn heartbeat(
             }
         }
         if let Some(multiplier) = pricing.credit_cost_multiplier {
+            let models = st
+                .repo
+                .node_by_prefix(&req.node_id)
+                .await
+                .filter(|node| node.node_id == req.node_id)
+                .map(|node| node.models)
+                .unwrap_or_default();
+            let multiplier = behavior_contract::pricing_multiplier(&models, multiplier);
             st.repo
                 .update_pricing(&req.node_id, multiplier, pricing.pricing_model.as_deref())
                 .await;
@@ -4466,7 +4521,10 @@ fn resolve_probe_addresses(
 
 fn is_private_host(host: &str) -> bool {
     let h = host.trim_matches(|c| c == '[' || c == ']');
-    is_loopback_or_unspecified(h) || is_rfc1918_v4(h) || is_ipv6_private(h)
+    behavior_contract::blocked_ip(h)
+        || is_loopback_or_unspecified(h)
+        || is_rfc1918_v4(h)
+        || is_ipv6_private(h)
 }
 
 fn is_loopback_or_unspecified(h: &str) -> bool {
@@ -5589,6 +5647,7 @@ mod tests {
                 operator_url: None,
                 policy_manifest: None,
                 health_models: None,
+                routing_policy: types::RoutingPolicyState::default(),
             },
             intents: vec![chat.into()],
             node_token: None,
@@ -9335,6 +9394,7 @@ mod tests {
                 operator_url: None,
                 policy_manifest: None,
                 health_models: Some(vec![]), // explicitly empty — no models loaded
+                routing_policy: types::RoutingPolicyState::default(),
             },
             intents: vec![chat.into()],
             node_token: None,
@@ -9359,5 +9419,73 @@ mod tests {
             v["count"], 0,
             "#494: node with health_models=[] must be excluded from unfiltered discover (DIR-TRUST-01)"
         );
+    }
+
+    #[tokio::test]
+    async fn discover_runtime_policy_applies_qos_boundary_and_php_ranking() {
+        let chat = "urn:iicp:intent:llm:chat:v1";
+        let mut state = test_state();
+        let mut nodes = state
+            .repo
+            .discover(&DiscoverQuery {
+                intent: chat.into(),
+                limit: 50,
+                ..DiscoverQuery::default()
+            })
+            .await;
+        assert_eq!(nodes.len(), 2);
+        nodes[0].node_id = "below-realtime".into();
+        nodes[0].completed_tasks_count = 999;
+        nodes[0].reputation_score = 0.79;
+        nodes[0].region = "us".into();
+        nodes[0].models = vec!["model-a".into()];
+        nodes[0].health_models = Some(vec!["model-a".into()]);
+        nodes[1].node_id = "realtime".into();
+        nodes[1].completed_tasks_count = 1000;
+        nodes[1].reputation_score = 0.8;
+        nodes[1].region = "eu".into();
+        nodes[1].models = vec!["model-a".into()];
+        nodes[1].health_models = Some(vec!["model-a".into()]);
+        state.repo = Arc::new(InMemoryRepo::new(
+            nodes
+                .into_iter()
+                .map(|node| NodeRecord {
+                    node,
+                    intents: vec![chat.into()],
+                    node_token: None,
+                    node_hmac_key: None,
+                    proxy_token: None,
+                })
+                .collect(),
+        ));
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/discover?intent=urn:iicp:intent:llm:chat:v1&qos=realtime&model=model-a&region=eu")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["nodes"][0]["node_id"], "realtime");
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_unknown_qos_before_repository_selection() {
+        let response = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/discover?intent=urn:iicp:intent:llm:chat:v1&qos=urgent")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
