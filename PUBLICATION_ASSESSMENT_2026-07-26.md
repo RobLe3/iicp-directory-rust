@@ -2,10 +2,10 @@
 
 ## Decision
 
-**DEFER pending explicit maintainer authorization.** The technical
-publication-preparation checks below pass, but this assessment does not change
-repository visibility or claim production equivalence with the PHP Genesis
-Seed.
+**READY FOR FINAL v0.1.0 CANDIDATE GATES; visibility still requires explicit
+authorization.** The technical publication-preparation checks below pass, but
+this assessment does not change repository visibility or claim production
+equivalence with the PHP Genesis Seed.
 
 ## Content-free evidence
 
@@ -32,9 +32,10 @@ Seed.
 
 Before any visibility change, rerun both history scanners against the exact
 candidate commit, verify the clean CI run, and obtain an explicit maintainer
-decision. Publication would expose a pre-1.0 reference implementation only; it
-would not deploy it, cut over the Genesis Seed, publish the IICP website or
-establish independent multi-root federation.
+decision. Publication would expose the second official directory
+implementation flavor as a pre-1.0 operator preview. It would not deploy it,
+cut over the Genesis Seed, deprecate PHP, publish the IICP website or establish
+independent multi-root federation.
 
 ## 2026-07-27 operator-evidence addendum
 
