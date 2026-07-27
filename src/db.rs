@@ -26,6 +26,89 @@ fn is_transient_transaction_error(error: &sqlx::Error) -> bool {
         .is_some_and(|code| matches!(code.as_ref(), "1205" | "1213"))
 }
 
+enum CreditMutationError {
+    NonceReplay,
+    NodeNotFound,
+    Database(sqlx::Error),
+}
+
+async fn record_credit_award_once(
+    pool: &Pool<MySql>,
+    node_id: &str,
+    amount: f64,
+    task_id: &str,
+    nonce: &str,
+) -> Result<f64, CreditMutationError> {
+    let mut tx = pool.begin().await.map_err(CreditMutationError::Database)?;
+    let node_balance: Option<(f64,)> =
+        sqlx::query_as("SELECT CAST(credit_balance AS DOUBLE) FROM nodes WHERE id = ? FOR UPDATE")
+            .bind(node_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(CreditMutationError::Database)?;
+    let Some((node_balance,)) = node_balance else {
+        return Err(CreditMutationError::NodeNotFound);
+    };
+
+    sqlx::query(
+        "INSERT INTO credits (node_id, balance, created_at, updated_at) \
+         VALUES (?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE node_id = VALUES(node_id)",
+    )
+    .bind(node_id)
+    .bind(node_balance)
+    .execute(&mut *tx)
+    .await
+    .map_err(CreditMutationError::Database)?;
+    let (ledger_balance,): (f64,) =
+        sqlx::query_as("SELECT CAST(balance AS DOUBLE) FROM credits WHERE node_id = ? FOR UPDATE")
+            .bind(node_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(CreditMutationError::Database)?;
+    if (ledger_balance - node_balance).abs() > 0.0001 {
+        return Err(CreditMutationError::Database(sqlx::Error::Protocol(
+            "credit ledger and node balance disagree".to_string(),
+        )));
+    }
+
+    let insert = sqlx::query(
+        "INSERT INTO credit_transactions \
+         (node_id, amount, type, task_id, nonce, reason, expires_at) \
+         VALUES (?, ?, 'credit', ?, ?, 'cip_award', NOW() + INTERVAL 90 DAY)",
+    )
+    .bind(node_id)
+    .bind(amount)
+    .bind(task_id)
+    .bind(nonce)
+    .execute(&mut *tx)
+    .await;
+    if let Err(error) = insert {
+        if error
+            .as_database_error()
+            .is_some_and(|database| database.is_unique_violation())
+        {
+            return Err(CreditMutationError::NonceReplay);
+        }
+        return Err(CreditMutationError::Database(error));
+    }
+
+    let new_balance = ((ledger_balance + amount) * 10_000.0).round() / 10_000.0;
+    sqlx::query("UPDATE credits SET balance = ?, updated_at = NOW() WHERE node_id = ?")
+        .bind(new_balance)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(CreditMutationError::Database)?;
+    sqlx::query("UPDATE nodes SET credit_balance = ? WHERE id = ?")
+        .bind(new_balance)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(CreditMutationError::Database)?;
+    tx.commit().await.map_err(CreditMutationError::Database)?;
+    Ok(new_balance)
+}
+
 // ── EMA helper ───────────────────────────────────────────────────────────────
 
 /// Apply proxy-observed latency EMA to nodes.avg_latency_ms (iicp-telemetry §4.3).
@@ -1798,76 +1881,24 @@ impl NodeRepository for MySqlRepo {
         task_id: &str,
         nonce: &str,
     ) -> Result<f64, CreditError> {
-        // Atomic nonce check + insert + balance update via BEGIN/COMMIT.
-        let mut tx = self.pool.begin().await.map_err(|error| {
-            eprintln!("credit award: begin transaction failed: {error}");
-            CreditError::DbError
-        })?;
-
-        let existing: Option<(i64,)> =
-            sqlx::query_as("SELECT COUNT(*) FROM credit_transactions WHERE nonce = ?")
-                .bind(nonce)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|error| {
-                    eprintln!("credit award: nonce lookup failed: {error}");
-                    CreditError::DbError
-                })?;
-        if existing.map(|(n,)| n > 0).unwrap_or(false) {
-            return Err(CreditError::NonceReplay);
-        }
-
-        // WQ-056 / billing §11: an earn stamps the credit TTL horizon (NOW() + 90 DAY).
-        // The nightly run_expire_credits_loop sweeps nodes whose newest earn is past TTL.
-        let insert_result = sqlx::query(
-            "INSERT INTO credit_transactions (node_id, amount, type, task_id, nonce, reason, expires_at) \
-             VALUES (?, ?, 'credit', ?, ?, 'cip_award', NOW() + INTERVAL 90 DAY)",
-        )
-        .bind(node_id)
-        .bind(amount)
-        .bind(task_id)
-        .bind(nonce)
-        .execute(&mut *tx)
-        .await;
-        if let Err(error) = insert_result {
-            if error
-                .as_database_error()
-                .is_some_and(|db_error| db_error.is_unique_violation())
-            {
-                return Err(CreditError::NonceReplay);
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
+            match record_credit_award_once(&self.pool, node_id, amount, task_id, nonce).await {
+                Ok(balance) => return Ok(balance),
+                Err(CreditMutationError::NonceReplay) => return Err(CreditError::NonceReplay),
+                Err(CreditMutationError::NodeNotFound) => return Err(CreditError::NodeNotFound),
+                Err(CreditMutationError::Database(error))
+                    if is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(CreditMutationError::Database(error)) => {
+                    eprintln!("credit award transaction failed: {error}");
+                    return Err(CreditError::DbError);
+                }
             }
-            eprintln!("credit award: ledger insert failed: {error}");
-            return Err(CreditError::DbError);
         }
-
-        sqlx::query("UPDATE nodes SET credit_balance = credit_balance + ? WHERE id = ?")
-            .bind(amount)
-            .bind(node_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                eprintln!("credit award: balance update failed: {error}");
-                CreditError::DbError
-            })?;
-
-        tx.commit().await.map_err(|error| {
-            eprintln!("credit award: commit failed: {error}");
-            CreditError::DbError
-        })?;
-
-        // Fetch updated balance. CAST AS DOUBLE — credit_balance is DECIMAL(15,4) and sqlx
-        // cannot decode DECIMAL straight into f64, so a bare SELECT errored → None → the award
-        // (already committed above) wrongly returned CreditError → 500, and the signed
-        // CREDIT_AWARD event was never emitted (#459 bug A). Same fix as credit_balance().
-        let row: Option<(f64,)> =
-            sqlx::query_as("SELECT CAST(credit_balance AS DOUBLE) FROM nodes WHERE id = ?")
-                .bind(node_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
-        row.map(|(b,)| Ok(b))
-            .unwrap_or(Err(CreditError::NodeNotFound))
+        Err(CreditError::DbError)
     }
 
     async fn debit_for_consumer(
@@ -3691,5 +3722,63 @@ mod tests {
             head.1.as_deref(),
             events.last().and_then(|event| event.sig.as_deref())
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn concurrent_credit_awards_preserve_dual_write_and_ledger_total() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min) \
+             VALUES ('credit-concurrency', 'https://example.invalid/v1', 'test', 'x', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed node");
+        let repo = Arc::new(MySqlRepo::new(pool.clone()));
+
+        let mut tasks = Vec::new();
+        for ordinal in 0..40 {
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.record_credit_award(
+                    "credit-concurrency",
+                    0.25,
+                    &format!("task-{ordinal}"),
+                    &format!("nonce-{ordinal}"),
+                )
+                .await
+                .expect("award must succeed")
+            }));
+        }
+        for task in tasks {
+            task.await.expect("award task must join");
+        }
+
+        let (node_balance, ledger_balance, transaction_total, transaction_count): (
+            f64,
+            f64,
+            f64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT CAST(n.credit_balance AS DOUBLE), CAST(c.balance AS DOUBLE), \
+                        CAST(SUM(t.amount) AS DOUBLE), COUNT(*) \
+                 FROM nodes n JOIN credits c ON c.node_id = n.id \
+                 JOIN credit_transactions t ON t.node_id = n.id AND t.type = 'credit' \
+                 WHERE n.id = 'credit-concurrency' GROUP BY n.id, n.credit_balance, c.balance",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read reconciled ledger");
+        assert_eq!(transaction_count, 40);
+        assert!((transaction_total - 10.0).abs() < 0.0001);
+        assert!((node_balance - 10.0).abs() < 0.0001);
+        assert!((ledger_balance - 10.0).abs() < 0.0001);
     }
 }
