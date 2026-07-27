@@ -1927,11 +1927,17 @@ impl NodeRepository for MySqlRepo {
                 };
             };
             let updated = sqlx::query(
-                "UPDATE nodes SET credit_balance = credit_balance - ? \
-                 WHERE id = ? AND credit_balance + 0.0001 >= ?",
+                "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
+                 SET n.credit_balance = n.credit_balance - ?, \
+                     c.balance = c.balance - ?, c.updated_at = NOW() \
+                 WHERE n.id = ? AND n.credit_balance + 0.0001 >= ? \
+                   AND c.balance + 0.0001 >= ? \
+                   AND ABS(n.credit_balance - c.balance) <= 0.0001",
             )
             .bind(amount)
+            .bind(amount)
             .bind(consumer_node_id)
+            .bind(amount)
             .bind(amount)
             .execute(&mut *tx)
             .await
@@ -2022,6 +2028,23 @@ impl NodeRepository for MySqlRepo {
                 break;
             }
             let take = remaining.min(balance);
+            let ledger: Option<(f64,)> = sqlx::query_as(
+                "SELECT CAST(balance AS DOUBLE) FROM credits WHERE node_id = ? FOR UPDATE",
+            )
+            .bind(&node_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap_or_default();
+            if ledger.is_none_or(|(ledger_balance,)| (ledger_balance - balance).abs() > 0.0001) {
+                let _ = tx.rollback().await;
+                return WalletDebitResult {
+                    debited: false,
+                    spent: 0.0,
+                    scope: "operator_wallet",
+                    reason: Some("db_error"),
+                    debit_count: 0,
+                };
+            }
             let tx_reason = if node_id == consumer_node_id {
                 reason.to_string()
             } else {
@@ -2030,13 +2053,19 @@ impl NodeRepository for MySqlRepo {
                     &consumer_node_id[..consumer_node_id.len().min(8)]
                 )
             };
-            let ok_update =
-                sqlx::query("UPDATE nodes SET credit_balance = credit_balance - ? WHERE id = ?")
-                    .bind(take)
-                    .bind(&node_id)
-                    .execute(&mut *tx)
-                    .await
-                    .is_ok();
+            let ok_update = sqlx::query(
+                "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
+                 SET n.credit_balance = n.credit_balance - ?, \
+                     c.balance = c.balance - ?, c.updated_at = NOW() \
+                 WHERE n.id = ? AND ABS(n.credit_balance - c.balance) <= 0.0001",
+            )
+            .bind(take)
+            .bind(take)
+            .bind(&node_id)
+            .execute(&mut *tx)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .unwrap_or(false);
             let ok_insert = sqlx::query(
                 "INSERT INTO credit_transactions (node_id, amount, type, task_id, reason) \
                  VALUES (?, ?, 'debit', ?, ?)",
@@ -2114,9 +2143,13 @@ impl NodeRepository for MySqlRepo {
             // Re-read + zero under the transaction; insert the ttl_expire debit for the
             // swept amount (mirrors the PHP expire row; preserves balance==earned−debits).
             let ok = sqlx::query(
-                "UPDATE nodes SET credit_balance = 0 WHERE id = ? AND credit_balance > 0",
+                "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
+                 SET n.credit_balance = 0, c.balance = 0, c.updated_at = NOW() \
+                 WHERE n.id = ? AND n.credit_balance = ? \
+                   AND ABS(n.credit_balance - c.balance) <= 0.0001",
             )
             .bind(&node_id)
+            .bind(balance)
             .execute(&mut *tx)
             .await
             .map(|r| r.rows_affected() > 0)
@@ -3780,5 +3813,208 @@ mod tests {
         assert!((transaction_total - 10.0).abs() < 0.0001);
         assert!((node_balance - 10.0).abs() < 0.0001);
         assert!((ledger_balance - 10.0).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn concurrent_node_debits_never_double_spend_or_drift() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, credit_balance) \
+             VALUES ('debit-concurrency', 'https://example.invalid/v1', 'test', 'x', 1, 1, 10)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed node");
+        sqlx::query(
+            "INSERT INTO credits (node_id, balance, created_at, updated_at) \
+             VALUES ('debit-concurrency', 10, NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed credit balance");
+        let repo = Arc::new(MySqlRepo::new(pool.clone()));
+
+        let mut tasks = Vec::new();
+        for ordinal in 0..20 {
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.debit_for_consumer(
+                    "debit-concurrency",
+                    1.0,
+                    &format!("task-{ordinal}"),
+                    "concurrency-test",
+                )
+                .await
+            }));
+        }
+        let mut successes = 0;
+        for task in tasks {
+            successes += u32::from(task.await.expect("debit task must join").debited);
+        }
+        assert_eq!(successes, 10);
+
+        let (node_balance, ledger_balance, debit_total, debit_count): (f64, f64, f64, i64) =
+            sqlx::query_as(
+                "SELECT CAST(n.credit_balance AS DOUBLE), CAST(c.balance AS DOUBLE), \
+                        CAST(SUM(t.amount) AS DOUBLE), COUNT(*) \
+                 FROM nodes n JOIN credits c ON c.node_id = n.id \
+                 JOIN credit_transactions t ON t.node_id = n.id AND t.type = 'debit' \
+                 WHERE n.id = 'debit-concurrency' GROUP BY n.id, n.credit_balance, c.balance",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reconciled ledger");
+        assert_eq!(debit_count, 10);
+        assert!((debit_total - 10.0).abs() < 0.0001);
+        assert!(node_balance.abs() < 0.0001);
+        assert!(ledger_balance.abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn concurrent_operator_wallet_debits_are_all_or_nothing() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        for (id, balance) in [("wallet-consumer", 3.0), ("wallet-peer", 4.0)] {
+            sqlx::query(
+                "INSERT INTO nodes \
+                 (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
+                  credit_balance, operator_pubkey) VALUES (?, 'https://example.invalid/v1', \
+                  'test', 'x', 1, 1, ?, 'shared-operator')",
+            )
+            .bind(id)
+            .bind(balance)
+            .execute(&pool)
+            .await
+            .expect("seed wallet node");
+            sqlx::query(
+                "INSERT INTO credits (node_id, balance, created_at, updated_at) \
+                 VALUES (?, ?, NOW(), NOW())",
+            )
+            .bind(id)
+            .bind(balance)
+            .execute(&pool)
+            .await
+            .expect("seed wallet credit");
+        }
+        let repo = Arc::new(MySqlRepo::new(pool.clone()));
+        let mut tasks = Vec::new();
+        for ordinal in 0..2 {
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.debit_for_consumer(
+                    "wallet-consumer",
+                    5.0,
+                    &format!("wallet-task-{ordinal}"),
+                    "wallet-test",
+                )
+                .await
+            }));
+        }
+        let mut successes = 0;
+        for task in tasks {
+            successes += u32::from(task.await.expect("wallet task must join").debited);
+        }
+        assert_eq!(successes, 1);
+
+        let rows: Vec<(f64, f64)> = sqlx::query_as(
+            "SELECT CAST(n.credit_balance AS DOUBLE), CAST(c.balance AS DOUBLE) \
+             FROM nodes n JOIN credits c ON c.node_id = n.id \
+             WHERE n.operator_pubkey = 'shared-operator' ORDER BY n.id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read wallet balances");
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|(node, ledger)| (node - ledger).abs() < 0.0001));
+        assert!((rows.iter().map(|(node, _)| node).sum::<f64>() - 2.0).abs() < 0.0001);
+        let (debit_total,): (f64,) = sqlx::query_as(
+            "SELECT CAST(SUM(amount) AS DOUBLE) FROM credit_transactions WHERE type = 'debit'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read wallet debit total");
+        assert!((debit_total - 5.0).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn expiry_racing_with_award_keeps_ledger_reconciled() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, credit_balance) \
+             VALUES ('expiry-race', 'https://example.invalid/v1', 'test', 'x', 1, 1, 5)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed node");
+        sqlx::query(
+            "INSERT INTO credits (node_id, balance, created_at, updated_at) \
+             VALUES ('expiry-race', 5, NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed balance");
+        sqlx::query(
+            "INSERT INTO credit_transactions \
+             (node_id, amount, type, nonce, reason, expires_at) \
+             VALUES ('expiry-race', 5, 'credit', 'expired-seed', 'seed', NOW() - INTERVAL 1 DAY)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed expired earn");
+        let repo = Arc::new(MySqlRepo::new(pool.clone()));
+        let expire_repo = Arc::clone(&repo);
+        let award_repo = Arc::clone(&repo);
+        let (expire, award) = tokio::join!(
+            tokio::spawn(async move { expire_repo.expire_idle_node_credits().await }),
+            tokio::spawn(async move {
+                award_repo
+                    .record_credit_award("expiry-race", 1.0, "fresh-task", "fresh-award")
+                    .await
+            })
+        );
+        expire.expect("expiry task must join");
+        award
+            .expect("award task must join")
+            .expect("award must succeed");
+
+        let (node_balance, ledger_balance): (f64, f64) = sqlx::query_as(
+            "SELECT CAST(n.credit_balance AS DOUBLE), CAST(c.balance AS DOUBLE) \
+             FROM nodes n JOIN credits c ON c.node_id = n.id WHERE n.id = 'expiry-race'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read balances");
+        let (credits, debits): (f64, f64) = sqlx::query_as(
+            "SELECT CAST(SUM(CASE WHEN type='credit' THEN amount ELSE 0 END) AS DOUBLE), \
+                    CAST(SUM(CASE WHEN type='debit' THEN amount ELSE 0 END) AS DOUBLE) \
+             FROM credit_transactions WHERE node_id = 'expiry-race'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read transaction totals");
+        assert!((node_balance - ledger_balance).abs() < 0.0001);
+        assert!((node_balance - (credits - debits)).abs() < 0.0001);
+        assert!(node_balance == 1.0 || node_balance == 6.0);
     }
 }
