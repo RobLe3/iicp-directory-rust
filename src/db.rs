@@ -669,8 +669,9 @@ async fn upsert_registered_node(
              (id, endpoint, region, available, relay_capable, node_token_hash, node_hmac_key,
               proxy_token_hash, max_concurrent, tokens_per_min, reputation_score, status,
               operator_pubkey, operator_verified, operator_trust_tier, backend,
-              supported_receipt_profiles, public_listing, operator_url, policy_manifest)
-           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+              supported_receipt_profiles, public_listing, operator_url, policy_manifest,
+              credit_cost_multiplier, pricing_model)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE
              endpoint = VALUES(endpoint), region = VALUES(region), available = 1,
              relay_capable = VALUES(relay_capable), status = 'active',
@@ -684,7 +685,9 @@ async fn upsert_registered_node(
              supported_receipt_profiles = VALUES(supported_receipt_profiles),
              public_listing = VALUES(public_listing),
              operator_url = VALUES(operator_url),
-             policy_manifest = VALUES(policy_manifest)
+             policy_manifest = VALUES(policy_manifest),
+             credit_cost_multiplier = VALUES(credit_cost_multiplier),
+             pricing_model = VALUES(pricing_model)
              -- reputation_score intentionally NOT updated (ADR-026 anti-laundering)"#,
     )
     .bind(&rec.node.node_id)
@@ -713,6 +716,8 @@ async fn upsert_registered_node(
             .as_ref()
             .map(serde_json::Value::to_string),
     )
+    .bind(rec.node.credit_cost_multiplier)
+    .bind(&rec.node.pricing_model)
     .execute(&mut **transaction)
     .await
     .map_err(|_| RepoError::Persistence)?;
@@ -728,12 +733,38 @@ async fn replace_registered_capabilities(
         .execute(&mut **transaction)
         .await
         .map_err(|_| RepoError::Persistence)?;
+    let models = serde_json::to_string(&rec.node.models).map_err(|_| RepoError::Persistence)?;
     for intent in &rec.intents {
         sqlx::query(
-            "INSERT INTO capabilities (node_id, intent, models, max_tokens) VALUES (?, ?, '[]', 0)",
+            "INSERT INTO capabilities (node_id, intent, models, max_tokens) VALUES (?, ?, ?, 0)",
         )
         .bind(&rec.node.node_id)
         .bind(intent)
+        .bind(&models)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| RepoError::Persistence)?;
+    }
+    Ok(())
+}
+
+async fn replace_registered_availability(
+    transaction: &mut sqlx::Transaction<'_, MySql>,
+    rec: &NodeRecord,
+) -> Result<(), RepoError> {
+    sqlx::query("DELETE FROM availability_windows WHERE node_id = ?")
+        .bind(&rec.node.node_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| RepoError::Persistence)?;
+    for window in &rec.availability {
+        sqlx::query(
+            "INSERT INTO availability_windows (node_id, start_time, end_time, share) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&rec.node.node_id)
+        .bind(&window.start)
+        .bind(&window.end)
+        .bind(window.share)
         .execute(&mut **transaction)
         .await
         .map_err(|_| RepoError::Persistence)?;
@@ -757,6 +788,12 @@ async fn persist_registration(
         return Err(RepoError::Persistence);
     }
     if replace_registered_capabilities(&mut transaction, rec)
+        .await
+        .is_err()
+    {
+        return Err(RepoError::Persistence);
+    }
+    if replace_registered_availability(&mut transaction, rec)
         .await
         .is_err()
     {
@@ -3393,6 +3430,7 @@ impl NodeRepository for MySqlRepo {
                 NodeRecord {
                     node,
                     intents: node_intents,
+                    availability: vec![],
                     node_token: None,
                     node_hmac_key: None,
                     proxy_token: None,

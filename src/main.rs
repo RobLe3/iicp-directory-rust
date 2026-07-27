@@ -1509,6 +1509,38 @@ struct RegisterRequest {
     /// `public_listing` bool + `operator_url`). Absent → not listed.
     #[serde(default)]
     listing: Option<ListingInput>,
+    #[serde(default)]
+    availability: Vec<RegistrationAvailability>,
+    #[serde(default)]
+    pricing: Option<RegistrationPricing>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RegistrationAvailability {
+    start: String,
+    end: String,
+    #[serde(default = "default_availability_share")]
+    share: f64,
+}
+
+fn default_availability_share() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RegistrationPricing {
+    #[serde(default = "default_credit_multiplier")]
+    credit_cost_multiplier: f64,
+    #[serde(default = "default_pricing_model")]
+    pricing_model: String,
+}
+
+fn default_credit_multiplier() -> f64 {
+    1.0
+}
+
+fn default_pricing_model() -> String {
+    "per_token".into()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2357,6 +2389,7 @@ struct PendingRegistration {
     request: RegisterRequest,
     node: types::Node,
     intents: Vec<String>,
+    availability: Vec<repo::AvailabilityWindow>,
     node_id: String,
     node_token: String,
     proxy_token: String,
@@ -2502,6 +2535,7 @@ async fn commit_registration(
         .register(repo::NodeRecord {
             node: pending.node,
             intents: pending.intents,
+            availability: pending.availability,
             node_token: Some(pending.node_token.clone()),
             node_hmac_key: Some(pending.node_hmac_key.clone()),
             proxy_token: Some(pending.proxy_token.clone()),
@@ -2788,6 +2822,29 @@ async fn register(
         return rejection;
     }
 
+    if req.availability.iter().any(|window| {
+        !valid_hhmm(&window.start)
+            || !valid_hhmm(&window.end)
+            || !(0.0..=1.0).contains(&window.share)
+    }) {
+        return reject("validation_error", "invalid availability window");
+    }
+    if req.pricing.as_ref().is_some_and(|pricing| {
+        !(0.0..=1000.0).contains(&pricing.credit_cost_multiplier)
+            || !PRICING_MODELS.contains(&pricing.pricing_model.as_str())
+    }) {
+        return reject("validation_error", "invalid pricing declaration");
+    }
+    let advertised_models: Vec<String> = req
+        .capabilities
+        .iter()
+        .flat_map(|capability| capability.models.iter().cloned())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let pricing_multiplier = req.pricing.as_ref().map_or(1.0, |pricing| {
+        behavior_contract::pricing_multiplier(&advertised_models, pricing.credit_cost_multiplier)
+    });
     let node = types::Node {
         node_id: node_id.clone(),
         endpoint: req.endpoint.clone(),
@@ -2805,13 +2862,7 @@ async fn register(
         reputation_tier: Some("bronze".into()), // probation (< 100 tasks) → bronze floor tier
         transport_endpoint: req.transport_endpoint.clone(),
         cip_conformance_level: Some("CIP-None".into()),
-        models: req
-            .capabilities
-            .iter()
-            .flat_map(|c| c.models.iter().cloned())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect(),
+        models: advertised_models,
         pricing: None,
         cip_policy: Some(serde_json::json!({
             "allow_remote_inference": false,
@@ -2849,8 +2900,14 @@ async fn register(
         public_key: req.cx_public_key.clone(),
         transport_metadata: req.transport_metadata.clone(),
         // #400 — pricing/attestation default at register; pricing refined via heartbeat.
-        credit_cost_multiplier: 1.0,
-        pricing_model: Some("per_token".into()),
+        credit_cost_multiplier: pricing_multiplier,
+        pricing_model: Some(
+            req.pricing
+                .as_ref()
+                .map_or_else(default_pricing_model, |pricing| {
+                    pricing.pricing_model.clone()
+                }),
+        ),
         attested: false,
         tasks_failed: 0,
         transport: vec![], // #397 — derived at discover time
@@ -2876,6 +2933,15 @@ async fn register(
         routing_policy: types::RoutingPolicyState::default(),
     };
     let intents = req.capabilities.iter().map(|c| c.intent.clone()).collect();
+    let availability = req
+        .availability
+        .iter()
+        .map(|window| repo::AvailabilityWindow {
+            start: window.start.clone(),
+            end: window.end.clone(),
+            share: window.share,
+        })
+        .collect();
     commit_registration(
         &st,
         &headers,
@@ -2883,6 +2949,7 @@ async fn register(
             request: req,
             node,
             intents,
+            availability,
             node_id,
             node_token,
             proxy_token,
@@ -2893,6 +2960,18 @@ async fn register(
         },
     )
     .await
+}
+
+fn valid_hhmm(value: &str) -> bool {
+    let mut parts = value.split(':');
+    matches!(
+        (
+            parts.next().and_then(|part| part.parse::<u8>().ok()),
+            parts.next().and_then(|part| part.parse::<u8>().ok()),
+            parts.next()
+        ),
+        (Some(0..=23), Some(0..=59), None)
+    )
 }
 
 // ── heartbeat (iicp-dir §3.2) ─────────────────────────────────────────────────
@@ -5650,6 +5729,7 @@ mod tests {
                 routing_policy: types::RoutingPolicyState::default(),
             },
             intents: vec![chat.into()],
+            availability: vec![],
             node_token: None,
             node_hmac_key: Some("test-hmac-key".into()),
             proxy_token: None,
@@ -8059,6 +8139,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_accepts_availability_and_applies_pricing_ceiling() {
+        let state = test_state();
+        let response = app(state.clone())
+            .oneshot(post_register(serde_json::json!({
+                "node_id": "priced-registration",
+                "endpoint": "https://1.1.1.1",
+                "capabilities": [{
+                    "intent": "urn:iicp:intent:llm:chat:v1",
+                    "models": ["qwen2.5:0.5b"]
+                }],
+                "availability": [{"start": "08:30", "end": "17:15", "share": 0.75}],
+                "pricing": {
+                    "credit_cost_multiplier": 25.0,
+                    "pricing_model": "per_token"
+                }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let node = state
+            .repo
+            .get("priced-registration")
+            .await
+            .expect("registered node");
+        assert!((node.credit_cost_multiplier - 0.15).abs() < 0.000_001);
+        assert_eq!(node.pricing_model.as_deref(), Some("per_token"));
+    }
+
+    #[tokio::test]
+    async fn register_rejects_invalid_availability_or_pricing() {
+        let invalid_fields = [
+            serde_json::json!({"availability": [{"start": "24:00", "end": "17:00", "share": 1.0}]}),
+            serde_json::json!({"availability": [{"start": "08:00", "end": "17:00", "share": 1.1}]}),
+            serde_json::json!({"pricing": {"credit_cost_multiplier": -0.1, "pricing_model": "per_token"}}),
+            serde_json::json!({"pricing": {"credit_cost_multiplier": 1.0, "pricing_model": "invented"}}),
+        ];
+        for fields in invalid_fields {
+            let mut body = serde_json::json!({
+                "endpoint": "https://1.1.1.1",
+                "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
+            });
+            body.as_object_mut()
+                .expect("registration object")
+                .extend(fields.as_object().expect("test fields").clone());
+            let response = app(test_state())
+                .oneshot(post_register(body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[tokio::test]
     async fn register_refuses_prohibited_capability_before_persistence() {
         let body = serde_json::json!({
             "endpoint": "https://1.1.1.1",
@@ -9397,6 +9530,7 @@ mod tests {
                 routing_policy: types::RoutingPolicyState::default(),
             },
             intents: vec![chat.into()],
+            availability: vec![],
             node_token: None,
             node_hmac_key: Some("test-hmac-key".into()),
             proxy_token: None,
@@ -9452,6 +9586,7 @@ mod tests {
                 .map(|node| NodeRecord {
                     node,
                     intents: vec![chat.into()],
+                    availability: vec![],
                     node_token: None,
                     node_hmac_key: None,
                     proxy_token: None,

@@ -473,6 +473,7 @@ async fn apply_register(repo: &dyn NodeRepository, ev: &FederatedEvent) -> Apply
         .register(NodeRecord {
             node,
             intents: intents_from_payload(&ev.payload),
+            availability: vec![],
             node_token: None, // replica never issues tokens; writes 307 to seed
             node_hmac_key: None,
             proxy_token: None,
@@ -732,6 +733,7 @@ pub async fn apply_snapshot(repo: &dyn NodeRepository, snapshot: &Value) -> usiz
                 repo.register(NodeRecord {
                     node,
                     intents: intents.get(node_id).cloned().unwrap_or_default(),
+                    availability: vec![],
                     node_token: None,
                     node_hmac_key: None,
                     proxy_token: None,
