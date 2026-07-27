@@ -5,8 +5,9 @@ Last refreshed: **2026-07-27**. Rust now consumes the PHP authority's normalized
 `contract-v1.10.76.json` remains immutable capability evidence; neither fixture
 is a production cutover claim.
 
-> **Status:** this Rust implementation is a reconciled parity baseline, not a
-> cutover-ready replacement. Operator acceptance/DSR routes, signed policy-manifest
+> **Status:** this Rust implementation is the second official directory
+> flavor and a reconciled parity baseline, not a cutover-ready production
+> replacement. Operator acceptance/DSR routes, signed policy-manifest
 > validation with fail-closed key lifecycle, public-vs-dispatch discovery and bounded
 > anonymous dispatch counters are implemented. Public-mesh intent-policy refusal uses
 > the shared canonical taxonomy. `directory/parity/contract-v1.10.76.json` is the
@@ -16,8 +17,8 @@ The post-`v1.10.76` refresh is tracked by issue #1 and its bounded follow-ups.
 Signed-event appends now use the PHP-compatible durable, row-locked chain head;
 credit concurrency, transient retries, runtime discovery policy and
 transactional registration recovery/rollback are complete. Maintainability
-extraction and hardened operator-distribution evidence remain separately
-tracked by #12 and #13.
+extraction and hardened operator-distribution evidence were completed by
+PR #22; persistent production-equivalent REACH and production rollback remain.
 
 The HTTP fixture is copied byte-for-byte from the PHP repository. Rust CI pins
 its digest and checks all 43 canonical method/path pairs plus the finite auth
@@ -39,7 +40,11 @@ tie-breaking and the caller limit. MySQL candidates carry capability, runtime,
 backend-stability, pricing, readiness and availability inputs internally;
 those inputs are not added to the public wire response.
 
-The goal is not merely to compile a Rust server. The Rust directory must be wire-compatible with the PHP/Laravel directory for clients, nodes, relays, the website and future replicas. The PHP seed remains production authority until live conformance and operational evidence justify a cutover.
+The goal is not merely to compile a Rust server. The Rust flavor must be
+wire-compatible with the PHP/Laravel flavor for clients, nodes, relays and
+future replicas. The shared specification and executable contracts are
+implementation-neutral authority. PHP remains Genesis deployment authority
+until live conformance and operational evidence justify a cutover.
 
 Status legend: ✅ done · 🔶 present but not full production equivalent · ⬜ not ported / intentionally PHP-only
 

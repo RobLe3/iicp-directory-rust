@@ -1,0 +1,30 @@
+{
+  "schema": "iicp.directory-implementation-compatibility.v1",
+  "implementation": {
+    "flavor": "rust",
+    "version": "0.1.0",
+    "status": "operator_preview"
+  },
+  "php_parity_baseline": {
+    "version": "1.10.80.1",
+    "commit": "08fa5f9"
+  },
+  "contracts": {
+    "http": {
+      "path": "parity/http-contract-v1.json",
+      "sha256": "62fad592a33305a754353c43f6476d257f01ccf6e3cfdbf391d03717ce4796b5"
+    },
+    "behavior": {
+      "path": "parity/behavior-contract-v1.json",
+      "sha256": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+    },
+    "schema": {
+      "path": "schema/contract-v1.json",
+      "sha256": "d01c9a142fc365532049ddd55b68bcf10ae681a294d1a7ee44825c139b481417"
+    }
+  },
+  "minimum_sdk_version": "0.7.94",
+  "production_authority": false,
+  "genesis_cutover_authorized": false,
+  "php_deprecation_authorized": false
+}

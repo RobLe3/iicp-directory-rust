@@ -1,14 +1,26 @@
 # iicp-directory-rs
 
-Rust reference implementation of the IICP directory control plane.
+Rust implementation of the IICP directory control plane.
 
 The protocol is defined by the public [IICP specification](https://github.com/RobLe3/IICP).
 This repository owns the Rust implementation, not the protocol, website,
 production deployment, or Genesis Seed credentials and data.
 
-**Status as of 2026-07-19:** Rust is a reconciled parity baseline, not a cutover-ready replacement for the Laravel production seed. It implements broad public-route compatibility plus public-vs-route discovery, anonymous dispatch counters, signed operator acceptance/DSR with related-record MySQL parity, signed policy manifests and fail-closed policy-key lifecycle handling. Live operational equivalence and an explicitly approved cutover remain open gates. See [`PARITY.md`](PARITY.md) and the versioned parity fixtures before making any cutover claim.
+Release compatibility and the PHP transition boundary are defined in
+[`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
-The PHP/Laravel directory remains the production seed. Rust is the typed replacement candidate and must continue to pass the same REACH/live conformance probes before it can own production traffic.
+**Status as of 2026-07-27:** Rust is the second official implementation
+flavor of the IICP directory contract and is being prepared as a pre-1.0
+operator preview. PHP remains the deployed Genesis flavor. Rust is not yet a
+cutover-ready production replacement: persistent REACH, production rollback
+and explicit cutover approval remain open gates. See [`PARITY.md`](PARITY.md)
+and the versioned parity fixtures before making an operational-equivalence
+claim.
+
+The protocol and versioned behavior contracts are implementation-neutral.
+PHP/Laravel remains the production seed today; Rust is the intended long-term
+maintained flavor and must pass the same REACH/live conformance probes before
+it can own production traffic.
 
 ## What is covered now
 
@@ -33,7 +45,8 @@ The PHP/Laravel directory remains the production seed. Rust is the typed replace
 
 ## Why Rust
 
-The PHP directory (`../directory/` in the main workspace, or the dedicated `iicp-directory-php` repo) is the current production reference implementation. This Rust crate is the permanent replacement candidate because it gives IICP:
+The PHP directory is the current production implementation. This Rust crate is
+the planned long-term implementation because it gives IICP:
 
 1. **Auditable scoring** — routing and reputation logic compiled into one typed binary.
 2. **Type-safe wire contracts** — fewer accidental field-shape regressions in discovery/stats responses.
@@ -42,7 +55,7 @@ The PHP directory (`../directory/` in the main workspace, or the dedicated `iicp
 Migration path:
 
 ```text
-PHP reference → Rust serves compatible hot paths → federated mesh → PHP decommission
+PHP Genesis → dual supported flavors → Rust Genesis → PHP maintenance retirement
 ```
 
 ## Run
