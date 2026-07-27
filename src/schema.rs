@@ -454,8 +454,10 @@ mod tests {
     fn embedded_contract_is_parseable_and_has_core_tables() {
         let contract: Contract = serde_json::from_str(CONTRACT_JSON).unwrap();
         assert!(contract.tables.contains_key("nodes"));
+        assert!(contract.tables.contains_key("node_event_chain_heads"));
         assert!(contract.tables.contains_key("capabilities"));
         assert!(contract.tables.contains_key("credit_transactions"));
+        assert!(BASELINE_SQL.contains("INSERT INTO `node_event_chain_heads`"));
     }
 
     #[test]

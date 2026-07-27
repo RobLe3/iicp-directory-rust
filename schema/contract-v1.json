@@ -868,6 +868,49 @@
         }
       }
     },
+    "node_event_chain_heads": {
+      "columns": {
+        "chain_id": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "last_seq": {
+          "column_type": "bigint unsigned",
+          "default": "0",
+          "extra": "",
+          "nullable": false
+        },
+        "last_signature": {
+          "column_type": "varchar(128)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "chain_id"
+          ],
+          "unique": true
+        }
+      }
+    },
     "node_events": {
       "columns": {
         "created_at": {
