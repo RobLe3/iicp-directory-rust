@@ -22,14 +22,239 @@ use crate::types::Node;
 fn is_transient_transaction_error(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
-        .and_then(|database| database.code())
-        .is_some_and(|code| matches!(code.as_ref(), "1205" | "1213"))
+        .and_then(|database| database.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>())
+        .is_some_and(|database| matches!(database.number(), 1205 | 1213))
 }
 
 enum CreditMutationError {
     NonceReplay,
     NodeNotFound,
     Database(sqlx::Error),
+}
+
+enum DebitMutationError {
+    Insufficient(&'static str),
+    Database {
+        scope: &'static str,
+        error: sqlx::Error,
+    },
+}
+
+impl DebitMutationError {
+    fn database(scope: &'static str, error: sqlx::Error) -> Self {
+        Self::Database { scope, error }
+    }
+}
+
+fn failed_debit(scope: &'static str, reason: &'static str) -> WalletDebitResult {
+    WalletDebitResult {
+        debited: false,
+        spent: 0.0,
+        scope,
+        reason: Some(reason),
+        debit_count: 0,
+    }
+}
+
+async fn debit_node_once(
+    pool: &Pool<MySql>,
+    consumer_node_id: &str,
+    amount: f64,
+    task_id: &str,
+    reason: &str,
+) -> Result<WalletDebitResult, DebitMutationError> {
+    const SCOPE: &str = "node";
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+    let updated = sqlx::query(
+        "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
+         SET n.credit_balance = n.credit_balance - ?, \
+             c.balance = c.balance - ?, c.updated_at = NOW() \
+         WHERE n.id = ? AND n.credit_balance + 0.0001 >= ? \
+           AND c.balance + 0.0001 >= ? \
+           AND ABS(n.credit_balance - c.balance) <= 0.0001",
+    )
+    .bind(amount)
+    .bind(amount)
+    .bind(consumer_node_id)
+    .bind(amount)
+    .bind(amount)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+    if updated.rows_affected() == 0 {
+        return Err(DebitMutationError::Insufficient("insufficient_balance"));
+    }
+    sqlx::query(
+        "INSERT INTO credit_transactions (node_id, amount, type, task_id, reason) \
+         VALUES (?, ?, 'debit', ?, ?)",
+    )
+    .bind(consumer_node_id)
+    .bind(amount)
+    .bind(task_id)
+    .bind(reason)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+    tx.commit()
+        .await
+        .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+    Ok(WalletDebitResult {
+        debited: true,
+        spent: amount,
+        scope: SCOPE,
+        reason: None,
+        debit_count: 1,
+    })
+}
+
+async fn debit_operator_wallet_once(
+    pool: &Pool<MySql>,
+    consumer_node_id: &str,
+    operator_pubkey: &str,
+    amount: f64,
+    task_id: &str,
+    reason: &str,
+) -> Result<WalletDebitResult, DebitMutationError> {
+    const SCOPE: &str = "operator_wallet";
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+    let candidates: Vec<(String, f64, Option<i64>)> = sqlx::query_as(
+        "SELECT n.id, CAST(n.credit_balance AS DOUBLE), \
+                UNIX_TIMESTAMP((SELECT MIN(ct.expires_at) FROM credit_transactions ct \
+                                WHERE ct.node_id = n.id AND ct.type = 'credit' \
+                                  AND ct.expires_at IS NOT NULL AND ct.expires_at > NOW())) AS horizon \
+         FROM nodes n WHERE n.operator_pubkey = ? AND n.status != 'archived' \
+         AND n.credit_balance > 0 AND ( \
+           EXISTS (SELECT 1 FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NULL) \
+           OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) IS NULL \
+           OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) > NOW() \
+         ) ORDER BY horizon IS NULL, horizon, n.id FOR UPDATE",
+    )
+    .bind(operator_pubkey)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+
+    let available: f64 = candidates.iter().map(|(_, balance, _)| *balance).sum();
+    if available + 0.0001 < amount {
+        return Err(DebitMutationError::Insufficient(
+            "insufficient_operator_wallet_balance",
+        ));
+    }
+
+    let mut remaining = amount;
+    let mut debit_count = 0_u32;
+    for (node_id, balance, _) in candidates {
+        if remaining <= 0.00005 {
+            break;
+        }
+        let take = remaining.min(balance);
+        let ledger: Option<(f64,)> = sqlx::query_as(
+            "SELECT CAST(balance AS DOUBLE) FROM credits WHERE node_id = ? FOR UPDATE",
+        )
+        .bind(&node_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+        if ledger.is_none_or(|(ledger_balance,)| (ledger_balance - balance).abs() > 0.0001) {
+            return Err(DebitMutationError::database(
+                SCOPE,
+                sqlx::Error::Protocol("credit ledger and node balance disagree".to_string()),
+            ));
+        }
+        let tx_reason = if node_id == consumer_node_id {
+            reason.to_string()
+        } else {
+            format!(
+                "{reason}:operator_wallet:consumer={}",
+                &consumer_node_id[..consumer_node_id.len().min(8)]
+            )
+        };
+        let updated = sqlx::query(
+            "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
+             SET n.credit_balance = n.credit_balance - ?, \
+                 c.balance = c.balance - ?, c.updated_at = NOW() \
+             WHERE n.id = ? AND ABS(n.credit_balance - c.balance) <= 0.0001",
+        )
+        .bind(take)
+        .bind(take)
+        .bind(&node_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+        if updated.rows_affected() == 0 {
+            return Err(DebitMutationError::database(
+                SCOPE,
+                sqlx::Error::Protocol("credit ledger changed while locked".to_string()),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO credit_transactions (node_id, amount, type, task_id, reason) \
+             VALUES (?, ?, 'debit', ?, ?)",
+        )
+        .bind(&node_id)
+        .bind(take)
+        .bind(task_id)
+        .bind(tx_reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+        remaining -= take;
+        debit_count += 1;
+    }
+
+    if remaining > 0.0001 {
+        return Err(DebitMutationError::database(
+            SCOPE,
+            sqlx::Error::Protocol("operator wallet allocation was incomplete".to_string()),
+        ));
+    }
+    tx.commit()
+        .await
+        .map_err(|error| DebitMutationError::database(SCOPE, error))?;
+    Ok(WalletDebitResult {
+        debited: true,
+        spent: amount,
+        scope: SCOPE,
+        reason: None,
+        debit_count,
+    })
+}
+
+async fn expire_idle_credit_once(
+    pool: &Pool<MySql>,
+    node_id: &str,
+    expected_balance: f64,
+) -> Result<Option<f64>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
+         SET n.credit_balance = 0, c.balance = 0, c.updated_at = NOW() \
+         WHERE n.id = ? AND n.credit_balance = ? \
+           AND ABS(n.credit_balance - c.balance) <= 0.0001",
+    )
+    .bind(node_id)
+    .bind(expected_balance)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(None);
+    }
+    sqlx::query(
+        "INSERT INTO credit_transactions (node_id, amount, type, reason) \
+         VALUES (?, ?, 'debit', 'ttl_expire')",
+    )
+    .bind(node_id)
+    .bind(expected_balance)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(expected_balance))
 }
 
 async fn record_credit_award_once(
@@ -1908,206 +2133,68 @@ impl NodeRepository for MySqlRepo {
         task_id: &str,
         reason: &str,
     ) -> WalletDebitResult {
-        let op: Option<(Option<String>,)> =
+        let op: Result<Option<(Option<String>,)>, sqlx::Error> =
             sqlx::query_as("SELECT operator_pubkey FROM nodes WHERE id = ?")
                 .bind(consumer_node_id)
                 .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
-
-        let Some(operator_pubkey) = op.and_then(|(p,)| p).filter(|p| !p.is_empty()) else {
-            let Ok(mut tx) = self.pool.begin().await else {
-                return WalletDebitResult {
-                    debited: false,
-                    spent: 0.0,
-                    scope: "node",
-                    reason: Some("db_error"),
-                    debit_count: 0,
-                };
-            };
-            let updated = sqlx::query(
-                "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
-                 SET n.credit_balance = n.credit_balance - ?, \
-                     c.balance = c.balance - ?, c.updated_at = NOW() \
-                 WHERE n.id = ? AND n.credit_balance + 0.0001 >= ? \
-                   AND c.balance + 0.0001 >= ? \
-                   AND ABS(n.credit_balance - c.balance) <= 0.0001",
-            )
-            .bind(amount)
-            .bind(amount)
-            .bind(consumer_node_id)
-            .bind(amount)
-            .bind(amount)
-            .execute(&mut *tx)
-            .await
-            .map(|r| r.rows_affected() > 0)
-            .unwrap_or(false);
-            if !updated {
-                let _ = tx.rollback().await;
-                return WalletDebitResult {
-                    debited: false,
-                    spent: 0.0,
-                    scope: "node",
-                    reason: Some("insufficient_balance"),
-                    debit_count: 0,
-                };
+                .await;
+        let operator_pubkey = match op {
+            Ok(row) => row.and_then(|(key,)| key).filter(|key| !key.is_empty()),
+            Err(error) => {
+                eprintln!("credit debit scope lookup failed: {error}");
+                return failed_debit("node", "db_error");
             }
-            let inserted = sqlx::query(
-                "INSERT INTO credit_transactions (node_id, amount, type, task_id, reason) \
-                 VALUES (?, ?, 'debit', ?, ?)",
-            )
-            .bind(consumer_node_id)
-            .bind(amount)
-            .bind(task_id)
-            .bind(reason)
-            .execute(&mut *tx)
-            .await
-            .is_ok();
-            if inserted && tx.commit().await.is_ok() {
-                return WalletDebitResult {
-                    debited: true,
-                    spent: amount,
-                    scope: "node",
-                    reason: None,
-                    debit_count: 1,
-                };
-            }
-            return WalletDebitResult {
-                debited: false,
-                spent: 0.0,
-                scope: "node",
-                reason: Some("db_error"),
-                debit_count: 0,
-            };
         };
 
-        let Ok(mut tx) = self.pool.begin().await else {
-            return WalletDebitResult {
-                debited: false,
-                spent: 0.0,
-                scope: "operator_wallet",
-                reason: Some("db_error"),
-                debit_count: 0,
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
+            let result = match operator_pubkey.as_deref() {
+                Some(operator) => {
+                    debit_operator_wallet_once(
+                        &self.pool,
+                        consumer_node_id,
+                        operator,
+                        amount,
+                        task_id,
+                        reason,
+                    )
+                    .await
+                }
+                None => {
+                    debit_node_once(&self.pool, consumer_node_id, amount, task_id, reason).await
+                }
             };
-        };
-
-        let candidates: Vec<(String, f64, Option<i64>)> = sqlx::query_as(
-            "SELECT n.id, CAST(n.credit_balance AS DOUBLE), \
-                    UNIX_TIMESTAMP((SELECT MIN(ct.expires_at) FROM credit_transactions ct \
-                                    WHERE ct.node_id = n.id AND ct.type = 'credit' \
-                                      AND ct.expires_at IS NOT NULL AND ct.expires_at > NOW())) AS horizon \
-             FROM nodes n WHERE n.operator_pubkey = ? AND n.status != 'archived' \
-             AND n.credit_balance > 0 AND ( \
-               EXISTS (SELECT 1 FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NULL) \
-               OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) IS NULL \
-               OR (SELECT MAX(ct.expires_at) FROM credit_transactions ct WHERE ct.node_id = n.id AND ct.type = 'credit' AND ct.expires_at IS NOT NULL) > NOW() \
-             ) ORDER BY horizon IS NULL, horizon, n.id FOR UPDATE",
-        )
-        .bind(&operator_pubkey)
-        .fetch_all(&mut *tx)
-        .await
-        .unwrap_or_default();
-
-        let available: f64 = candidates.iter().map(|(_, balance, _)| *balance).sum();
-        if available + 0.0001 < amount {
-            let _ = tx.rollback().await;
-            return WalletDebitResult {
-                debited: false,
-                spent: 0.0,
-                scope: "operator_wallet",
-                reason: Some("insufficient_operator_wallet_balance"),
-                debit_count: 0,
-            };
+            match result {
+                Ok(result) => return result,
+                Err(DebitMutationError::Insufficient(reason)) => {
+                    return failed_debit(
+                        if operator_pubkey.is_some() {
+                            "operator_wallet"
+                        } else {
+                            "node"
+                        },
+                        reason,
+                    );
+                }
+                Err(DebitMutationError::Database { error, .. })
+                    if is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(DebitMutationError::Database { scope, error }) => {
+                    eprintln!("credit debit transaction failed: {error}");
+                    return failed_debit(scope, "db_error");
+                }
+            }
         }
-
-        let mut remaining = amount;
-        let mut debit_count = 0_u32;
-        for (node_id, balance, _) in candidates {
-            if remaining <= 0.00005 {
-                break;
-            }
-            let take = remaining.min(balance);
-            let ledger: Option<(f64,)> = sqlx::query_as(
-                "SELECT CAST(balance AS DOUBLE) FROM credits WHERE node_id = ? FOR UPDATE",
-            )
-            .bind(&node_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .unwrap_or_default();
-            if ledger.is_none_or(|(ledger_balance,)| (ledger_balance - balance).abs() > 0.0001) {
-                let _ = tx.rollback().await;
-                return WalletDebitResult {
-                    debited: false,
-                    spent: 0.0,
-                    scope: "operator_wallet",
-                    reason: Some("db_error"),
-                    debit_count: 0,
-                };
-            }
-            let tx_reason = if node_id == consumer_node_id {
-                reason.to_string()
+        failed_debit(
+            if operator_pubkey.is_some() {
+                "operator_wallet"
             } else {
-                format!(
-                    "{reason}:operator_wallet:consumer={}",
-                    &consumer_node_id[..consumer_node_id.len().min(8)]
-                )
-            };
-            let ok_update = sqlx::query(
-                "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
-                 SET n.credit_balance = n.credit_balance - ?, \
-                     c.balance = c.balance - ?, c.updated_at = NOW() \
-                 WHERE n.id = ? AND ABS(n.credit_balance - c.balance) <= 0.0001",
-            )
-            .bind(take)
-            .bind(take)
-            .bind(&node_id)
-            .execute(&mut *tx)
-            .await
-            .map(|result| result.rows_affected() > 0)
-            .unwrap_or(false);
-            let ok_insert = sqlx::query(
-                "INSERT INTO credit_transactions (node_id, amount, type, task_id, reason) \
-                 VALUES (?, ?, 'debit', ?, ?)",
-            )
-            .bind(&node_id)
-            .bind(take)
-            .bind(task_id)
-            .bind(tx_reason)
-            .execute(&mut *tx)
-            .await
-            .is_ok();
-            if !ok_update || !ok_insert {
-                let _ = tx.rollback().await;
-                return WalletDebitResult {
-                    debited: false,
-                    spent: 0.0,
-                    scope: "operator_wallet",
-                    reason: Some("db_error"),
-                    debit_count: 0,
-                };
-            }
-            remaining -= take;
-            debit_count += 1;
-        }
-
-        if remaining <= 0.0001 && tx.commit().await.is_ok() {
-            WalletDebitResult {
-                debited: true,
-                spent: amount,
-                scope: "operator_wallet",
-                reason: None,
-                debit_count,
-            }
-        } else {
-            WalletDebitResult {
-                debited: false,
-                spent: 0.0,
-                scope: "operator_wallet",
-                reason: Some("db_error"),
-                debit_count: 0,
-            }
-        }
+                "node"
+            },
+            "db_error",
+        )
     }
 
     async fn expire_idle_node_credits(&self) -> (u64, f64) {
@@ -2137,39 +2224,25 @@ impl NodeRepository for MySqlRepo {
             if !credit_ttl_idle(max_earn_expires_unix, balance, now_unix) {
                 continue;
             }
-            let Ok(mut tx) = self.pool.begin().await else {
-                continue;
-            };
-            // Re-read + zero under the transaction; insert the ttl_expire debit for the
-            // swept amount (mirrors the PHP expire row; preserves balance==earned−debits).
-            let ok = sqlx::query(
-                "UPDATE nodes n JOIN credits c ON c.node_id = n.id \
-                 SET n.credit_balance = 0, c.balance = 0, c.updated_at = NOW() \
-                 WHERE n.id = ? AND n.credit_balance = ? \
-                   AND ABS(n.credit_balance - c.balance) <= 0.0001",
-            )
-            .bind(&node_id)
-            .bind(balance)
-            .execute(&mut *tx)
-            .await
-            .map(|r| r.rows_affected() > 0)
-            .unwrap_or(false);
-            if !ok {
-                let _ = tx.rollback().await;
-                continue;
-            }
-            let inserted = sqlx::query(
-                "INSERT INTO credit_transactions (node_id, amount, type, reason) \
-                 VALUES (?, ?, 'debit', 'ttl_expire')",
-            )
-            .bind(&node_id)
-            .bind(balance)
-            .execute(&mut *tx)
-            .await
-            .is_ok();
-            if inserted && tx.commit().await.is_ok() {
-                expired_nodes += 1;
-                expired_credits += balance;
+            const ATTEMPTS: usize = 3;
+            for attempt in 0..ATTEMPTS {
+                match expire_idle_credit_once(&self.pool, &node_id, balance).await {
+                    Ok(Some(expired)) => {
+                        expired_nodes += 1;
+                        expired_credits += expired;
+                        break;
+                    }
+                    Ok(None) => break,
+                    Err(error)
+                        if is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("credit expiry transaction failed for {node_id}: {error}");
+                        break;
+                    }
+                }
             }
         }
         (expired_nodes, expired_credits)
@@ -3623,7 +3696,9 @@ impl NodeRepository for MySqlRepo {
 mod tests {
     use super::{credit_ttl_idle, init_pool, median_outlier_weight, MySqlRepo};
     use crate::repo::NodeRepository;
+    use sqlx::mysql::MySqlPoolOptions;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn s(vals: &[f64]) -> Vec<(f64,)> {
         vals.iter().map(|&v| (v,)).collect()
@@ -3942,7 +4017,9 @@ mod tests {
             .all(|(node, ledger)| (node - ledger).abs() < 0.0001));
         assert!((rows.iter().map(|(node, _)| node).sum::<f64>() - 2.0).abs() < 0.0001);
         let (debit_total,): (f64,) = sqlx::query_as(
-            "SELECT CAST(SUM(amount) AS DOUBLE) FROM credit_transactions WHERE type = 'debit'",
+            "SELECT CAST(SUM(ct.amount) AS DOUBLE) FROM credit_transactions ct \
+             JOIN nodes n ON n.id = ct.node_id \
+             WHERE ct.type = 'debit' AND n.operator_pubkey = 'shared-operator'",
         )
         .fetch_one(&pool)
         .await
@@ -4016,5 +4093,159 @@ mod tests {
         assert!((node_balance - ledger_balance).abs() < 0.0001);
         assert!((node_balance - (credits - debits)).abs() < 0.0001);
         assert!(node_balance == 1.0 || node_balance == 6.0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn transient_credit_mutations_retry_once_and_reconcile() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let admin_pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&admin_pool)
+            .await
+            .expect("bootstrap disposable schema");
+        let retry_pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SET SESSION innodb_lock_wait_timeout = 1")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect retry-test pool");
+        let repo = Arc::new(MySqlRepo::new(retry_pool));
+
+        for (id, balance, operator) in [
+            ("retry-node", 2.0, None),
+            ("retry-wallet-consumer", 2.0, Some("retry-operator")),
+            ("retry-wallet-peer", 2.0, Some("retry-operator")),
+            ("retry-expiry", 3.0, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO nodes \
+                 (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
+                  credit_balance, operator_pubkey) \
+                 VALUES (?, 'https://example.invalid/v1', 'test', 'x', 1, 1, ?, ?)",
+            )
+            .bind(id)
+            .bind(balance)
+            .bind(operator)
+            .execute(&admin_pool)
+            .await
+            .expect("seed retry node");
+            sqlx::query(
+                "INSERT INTO credits (node_id, balance, created_at, updated_at) \
+                 VALUES (?, ?, NOW(), NOW())",
+            )
+            .bind(id)
+            .bind(balance)
+            .execute(&admin_pool)
+            .await
+            .expect("seed retry credit");
+        }
+        sqlx::query(
+            "INSERT INTO credit_transactions \
+             (node_id, amount, type, nonce, reason, expires_at) \
+             VALUES ('retry-expiry', 3, 'credit', 'retry-expired-seed', 'seed', \
+                     NOW() - INTERVAL 1 DAY)",
+        )
+        .execute(&admin_pool)
+        .await
+        .expect("seed expired retry credit");
+
+        let mut node_lock = admin_pool.begin().await.expect("begin node lock");
+        sqlx::query("SELECT id FROM nodes WHERE id = 'retry-node' FOR UPDATE")
+            .fetch_one(&mut *node_lock)
+            .await
+            .expect("hold node debit lock");
+        let debit_repo = Arc::clone(&repo);
+        let node_debit = tokio::spawn(async move {
+            debit_repo
+                .debit_for_consumer("retry-node", 1.0, "retry-node-task", "retry-test")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        node_lock.commit().await.expect("release node debit lock");
+        let node_result = node_debit.await.expect("node debit task must join");
+        assert!(node_result.debited);
+        assert_eq!(node_result.debit_count, 1);
+
+        let mut wallet_lock = admin_pool.begin().await.expect("begin wallet lock");
+        sqlx::query("SELECT id FROM nodes WHERE id = 'retry-wallet-consumer' FOR UPDATE")
+            .fetch_one(&mut *wallet_lock)
+            .await
+            .expect("hold operator wallet lock");
+        let wallet_repo = Arc::clone(&repo);
+        let wallet_debit = tokio::spawn(async move {
+            wallet_repo
+                .debit_for_consumer(
+                    "retry-wallet-consumer",
+                    3.0,
+                    "retry-wallet-task",
+                    "retry-test",
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        wallet_lock
+            .commit()
+            .await
+            .expect("release operator wallet lock");
+        let wallet_result = wallet_debit.await.expect("wallet debit task must join");
+        assert!(wallet_result.debited);
+        assert_eq!(wallet_result.debit_count, 2);
+
+        let mut expiry_lock = admin_pool.begin().await.expect("begin expiry lock");
+        sqlx::query("SELECT id FROM nodes WHERE id = 'retry-expiry' FOR UPDATE")
+            .fetch_one(&mut *expiry_lock)
+            .await
+            .expect("hold expiry lock");
+        let expiry_repo = Arc::clone(&repo);
+        let expiry = tokio::spawn(async move { expiry_repo.expire_idle_node_credits().await });
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        expiry_lock.commit().await.expect("release expiry lock");
+        assert_eq!(expiry.await.expect("expiry task must join"), (1, 3.0));
+
+        let rows: Vec<(String, f64, f64)> = sqlx::query_as(
+            "SELECT n.id, CAST(n.credit_balance AS DOUBLE), CAST(c.balance AS DOUBLE) \
+             FROM nodes n JOIN credits c ON c.node_id = n.id \
+             WHERE n.id LIKE 'retry-%' ORDER BY n.id",
+        )
+        .fetch_all(&admin_pool)
+        .await
+        .expect("read retry balances");
+        assert_eq!(rows.len(), 4);
+        assert!(rows
+            .iter()
+            .all(|(_, node, ledger)| (node - ledger).abs() < 0.0001));
+
+        let retry_transactions: Vec<(String, String, i64, f64)> = sqlx::query_as(
+            "SELECT node_id, reason, COUNT(*), CAST(SUM(amount) AS DOUBLE) \
+             FROM credit_transactions WHERE node_id LIKE 'retry-%' AND \
+             (reason IN ('retry-test', 'ttl_expire') OR task_id = 'retry-wallet-task') \
+             GROUP BY node_id, reason ORDER BY node_id, reason",
+        )
+        .fetch_all(&admin_pool)
+        .await
+        .expect("read retry transactions");
+        assert_eq!(
+            retry_transactions
+                .iter()
+                .map(|(_, _, count, _)| *count)
+                .sum::<i64>(),
+            4
+        );
+        assert!(retry_transactions
+            .iter()
+            .all(|(_, _, count, _)| *count == 1));
+        let retry_debit_total: f64 = retry_transactions
+            .iter()
+            .map(|(_, _, _, amount)| *amount)
+            .sum();
+        assert!((retry_debit_total - 7.0).abs() < 0.0001);
     }
 }
