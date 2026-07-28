@@ -1,4 +1,4 @@
-# iicp-directory-rs
+# IICP Directory — Rust operator preview
 
 Rust implementation of the IICP directory control plane.
 
@@ -9,13 +9,12 @@ production deployment, or Genesis Seed credentials and data.
 Release compatibility and the PHP transition boundary are defined in
 [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
-**Status as of 2026-07-27:** Rust is the second official implementation
-flavor of the IICP directory contract and is being prepared as a pre-1.0
-operator preview. PHP remains the deployed Genesis flavor. Rust is not yet a
-cutover-ready production replacement: persistent REACH, production rollback
-and explicit cutover approval remain open gates. See [`PARITY.md`](PARITY.md)
-and the versioned parity fixtures before making an operational-equivalence
-claim.
+**Status:** Rust is the second official implementation flavor of the IICP
+directory contract and is published as a pre-1.0 operator preview. PHP remains
+the deployed Genesis flavor. Rust is not a cutover-ready production
+replacement: persistent REACH, production rollback and explicit cutover
+approval remain separate gates. See [`PARITY.md`](PARITY.md) and the versioned
+parity fixtures before making an operational-equivalence claim.
 
 The protocol and versioned behavior contracts are implementation-neutral.
 PHP/Laravel remains the production seed today; Rust is the intended long-term
@@ -43,14 +42,12 @@ it can own production traffic.
 - API route parity does not automatically mean operational parity. Production replacement still requires the same live REACH probes, deployment runbooks, cache behavior, background jobs and operator procedures to pass.
 - The PHP directory is still the source of truth for production until the maintainer explicitly cuts over.
 
-## Why Rust
+## Why a Rust implementation
 
-The PHP directory is the current production implementation. This Rust crate is
-the planned long-term implementation because it gives IICP:
-
-1. **Auditable scoring** — routing and reputation logic compiled into one typed binary.
-2. **Type-safe wire contracts** — fewer accidental field-shape regressions in discovery/stats responses.
-3. **Security properties** — bcrypt token storage, HMAC receipt verification, SSRF guards and reputation abuse mitigations compiled into tested code paths.
+The PHP directory is the current production implementation. The Rust flavor
+provides a single typed binary for operators who prefer that deployment model.
+Its routing, persistence and security behavior remains accountable to the same
+public contracts and conformance evidence as PHP.
 
 Migration path:
 
@@ -77,6 +74,9 @@ cargo run
 ```
 
 Migrations are loaded from `migrations/` on startup.
+
+For a durable installation, backup and recovery guidance, read
+[`OPERATIONS.md`](OPERATIONS.md). In-memory mode is for local evaluation only.
 
 ## Configuration
 
@@ -105,6 +105,10 @@ The route-alias and live-shape compatibility tests are in `src/main.rs` near the
 ## Relationship to PHP
 
 See [`PARITY.md`](PARITY.md) for the detailed PHP/Rust parity checklist. The versioned parity fixtures define the seed requirements; the dedicated PHP repository remains the easiest way to compare exact Laravel behavior.
+
+Applications do not need to know which directory implementation serves a
+compatible endpoint. To connect a consumer or provider agent, follow
+[Connect an AI agent to IICP](https://github.com/RobLe3/IICP/blob/main/docs/agent-bootstrap.md).
 
 ## Contributing and security
 

@@ -10,7 +10,8 @@ The repository may be published as a pre-1.0 implementation when:
 - the README accurately distinguishes route parity from production equivalence;
 - the maintainer explicitly authorizes the visibility change.
 
-Publication is not a production cutover.
+Publication is not a production cutover or evidence of independent
+multi-operator federation.
 
 The dated assessment in `PUBLICATION_ASSESSMENT_2026-07-26.md` records the
 current evidence and remaining authorization gate. Passing technical checks
