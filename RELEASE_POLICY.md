@@ -33,7 +33,7 @@ HTTP and integrity behavior changes require shared-contract review.
 
 Security fixes target the latest preview. Production support and a stable
 deprecation policy begin only after Rust is promoted from operator preview to
-supported alternative.
+a supported alternative.
 
 ## PHP transition
 
