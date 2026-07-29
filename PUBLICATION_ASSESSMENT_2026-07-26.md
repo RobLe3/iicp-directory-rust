@@ -2,7 +2,7 @@
 
 ## Decision
 
-**READY FOR PUBLIC OPERATOR PREVIEW.** The exact `v0.1.1` source candidate
+**READY FOR PUBLIC OPERATOR PREVIEW.** The exact `v0.1.2` source candidate
 passed the publication checks below. This decision publishes source and release
 assets only. It does not deploy Rust, cut over Genesis or deprecate PHP.
 
@@ -43,5 +43,4 @@ cutover decision and live rehearsal.
 ## Provenance note
 
 The `v0.1.0` tag is retained as a failed publication attempt: its compatibility
-manifest gate did not complete and it has no release assets. `v0.1.1` is the
-first completed operator-preview release.
+manifest gate did not complete and it has no release assets. `v0.1.2` is the current corrective operator-preview release; `v0.1.1` remains a valid earlier preview pinned to the failed PHP tag name and should not be used as the current compatibility reference.
