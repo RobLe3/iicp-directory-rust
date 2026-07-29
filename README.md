@@ -98,8 +98,14 @@ For a durable installation, backup and recovery guidance, read
 | `IICP_ALLOW_IN_MEMORY` | `false` | Explicitly allow disposable in-memory state outside production. |
 | `IICP_DEV_ALLOW_INSECURE_TLS` | `false` | Allow invalid probe certificates only in local/testing environments. Never affects production. |
 | `IICP_DEV_ALLOW_UNSIGNED_EVENTS` | `false` | Allow unsigned replica events only in local/testing environments. Never affects production. |
+| `IICP_DEPLOYMENT_KIND` | — | `shared_hosting`, `container`, `native` or `other`; required to publish signed deployment provenance. |
+| `IICP_RELEASE_TAG`, `IICP_SOURCE_COMMIT`, `IICP_BUILD_ID`, `IICP_DEPLOYED_AT` | — | Immutable release inputs for `/.well-known/iicp-deployment.json`. |
+| `IICP_ROOT_KEY_ID` | — | DID verification-method ID for the configured signing key. |
+| `IICP_OPENAPI_VERSION`, `IICP_PROTOCOL_MIN`, `IICP_PROTOCOL_MAX` | `1.6.0`, `1.9.0`, `1.9.0` | Compatibility metadata in the signed deployment record. |
 
 In production mode, `POST /v1/register` and `POST /api/v1/register` reject private/loopback endpoints. Use `APP_ENV=local` for local endpoint tests.
+The deployment-provenance endpoint returns 503 until every required release
+input and the signing key are present.
 
 ## Test baseline
 

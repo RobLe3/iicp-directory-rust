@@ -1,9 +1,10 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
-Last refreshed: **2026-07-27**. Rust now consumes the PHP authority's normalized
-`parity/http-contract-v1.json` for runtime `v1.10.80.1` at `08fa5f9`. The older
-`contract-v1.10.76.json` remains immutable capability evidence; neither fixture
-is a production cutover claim.
+Last refreshed: **2026-07-29**. Rust `v0.1.3` pins the current shared
+`contract-v1.10.81.json`, whose PHP runtime authority is `v1.10.81.2`. The
+normalized HTTP and behavior fixtures retain their `v1.10.80.1` authority
+because the trust-boundary release did not change those wire vectors. The older
+contracts remain immutable evidence; none authorizes a production cutover.
 
 > **Status:** this Rust implementation is the second official directory
 > flavor and a reconciled parity baseline, not a cutover-ready production
