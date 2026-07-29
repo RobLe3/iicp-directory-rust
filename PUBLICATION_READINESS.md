@@ -3,7 +3,7 @@
 The repository may be published as a pre-1.0 implementation when:
 
 - current and full-history secret scans are resolved;
-- `cargo fmt --check` and `cargo test --locked` pass from a clean checkout;
+- formatting, blocking Clippy, locked tests, the coverage ratchet and RustSec pass from a clean checkout;
 - PHP/Rust parity fixtures and runtime gates pass;
 - the non-root, read-only operator distribution rehearsal passes locally;
 - production topology, credentials, backups and operator data are absent;
@@ -14,5 +14,5 @@ Publication is not a production cutover or evidence of independent
 multi-operator federation.
 
 The dated assessment in `PUBLICATION_ASSESSMENT_2026-07-26.md` records the
-current evidence and remaining authorization gate. Passing technical checks
-does not change repository visibility.
+candidate evidence. Client-adoption or REACH observation windows are separate
+live-system evidence and do not gate source visibility.
