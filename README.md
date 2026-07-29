@@ -55,16 +55,23 @@ Migration path:
 PHP Genesis → dual supported flavors → Rust Genesis → PHP maintenance retirement
 ```
 
+## Requirements
+
+- Rust 1.86 or newer
+- MySQL 8 / MariaDB 11 for durable operation
+
 ## Run
 
 ### Local, in memory
 
 ```bash
-cargo run
-cargo test
+APP_ENV=local IICP_ALLOW_IN_MEMORY=true cargo run
+cargo test --locked
 ```
 
-By default the server listens on `0.0.0.0:8090` and uses an in-memory repository when `DATABASE_URL` is absent.
+The server listens on `0.0.0.0:8090`. In-memory storage is available only when
+`APP_ENV` is not `production` and `IICP_ALLOW_IN_MEMORY=true` is explicit.
+Production startup fails when `DATABASE_URL` is absent.
 
 ### With MySQL
 
@@ -82,12 +89,15 @@ For a durable installation, backup and recovery guidance, read
 
 | Variable | Default | Description |
 |---|---:|---|
-| `DATABASE_URL` | — | MySQL DSN. Omit for in-memory local/test mode. |
-| `APP_ENV` | `production` | `local`, `testing`, `staging` or `production`; controls endpoint routability validation. |
+| `DATABASE_URL` | — | MySQL DSN. Required in production. |
+| `APP_ENV` | `production` | `local`, `testing`, `staging` or `production`; controls fail-closed safety policy. |
 | `APP_KEY` | — | Optional HS256 JWT compatibility key. |
-| `IICP_GENESIS_ED25519_SECRET_KEY` | — | 128-hex libsodium Ed25519 secret key used for event, DID, token and attestation signing. |
+| `IICP_GENESIS_ED25519_SECRET_KEY` | — | 128-hex libsodium Ed25519 secret key used for event, DID, token and attestation signing. Required in production. |
 | `IICP_REPLICA_MODE` | `false` | When true, unsafe writes redirect to the seed. |
 | `IICP_SEED_URL` | — | Seed URL used by replica write redirection. |
+| `IICP_ALLOW_IN_MEMORY` | `false` | Explicitly allow disposable in-memory state outside production. |
+| `IICP_DEV_ALLOW_INSECURE_TLS` | `false` | Allow invalid probe certificates only in local/testing environments. Never affects production. |
+| `IICP_DEV_ALLOW_UNSIGNED_EVENTS` | `false` | Allow unsigned replica events only in local/testing environments. Never affects production. |
 
 In production mode, `POST /v1/register` and `POST /api/v1/register` reject private/loopback endpoints. Use `APP_ENV=local` for local endpoint tests.
 
@@ -97,10 +107,10 @@ Current local verification:
 
 ```bash
 cd iicp-directory-rs
-cargo test
+./scripts/check_quality.sh
 ```
 
-The route-alias and live-shape compatibility tests are in `src/main.rs` near the other HTTP integration tests.
+The route-alias and live-shape compatibility tests are in `src/main.rs` near the other HTTP integration tests. The local publication-quality lane also blocks on Clippy, RustSec and a 70% line-coverage floor; the first measured operator-preview baseline was 74.05%. This is an explicit ratchet, not a claim of PHP's higher coverage level.
 
 ## Relationship to PHP
 

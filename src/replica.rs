@@ -34,6 +34,9 @@ pub struct ReplicaConfig {
     /// This replica's public HTTPS endpoint, from `IICP_REPLICA_ENDPOINT`.
     /// Sent to the seed during the join handshake so the seed can record this replica.
     pub replica_endpoint: Option<String>,
+    /// Production replicas never mutate from an unsigned/unverified source.
+    /// The bypass is explicit and limited to non-production testbeds.
+    pub verification_required: bool,
 }
 
 impl ReplicaConfig {
@@ -50,13 +53,26 @@ impl ReplicaConfig {
             .unwrap_or(10);
         let replica_did = std::env::var("IICP_REPLICA_DID").ok();
         let replica_endpoint = std::env::var("IICP_REPLICA_ENDPOINT").ok();
+        let app_env = std::env::var("APP_ENV").ok();
+        let unsigned_requested =
+            std::env::var("IICP_DEV_ALLOW_UNSIGNED_EVENTS").is_ok_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
         Some(ReplicaConfig {
             seed_url: seed_url.trim_end_matches('/').to_string(),
             poll_interval_secs,
             replica_did,
             replica_endpoint,
+            verification_required: verification_required(app_env.as_deref(), unsigned_requested),
         })
     }
+}
+
+fn verification_required(app_env: Option<&str>, unsigned_requested: bool) -> bool {
+    !matches!(app_env, Some("local" | "testing")) || !unsigned_requested
 }
 
 /// Resolve the seed's Ed25519 pubkey (hex) from its DID document — `None` if the seed
@@ -170,15 +186,20 @@ async fn join_handshake(
 /// Replica sync loop (DIR-FED-01/02/13): resolve the seed's signing key, perform the
 /// join handshake + snapshot bootstrap (#440), then poll the event log forever — verifying
 /// + applying each new event to mirror the seed's state. The join handshake (§7) announces
-/// this replica to the seed; the snapshot bootstrap (§5.3) primes local state and advances
-/// `since_seq` so we only tail events newer than the snapshot.
+///   this replica to the seed; the snapshot bootstrap (§5.3) primes local state and advances
+///   `since_seq` so we only tail events newer than the snapshot.
 pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap_or_default();
 
-    let pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+    let mut pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+    while cfg.verification_required && pubkey.is_none() {
+        eprintln!("[replica] seed verification key unavailable; refusing snapshot/event mutation");
+        tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs)).await;
+        pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+    }
     eprintln!(
         "[replica] sync start: seed={} signing-key={}",
         cfg.seed_url,
@@ -197,13 +218,25 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
 
     // SNAPSHOT BOOTSTRAP (§5.3): fetch the seed's state snapshot, apply it, and
     // advance `since_seq` to `snapshot_seq` so the poll loop only tails new events.
-    let mut since_seq: i64 = fetch_and_apply_snapshot(&client, &cfg.seed_url, repo.as_ref())
-        .await
-        .unwrap_or(0);
+    let mut since_seq: i64 = if cfg.verification_required {
+        eprintln!("[replica] unsigned snapshot skipped; replaying verified event chain from seq=0");
+        0
+    } else {
+        fetch_and_apply_snapshot(&client, &cfg.seed_url, repo.as_ref())
+            .await
+            .unwrap_or(0)
+    };
 
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.poll_interval_secs));
     loop {
         interval.tick().await;
+        if cfg.verification_required && pubkey.is_none() {
+            pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+            if pubkey.is_none() {
+                eprintln!("[replica] seed verification key still unavailable; no mutation");
+                continue;
+            }
+        }
         // Drain the backlog (paginate until caught up), then idle until the next tick.
         // `prev_sig` tracks the signature of the last event we verified, so each next
         // event's prev_hash can be checked for hash-chain continuity (#458). It is unknown
@@ -221,6 +254,7 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
                 break;
             }
             let mut applied = 0u32;
+            let mut refresh_key = false;
             for ev in &events {
                 let expected_prev = prev_sig
                     .as_deref()
@@ -236,13 +270,30 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
                 if hw > since_seq {
                     since_seq = hw;
                 }
-                if outcome == ApplyOutcome::Applied {
-                    applied += 1;
+                if matches!(outcome, ApplyOutcome::Applied | ApplyOutcome::Skipped) {
+                    if outcome == ApplyOutcome::Applied {
+                        applied += 1;
+                    }
                     prev_sig = ev.sig.clone();
+                }
+                if matches!(
+                    outcome,
+                    ApplyOutcome::Rejected("bad signature")
+                        | ApplyOutcome::Rejected("missing signature")
+                ) {
+                    refresh_key = true;
+                    break;
                 }
             }
             if applied > 0 {
                 eprintln!("[replica] applied {applied} event(s) → seq={since_seq}");
+            }
+            if refresh_key {
+                pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+                eprintln!(
+                    "[replica] signature rejection triggered seed-key refresh; event high-water unchanged"
+                );
+                break;
             }
             if !has_more {
                 break;
@@ -659,8 +710,12 @@ pub async fn verify_and_apply(
     }
     let outcome = apply_event(repo, ev).await;
     // Advance the high-water mark only when the event was accepted (applied/skipped),
-    // never on rejection.
-    (outcome, ev.seq)
+    // never on malformed or rejected input.
+    let high_water = match outcome {
+        ApplyOutcome::Applied | ApplyOutcome::Skipped => ev.seq,
+        ApplyOutcome::Rejected(_) => last_applied_seq,
+    };
+    (outcome, high_water)
 }
 
 /// Extract the Genesis Seed's Ed25519 public key (hex) from its DID document
@@ -1146,6 +1201,15 @@ mod tests {
             seed_pubkey_hex_from_did(&did).as_deref(),
             Some("d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737")
         );
+    }
+
+    #[test]
+    fn unsigned_replica_mode_is_explicit_and_non_production_only() {
+        assert!(verification_required(Some("production"), true));
+        assert!(verification_required(Some("staging"), true));
+        assert!(verification_required(Some("testing"), false));
+        assert!(!verification_required(Some("testing"), true));
+        assert!(!verification_required(Some("local"), true));
     }
 
     #[test]

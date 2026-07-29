@@ -1,0 +1,17 @@
+{
+  "authority": {
+    "php_commit": "58a5028a33d7",
+    "runtime_version": "v1.10.81.1"
+  },
+  "contract_version": "v1.10.81",
+  "fixtures": {
+    "behavior-contract-v1.json": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+    "http-contract-v1.json": "62fad592a33305a754353c43f6476d257f01ccf6e3cfdbf391d03717ce4796b5"
+  },
+  "scope": [
+    "v1.10.80_observable_contract_unchanged",
+    "tls_identity_fail_closed",
+    "production_federation_signature_required",
+    "strict_replica_cursor_integrity"
+  ]
+}

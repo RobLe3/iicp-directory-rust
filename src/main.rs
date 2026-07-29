@@ -211,8 +211,6 @@ const EXPOSURE_MODES: [&str; 8] = [
     "dual_stack_available",
 ];
 
-/// ADR-019 pricing_model vocabulary — enum parity with PHP (#401 / AL2).
-
 /// Process start instant — backs `server.uptime_seconds` in `/v1/stats` (PHP parity).
 /// Set once in `main`; unset in tests (uptime reports 0).
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -230,6 +228,12 @@ struct AppState {
     /// Adoption-gated E050 E′ hardening. False preserves the migration-safe
     /// dead-endpoint fallback; production must not enable this before #534.
     strict_e050_secured: bool,
+    /// Registration/lifecycle probes verify TLS identity by default. The
+    /// insecure mode is accepted only by an explicit non-production testbed.
+    allow_insecure_tls: bool,
+    /// Tests may disable live dial-back. Production defaults to probing every
+    /// registration that lacks a concrete topology declaration.
+    skip_liveness_check: bool,
 }
 
 /// Emit + sign a federated event onto this directory's log if a signing key is configured
@@ -916,16 +920,16 @@ async fn dispatch_ticket_issue(
     nodes.retain(|node| {
         node.health_models
             .as_ref()
-            .map_or(true, |models| !models.is_empty())
-            && req.model.as_ref().map_or(true, |model| {
+            .is_none_or(|models| !models.is_empty())
+            && req.model.as_ref().is_none_or(|model| {
                 node.health_models
                     .as_ref()
                     .unwrap_or(&node.models)
                     .contains(model)
             })
-            && req.relay_capable.map_or(true, |required| {
-                node.relay_capable.unwrap_or(false) == required
-            })
+            && req
+                .relay_capable
+                .is_none_or(|required| node.relay_capable.unwrap_or(false) == required)
             && !req
                 .exclude_node_id_prefixes
                 .iter()
@@ -1796,7 +1800,7 @@ async fn operator_challenge(
         Some(true) => {}
     }
     use ct_codecs::{Base64UrlSafeNoPadding, Encoder};
-    let nonce = Base64UrlSafeNoPadding::encode_to_string(&uuid::Uuid::new_v4().as_bytes())
+    let nonce = Base64UrlSafeNoPadding::encode_to_string(uuid::Uuid::new_v4().as_bytes())
         .unwrap_or_default();
     let expires = delegation::now_unix().saturating_add(OPERATOR_CHALLENGE_TTL_SECS);
     operator_challenges()
@@ -2265,9 +2269,9 @@ fn relay_endpoint(metadata: Option<&serde_json::Value>) -> Option<&str> {
 /// (operators run self-signed tunnels), matching the PHP `withoutVerifying()`. Any error
 /// (timeout, refused, DNS) → not alive. NOTE: like the PHP probe, this dials a
 /// node-controlled URL; the SSRF/DNS-rebind hardening tracked in #535 applies to both.
-async fn probe_endpoint_alive(endpoint: &str) -> bool {
+async fn probe_endpoint_alive(endpoint: &str, allow_insecure_tls: bool) -> bool {
     let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(allow_insecure_tls)
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
@@ -2534,7 +2538,7 @@ async fn registration_ownership_rejection(
     let secured = existing.operator_pubkey.is_some() || existing.public_key.is_some();
     let old_alive = if endpoint_changed && !has_ownership && !(state.strict_e050_secured && secured)
     {
-        probe_endpoint_alive(&existing.endpoint).await
+        probe_endpoint_alive(&existing.endpoint, state.allow_insecure_tls).await
     } else {
         false
     };
@@ -2636,9 +2640,21 @@ async fn register(
         return reject("IICP-E035", &format!("non-routable endpoint: {e:?}"));
     }
 
-    // RT-04: a node that does not declare a concrete reachable topology would, in the
-    // full implementation, be subject to a liveness probe before public_reachable=true.
+    // RT-04: a node without a concrete topology declaration must prove dial-back
+    // reachability before credentials are issued. TLS identity remains enabled in
+    // production; only an explicit non-production testbed can disable it.
     let declared = is_declared_reachable(req.nat_type.as_deref(), req.transport_method.as_deref());
+    let endpoint_verified = if declared || st.skip_liveness_check {
+        true
+    } else {
+        probe_endpoint_alive(&req.endpoint, st.allow_insecure_tls).await
+    };
+    if !endpoint_verified {
+        return reject(
+            "IICP-E036",
+            "endpoint unreachable or TLS identity verification failed",
+        );
+    }
 
     // node_id: collision-free UUID v4 (iter-1571 BUG fix — SystemTime-nanos could collide).
     // node_token: UUID v4, bcrypt-hashed by MySqlRepo at cost 12 before storing.
@@ -2829,7 +2845,7 @@ async fn register(
             node_hmac_key,
             operator_pubkey_for_upsert,
             recovered,
-            declared_reachable: declared,
+            declared_reachable: endpoint_verified,
         },
     )
     .await
@@ -4002,16 +4018,29 @@ async fn compliance_attestation(
             })),
         );
     };
+    let Some(run) = st.repo.latest_conformance_run().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "no_probe_data",
+                    "message": "No conformance probe run recorded yet"
+                }
+            })),
+        );
+    };
     let generated_at = chrono::Utc::now();
     let valid_until = generated_at + chrono::Duration::seconds(900);
     let document = serde_json::json!({
-        "endpoint": "https://iicp.network",
+        "endpoint": std::env::var("IICP_PUBLIC_URL")
+            .unwrap_or_else(|_| "https://iicp.network".to_string())
+            .trim_end_matches('/'),
         "spec_version": "iicp-dir v1.1.0",
         "purpose": "compliance-attestation",
-        "probe_run_id": serde_json::Value::Null,
-        "probe_run_at": serde_json::Value::Null,
-        "passed_probes": [],
-        "failed_probes": [],
+        "probe_run_id": run.run_id,
+        "probe_run_at": run.probed_at,
+        "passed_probes": run.passed,
+        "failed_probes": run.failed,
         "generated_at": generated_at.to_rfc3339(),
         "valid_until": valid_until.to_rfc3339()
     });
@@ -5061,7 +5090,7 @@ fn compute_directory_health(agg: &crate::repo::ProbeAggregate24h) -> serde_json:
     }
 
     let lat_score = p50
-        .map(|v| (1.0 - (v - 50.0) / 450.0).max(0.0).min(1.0))
+        .map(|v| (1.0 - (v - 50.0) / 450.0).clamp(0.0, 1.0))
         .unwrap_or(0.5);
     let total = passed + failed;
     let conf_score = if total > 0 {
@@ -5319,7 +5348,7 @@ struct RepositoryRuntime {
     mysql_pool: Option<Pool<MySql>>,
 }
 
-async fn initialize_repository() -> RepositoryRuntime {
+async fn initialize_repository(env: Env) -> RepositoryRuntime {
     // Wire DATABASE_URL → MySqlRepo when present. A configured database is an
     // explicit persistence contract: connection or schema failures are fatal,
     // never a silent downgrade to ephemeral memory.
@@ -5346,12 +5375,24 @@ async fn initialize_repository() -> RepositoryRuntime {
                 std::process::exit(1);
             }
         }
-    } else {
+    } else if env != Env::Production
+        && std::env::var("IICP_ALLOW_IN_MEMORY").is_ok_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    {
         println!("iicp-directory-rs {VERSION}: no DATABASE_URL; using InMemoryRepo");
         RepositoryRuntime {
             repo: Arc::new(InMemoryRepo::default()),
             mysql_pool: None,
         }
+    } else {
+        eprintln!(
+            "FATAL: DATABASE_URL is required; ephemeral memory requires non-production APP_ENV and IICP_ALLOW_IN_MEMORY=true"
+        );
+        std::process::exit(1);
     }
 }
 
@@ -5441,7 +5482,7 @@ async fn main() {
         Ok("staging") => Env::Staging,
         _ => Env::Production,
     };
-    let runtime = initialize_repository().await;
+    let runtime = initialize_repository(env).await;
     let repo = runtime.repo;
 
     // Spawn background maintenance tasks before starting the HTTP server.
@@ -5479,7 +5520,13 @@ async fn main() {
     // register/deregister write paths emit signed events onto /v1/events (become a seed).
     let signing_key = std::env::var("IICP_GENESIS_ED25519_SECRET_KEY")
         .ok()
-        .filter(|k| k.len() == 128);
+        .filter(|key| key.len() == 128 && hex::decode(key).is_ok());
+    if env == Env::Production && signing_key.is_none() {
+        eprintln!(
+            "FATAL: IICP_GENESIS_ED25519_SECRET_KEY must be a valid 128-hex Ed25519 secret in production"
+        );
+        std::process::exit(1);
+    }
     let state = AppState {
         repo,
         env,
@@ -5491,6 +5538,20 @@ async fn main() {
                 "1" | "true" | "yes" | "on"
             )
         }),
+        allow_insecure_tls: env != Env::Production
+            && std::env::var("IICP_DEV_ALLOW_INSECURE_TLS").is_ok_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
+        skip_liveness_check: matches!(env, Env::Local | Env::Testing)
+            && std::env::var("IICP_SKIP_LIVENESS_CHECK").is_ok_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
     };
     let router = match replica_seed_url {
         Some(seed) => app(state).layer(middleware::from_fn_with_state(seed, replica_write_gate)),
@@ -5601,6 +5662,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         }
     }
 
@@ -5623,6 +5686,61 @@ mod tests {
             "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
         ));
         st
+    }
+
+    #[tokio::test]
+    async fn compliance_attestation_uses_latest_conformance_run() {
+        let st = test_state_with_signing_key();
+        st.repo
+            .record_probe_batch(
+                "test",
+                &[
+                    ProbeResult {
+                        probe_id: "p1".into(),
+                        probe_type: "conformance".into(),
+                        test_id: Some("DIR-ONE".into()),
+                        level: "must".into(),
+                        passed: true,
+                        latency_ms: None,
+                        detail: None,
+                        run_id: "run-current".into(),
+                        probed_at: Some("2026-07-29T15:16:51Z".into()),
+                        node_id: None,
+                    },
+                    ProbeResult {
+                        probe_id: "p2".into(),
+                        probe_type: "conformance".into(),
+                        test_id: Some("DIR-TWO".into()),
+                        level: "should".into(),
+                        passed: false,
+                        latency_ms: None,
+                        detail: None,
+                        run_id: "run-current".into(),
+                        probed_at: Some("2026-07-29T15:16:51Z".into()),
+                        node_id: None,
+                    },
+                ],
+            )
+            .await;
+
+        let response = app(st)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/compliance-attestation")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["probe_run_id"], "run-current");
+        assert_eq!(value["passed_probes"], serde_json::json!(["DIR-ONE"]));
+        assert_eq!(value["failed_probes"], serde_json::json!(["DIR-TWO"]));
+        assert!(value["signature"]
+            .as_str()
+            .is_some_and(|sig| sig.len() == 128));
     }
 
     #[tokio::test]
@@ -8126,8 +8244,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_unknown_nat_not_declared_reachable() {
-        // RT-04: unknown nat_type → public_reachable=false (probe pending), not auto-true.
+    async fn explicit_test_liveness_bypass_admits_routable_unknown_nat_endpoint() {
+        // The shared test state explicitly enables the liveness bypass. RT-04 is
+        // covered by validate::tests::rt04_unknown_nat_does_not_bypass_probe;
+        // without the explicit bypass production performs a real dial-back.
         let body = serde_json::json!({
             "endpoint": "https://1.1.1.1",
             "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
@@ -8140,7 +8260,7 @@ mod tests {
         assert_eq!(resp.status(), 201);
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        assert_eq!(v["public_reachable"], false);
+        assert_eq!(v["public_reachable"], true);
     }
 
     fn hb(
@@ -8270,6 +8390,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         };
         let router = app(st);
         let body = |id: &str| {
@@ -8338,6 +8460,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         };
         let router = app(st);
         let body = serde_json::json!({
@@ -8390,6 +8514,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         };
         let router = app(st);
 
@@ -9031,6 +9157,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         };
         for bad_id in &[
             "",
@@ -9044,6 +9172,8 @@ mod tests {
                 signing_key: None,
                 register_rate: new_register_rate(),
                 strict_e050_secured: false,
+                allow_insecure_tls: false,
+                skip_liveness_check: true,
             })
             .oneshot(post_register(serde_json::json!({
                 "node_id": bad_id,
@@ -9072,6 +9202,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         };
         let resp = app(st)
             .oneshot(post_register(serde_json::json!({
@@ -9097,6 +9229,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         };
         let resp = app(st)
             .oneshot(post_register(serde_json::json!({
@@ -9175,6 +9309,8 @@ mod tests {
             signing_key: None,
             register_rate: new_register_rate(),
             strict_e050_secured: false,
+            allow_insecure_tls: false,
+            skip_liveness_check: true,
         };
         let body = serde_json::json!({
             "node_id": "self-node",

@@ -174,6 +174,7 @@ pub fn sign_event(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // Protocol transcript has eight fixed signed fields.
 pub fn sign_event_with_service_id(
     secret_key_hex: &str,
     service_id: &str,

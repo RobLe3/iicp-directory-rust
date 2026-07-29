@@ -2,6 +2,14 @@
 
 ## 0.1.0
 
+- Makes production persistence fail closed when `DATABASE_URL` is absent.
+- Verifies TLS identity for registration and lifecycle probes; insecure TLS is
+  limited to an explicit local/testing fixture flag.
+- Requires verified federation events in staging/production and prevents an
+  unsigned snapshot from mutating a strict replica before seed-key resolution.
+- Grounds compliance attestations in stored conformance probe evidence.
+- Adds blocking formatting, Clippy, tests, a measured 70% line-coverage ratchet
+  and RustSec checks to the local publication-quality lane.
 - First public operator preview of the Rust directory implementation.
 - Declares compatibility with the versioned PHP HTTP, behavior and schema
   fixtures listed in `compatibility/v0.1.0.json`.

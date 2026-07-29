@@ -222,6 +222,7 @@ pub trait NodeRepository: Send + Sync {
     /// not operator-bound (no `operator_pubkey`). The `operator_pubkey` is never returned —
     /// only the totals. Kept for backward-compatible tests; rich summaries use
     /// operator_wallet_summary().
+    #[allow(dead_code)]
     async fn operator_wallet(&self, node_id: &str) -> Option<(f64, u32)>;
 
     /// Rich operator wallet rollup: balance, earned, spent, tx count and reconcile flag.
@@ -303,6 +304,10 @@ pub trait NodeRepository: Send + Sync {
     /// Bulk-insert telemetry probe results and touch last_seen_at on the token.
     /// Returns the count of probes stored.
     async fn record_probe_batch(&self, token_sha256_hex: &str, probes: &[ProbeResult]) -> u32;
+
+    /// Latest completed conformance run used by the signed compliance
+    /// attestation. Returns content-free test identifiers only.
+    async fn latest_conformance_run(&self) -> Option<ConformanceRun>;
 
     /// WQ-057 — the `credit_cost_multiplier` of every available node serving `intent` with
     /// reputation ≥ `min_reputation` (the quote candidate set, PHP CreditsController::quote).
@@ -647,6 +652,49 @@ pub struct ProbeResult {
     pub node_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ConformanceRun {
+    pub run_id: String,
+    pub probed_at: String,
+    pub passed: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+fn conformance_run_from_probes(probes: &[ProbeResult]) -> Option<ConformanceRun> {
+    let latest = probes
+        .iter()
+        .filter(|probe| probe.probe_type == "conformance" && !probe.run_id.is_empty())
+        .max_by_key(|probe| probe.probed_at.as_deref().unwrap_or(""))?;
+    let mut passed = Vec::new();
+    let mut failed = Vec::new();
+    for probe in probes
+        .iter()
+        .filter(|probe| probe.probe_type == "conformance" && probe.run_id == latest.run_id)
+    {
+        let Some(test_id) = probe.test_id.as_ref() else {
+            continue;
+        };
+        if probe.passed {
+            passed.push(test_id.clone());
+        } else {
+            failed.push(test_id.clone());
+        }
+    }
+    passed.sort();
+    passed.dedup();
+    failed.sort();
+    failed.dedup();
+    Some(ConformanceRun {
+        run_id: latest.run_id.clone(),
+        probed_at: latest
+            .probed_at
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        passed,
+        failed,
+    })
+}
+
 /// Pre-aggregated probe metrics from `iicp_telemetry_aggregates` for a 24h window.
 /// All fields are None/0 until the REACH aggregation job has run (PHP parity: unavailable).
 #[derive(Debug, Default)]
@@ -788,6 +836,8 @@ pub struct RegistryStats {
 /// In-memory repository — backs tests and local runs until the MySQL layer lands.
 /// Read-write via a Mutex so the register→discover→heartbeat lifecycle is consistent;
 /// the MySQL-backed impl drops in behind the same trait.
+type ReplicaTuple = (String, String, String, String, i64);
+
 #[derive(Debug, Default)]
 pub struct InMemoryRepo {
     records: std::sync::Mutex<Vec<NodeRecord>>,
@@ -797,12 +847,13 @@ pub struct InMemoryRepo {
     /// (node_id, evaluator_did, score, evaluated_at_ms).
     health_obs: std::sync::Mutex<Vec<(String, String, f64, i64)>>,
     /// #441: trusted replicas — (replica_id, did, endpoint, trust_tier, registered_at_ms).
-    replicas: std::sync::Mutex<Vec<(String, String, String, String, i64)>>,
+    replicas: std::sync::Mutex<Vec<ReplicaTuple>>,
     /// #442: appended signed event log (seq-monotonic).
     events: std::sync::Mutex<Vec<EventRow>>,
     /// #463/#310: operator-identity records keyed by operator_pubkey → [`OperatorRow`].
     operators: std::sync::Mutex<std::collections::HashMap<String, OperatorRow>>,
     dispatch_usage: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
+    probe_results: std::sync::Mutex<Vec<ProbeResult>>,
 }
 
 /// In-memory operator-identity record (#463/#310). `ordinal`/`tier`/`badge` are the founder
@@ -841,6 +892,7 @@ impl InMemoryRepo {
             events: std::sync::Mutex::new(Vec::new()),
             operators: std::sync::Mutex::new(std::collections::HashMap::new()),
             dispatch_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
+            probe_results: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -1422,7 +1474,12 @@ impl NodeRepository for InMemoryRepo {
     }
 
     async fn record_probe_batch(&self, _token_sha256_hex: &str, probes: &[ProbeResult]) -> u32 {
-        probes.len() as u32 // InMemoryRepo: no telemetry table; count only
+        self.probe_results.lock().unwrap().extend_from_slice(probes);
+        probes.len() as u32
+    }
+
+    async fn latest_conformance_run(&self) -> Option<ConformanceRun> {
+        conformance_run_from_probes(&self.probe_results.lock().unwrap())
     }
 
     async fn quote_multipliers(&self, intent: &str, min_reputation: f64) -> Vec<f64> {

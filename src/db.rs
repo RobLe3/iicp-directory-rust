@@ -391,7 +391,7 @@ fn median_outlier_weight(value: f64, sorted_sample: &[(f64,)]) -> f64 {
         return 1.0;
     }
     let n = sorted_sample.len();
-    let median = if n.is_multiple_of(2) {
+    let median = if n % 2 == 0 {
         (sorted_sample[n / 2 - 1].0 + sorted_sample[n / 2].0) / 2.0
     } else {
         sorted_sample[n / 2].0
@@ -504,15 +504,15 @@ fn credit_ttl_idle(max_earn_expires_at_unix: Option<i64>, balance: f64, now_unix
 
 impl From<NodeRow> for Node {
     fn from(r: NodeRow) -> Self {
-        let rep = r.reputation_score as f64;
-        let lat = r.avg_latency_ms as f64;
+        let rep = r.reputation_score;
+        let lat = r.avg_latency_ms;
         Node {
             node_id: r.id,
             endpoint: r.endpoint,
             region: r.region,
             score: rep,
             available: r.available,
-            load: r.load as f64,
+            load: r.load,
             active_jobs: r.active_jobs,
             max_concurrent: r.max_concurrent,
             reputation_score: rep,
@@ -559,7 +559,7 @@ impl From<NodeRow> for Node {
             // #400 — discover field parity. credit_cost_multiplier defaults to
             // 1.0 when the column was absent (sqlx default → 0.0 → coerce to 1.0).
             credit_cost_multiplier: if r.credit_cost_multiplier > 0.0 {
-                r.credit_cost_multiplier as f64
+                r.credit_cost_multiplier
             } else {
                 1.0
             },
@@ -2374,6 +2374,48 @@ impl NodeRepository for MySqlRepo {
             let _ = probed_at; // timestamp handling deferred to Phase 2
         }
         count
+    }
+
+    async fn latest_conformance_run(&self) -> Option<crate::repo::ConformanceRun> {
+        let latest: Option<(String, String)> = sqlx::query_as(
+            "SELECT run_id, DATE_FORMAT(probed_at, '%Y-%m-%dT%H:%i:%sZ') \
+             FROM iicp_telemetry_probes \
+             WHERE probe_type = 'conformance' AND run_id IS NOT NULL AND run_id <> '' \
+             ORDER BY probed_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let (run_id, probed_at) = latest?;
+        let rows: Vec<(Option<String>, bool)> = sqlx::query_as(
+            "SELECT test_id, passed FROM iicp_telemetry_probes \
+             WHERE probe_type = 'conformance' AND run_id = ?",
+        )
+        .bind(&run_id)
+        .fetch_all(&self.pool)
+        .await
+        .ok()?;
+        let mut passed = Vec::new();
+        let mut failed = Vec::new();
+        for (test_id, ok) in rows {
+            let Some(test_id) = test_id else { continue };
+            if ok {
+                passed.push(test_id);
+            } else {
+                failed.push(test_id);
+            }
+        }
+        passed.sort();
+        passed.dedup();
+        failed.sort();
+        failed.dedup();
+        Some(crate::repo::ConformanceRun {
+            run_id,
+            probed_at,
+            passed,
+            failed,
+        })
     }
 
     async fn quote_multipliers(&self, intent: &str, min_reputation: f64) -> Vec<f64> {

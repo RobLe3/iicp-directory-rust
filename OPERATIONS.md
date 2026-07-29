@@ -1,8 +1,9 @@
 # Self-host operations
 
-The Rust directory uses an in-memory repository when `DATABASE_URL` is absent
-and MySQL when it is configured. In-memory operation is for development and
-does not provide durable recovery.
+The Rust directory requires `DATABASE_URL` in production. Disposable in-memory
+operation requires both a non-production `APP_ENV` and
+`IICP_ALLOW_IN_MEMORY=true`; it does not provide durable recovery. Production
+startup fails rather than silently losing directory state.
 
 For MySQL operation, create an encrypted off-host backup before and after every
 migration or maintenance operation. Restore tests must use a new disposable
@@ -27,7 +28,9 @@ The release image runs as fixed unprivileged identity `10001:10001`. A
 production orchestrator should additionally use a read-only root filesystem,
 drop all Linux capabilities, set `no-new-privileges`, and provide only a small
 non-executable `/tmp` tmpfs if the platform requires one. Database and signing
-credentials remain runtime secrets; never bake them into the image.
+credentials remain runtime secrets; never bake them into the image. Production
+startup requires both `DATABASE_URL` and a valid 128-hex
+`IICP_GENESIS_ED25519_SECRET_KEY`.
 
 Before considering an operator release, run the disposable evidence lane:
 
@@ -44,3 +47,18 @@ read-path samples per image. It fails on any 5xx response or candidate p95
 regression above 10%. The retained report contains only image digests,
 aggregate timings and pass/fail flags; it is not production capacity evidence
 or deployment authorization.
+
+## Production trust boundaries
+
+TLS certificates are verified during registration dial-back and lifecycle
+probes. `IICP_DEV_ALLOW_INSECURE_TLS=true` is accepted only in `local` or
+`testing`; production always verifies peer identity.
+
+Replica mode requires signed events in staging and production. Until the seed
+signing key is available, the replica waits without applying a snapshot or
+advancing its cursor. `IICP_DEV_ALLOW_UNSIGNED_EVENTS=true` is limited to local
+and testing fixtures.
+
+Compliance attestations are issued only when stored conformance probe evidence
+exists and a directory signing key is configured. Missing evidence or signing
+material fails closed; an empty signed success record is never emitted.

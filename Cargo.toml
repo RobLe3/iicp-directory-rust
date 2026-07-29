@@ -2,6 +2,7 @@
 name = "iicp-directory-rs"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.86"
 license = "Apache-2.0"
 description = "Pre-1.0 Rust operator preview of the IICP directory control plane."
 repository = "https://github.com/RobLe3/iicp-directory-rust"

@@ -58,7 +58,7 @@ fn base_verification(canonical: &[u8]) -> Verification {
         key_id: None,
         signed_at: None,
         expires_at: None,
-        canonical_sha256: hex::encode(Sha256::digest(&canonical)),
+        canonical_sha256: hex::encode(Sha256::digest(canonical)),
         public_key_sha256: None,
         manifest_identity_level: "self_attested",
         policy_key_fingerprint: None,
@@ -87,6 +87,7 @@ fn with_signature_metadata(
     result
 }
 
+#[allow(clippy::result_large_err)] // Both outcomes expose one normalized verification record.
 fn verify_detached(
     mut result: Verification,
     signature: &Map<String, Value>,

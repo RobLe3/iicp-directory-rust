@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 const BYTES: &[u8] = include_bytes!("../parity/behavior-contract-v1.json");
 const MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.80.json");
+const CURRENT_MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.81.json");
 const EXPECTED_SHA256: &str = "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f";
 
 #[derive(Deserialize)]
@@ -143,6 +144,22 @@ fn v1_10_80_manifest_pins_both_shared_fixtures() {
     let manifest: serde_json::Value =
         serde_json::from_slice(MANIFEST_BYTES).expect("valid parity manifest");
     assert_eq!(manifest["contract_version"], "v1.10.80");
+    assert_eq!(
+        manifest["fixtures"]["behavior-contract-v1.json"],
+        EXPECTED_SHA256
+    );
+    assert_eq!(
+        manifest["fixtures"]["http-contract-v1.json"],
+        "62fad592a33305a754353c43f6476d257f01ccf6e3cfdbf391d03717ce4796b5"
+    );
+}
+
+#[test]
+fn v1_10_81_manifest_preserves_wire_and_behavior_contracts() {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(CURRENT_MANIFEST_BYTES).expect("valid current parity manifest");
+    assert_eq!(manifest["contract_version"], "v1.10.81");
+    assert_eq!(manifest["authority"]["runtime_version"], "v1.10.81.1");
     assert_eq!(
         manifest["fixtures"]["behavior-contract-v1.json"],
         EXPECTED_SHA256
