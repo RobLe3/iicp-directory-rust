@@ -159,7 +159,7 @@ fn v1_10_81_manifest_preserves_wire_and_behavior_contracts() {
     let manifest: serde_json::Value =
         serde_json::from_slice(CURRENT_MANIFEST_BYTES).expect("valid current parity manifest");
     assert_eq!(manifest["contract_version"], "v1.10.81");
-    assert_eq!(manifest["authority"]["runtime_version"], "v1.10.81.1");
+    assert_eq!(manifest["authority"]["runtime_version"], "v1.10.81.2");
     assert_eq!(
         manifest["fixtures"]["behavior-contract-v1.json"],
         EXPECTED_SHA256
