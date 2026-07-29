@@ -2,7 +2,7 @@
 
 ## Decision
 
-**READY FOR FINAL v0.1.0 CANDIDATE GATES.** The technical
+**READY FOR FINAL v0.1.1 CANDIDATE GATES.** The technical
 publication-preparation checks below pass, but this assessment does not claim
 production equivalence with the PHP Genesis Seed.
 

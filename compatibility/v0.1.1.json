@@ -2,7 +2,7 @@
   "schema": "iicp.directory-implementation-compatibility.v1",
   "implementation": {
     "flavor": "rust",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "status": "operator_preview"
   },
   "php_parity_baseline": {

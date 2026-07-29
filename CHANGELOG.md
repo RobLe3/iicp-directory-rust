@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Corrective first public operator preview after the `v0.1.0` tag was pushed
+  before its compatibility-manifest gate completed. The failed tag remains
+  immutable and has no release assets.
+- Includes the production persistence, TLS, federation, attestation and local
+  quality-gate hardening described below.
+
 ## 0.1.0
 
 - Makes production persistence fail closed when `DATABASE_URL` is absent.
@@ -12,7 +20,7 @@
   and RustSec checks to the local publication-quality lane.
 - First public operator preview of the Rust directory implementation.
 - Declares compatibility with the versioned PHP HTTP, behavior and schema
-  fixtures listed in `compatibility/v0.1.0.json`.
+  fixtures listed in `compatibility/v0.1.1.json`.
 - Includes disposable MySQL upgrade, rollback, recovery and non-root container
   evidence.
 - Does not authorize a Genesis Seed cutover or PHP deprecation.

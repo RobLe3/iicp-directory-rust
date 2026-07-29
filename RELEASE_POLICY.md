@@ -7,7 +7,7 @@ implementation-neutral authority. PHP is the currently deployed Genesis
 flavor. Rust is the second official flavor and remains an operator preview
 until persistent REACH and rollback gates pass.
 
-The initial public preview version is `v0.1.0`. A Rust release does not
+The first completed public preview is `v0.1.1`. The `v0.1.0` tag is retained as a failed publication attempt and has no release assets. A Rust release does not
 authorize Genesis deployment, database mutation or PHP deprecation.
 
 ## Compatibility

@@ -270,7 +270,7 @@ mod tests {
         let s = Stats {
             server: ServerInfo {
                 active_nodes: 3,
-                version: "v0.1.0-rs".into(),
+                version: concat!("v", env!("CARGO_PKG_VERSION"), "-rs").into(),
             },
             mesh_health: MeshHealth {
                 score: 65,
