@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2
+
+- Corrects the PHP compatibility baseline to `v1.10.81.2`. The accidentally
+  published PHP `v1.10.81.1` tag identifies its previous main commit and is not
+  a deployable release.
+- Preserves the same Rust security behavior and byte-identical HTTP/behavior
+  fixtures as v0.1.1.
+
 ## 0.1.1
 
 - Corrective first public operator preview after the `v0.1.0` tag was pushed

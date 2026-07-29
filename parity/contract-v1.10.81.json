@@ -1,7 +1,7 @@
 {
   "authority": {
     "php_commit": "58a5028a33d7",
-    "runtime_version": "v1.10.81.1"
+    "runtime_version": "v1.10.81.2"
   },
   "contract_version": "v1.10.81",
   "fixtures": {
