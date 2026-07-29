@@ -62,3 +62,23 @@ and testing fixtures.
 Compliance attestations are issued only when stored conformance probe evidence
 exists and a directory signing key is configured. Missing evidence or signing
 material fails closed; an empty signed success record is never emitted.
+
+## Signed deployment record
+
+Set deployment provenance from an immutable release artifact, not from a
+mutable checkout:
+
+```bash
+export IICP_DEPLOYMENT_KIND=container
+export IICP_RELEASE_TAG=v0.1.3
+export IICP_SOURCE_COMMIT=<40-hex-release-commit>
+export IICP_BUILD_ID=sha256:<artifact-digest>
+export IICP_DEPLOYED_AT=<RFC3339-UTC-time>
+export IICP_ROOT_KEY_ID=did:web:directory.example#key-1
+```
+
+Set `IICP_IMAGE_DIGEST` and `IICP_SBOM_DIGEST` when those artifacts exist.
+Otherwise the signed record reports them as `null`. Verify
+`/.well-known/iicp-deployment.json` against the public release assets and DID
+key before advertising the directory. The record contains no database,
+hostname, path or credential information.

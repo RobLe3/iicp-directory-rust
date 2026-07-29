@@ -12,6 +12,7 @@ mod background;
 mod behavior_contract;
 mod db;
 mod delegation;
+mod deployment_provenance;
 mod discovery_policy;
 mod federation;
 mod health;
@@ -310,6 +311,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/registry/stats", get(registry_stats))
         .route("/api/v1/registry/stats", get(registry_stats))
         .route("/.well-known/did.json", get(did_document))
+        .route("/.well-known/iicp-deployment.json", get(deployment_record))
         .route("/.well-known/iicp-replicas.json", get(iicp_replicas))
         .route("/v1/directory-key", get(directory_key))
         .route("/api/v1/directory-key", get(directory_key))
@@ -3751,6 +3753,34 @@ async fn did_document(State(st): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+async fn deployment_record(State(st): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(config) = deployment_provenance::DeploymentConfig::from_env(VERSION) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {"code": "deployment_record_unavailable"}
+            })),
+        );
+    };
+    let Some(secret) = st.signing_key.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {"code": "deployment_record_unavailable"}
+            })),
+        );
+    };
+    match deployment_provenance::sign(&config, secret) {
+        Some(record) => (StatusCode::OK, Json(record)),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {"code": "deployment_record_unavailable"}
+            })),
+        ),
+    }
+}
+
 /// #442: build the Ed25519 `publicKeyJwk` (OKP/Ed25519, base64url `x`) for this directory's
 /// signing key, so a replica's `seed_pubkey_hex_from_did` resolves the verifying key. The
 /// libsodium 64-byte secret key is seed(32)‖public_key(32) → the pubkey is the last 32 bytes.
@@ -6458,6 +6488,20 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert!(v["verificationMethod"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deployment_record_fails_closed_without_release_metadata() {
+        let response = app(test_state_with_signing_key())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/.well-known/iicp-deployment.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3
+
+- Adds the signed `/.well-known/iicp-deployment.json` profile with the same
+  canonical fixture, purpose separation and fail-closed verification behavior
+  as the PHP directory.
+- Refreshes the parity summary without rewriting the immutable HTTP and
+  behavior fixture authority.
+- Does not authorize Genesis cutover or production federation activation.
+
 ## 0.1.2
 
 - Corrects the PHP compatibility baseline to `v1.10.81.2`. The accidentally
