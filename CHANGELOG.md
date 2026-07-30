@@ -2,6 +2,11 @@
 
 ## 0.1.3
 
+- Aligns replica authentication with PHP `v1.10.82`: registration rotates a
+  snapshot-scoped JWT, only its SHA-256 hash is stored, snapshots require the
+  current token, and the signed event tail remains public. The former events
+  scope is accepted for one compatibility window.
+- Adds a byte-identical PHP/Rust replica-token contract fixture.
 - Adds the signed `/.well-known/iicp-deployment.json` profile with the same
   canonical fixture, purpose separation and fail-closed verification behavior
   as the PHP directory.

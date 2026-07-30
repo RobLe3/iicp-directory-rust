@@ -532,6 +532,13 @@ pub trait NodeRepository: Send + Sync {
         trust_tier: &str,
     ) -> bool;
 
+    /// Store the SHA-256 hash of the currently issued replica JWT. Plaintext tokens
+    /// never enter repository storage.
+    async fn set_replica_token_hash(&self, replica_id: &str, token_hash: &str) -> bool;
+
+    /// Return the stored hash for the current replica JWT.
+    async fn replica_token_hash(&self, replica_id: &str) -> Option<String>;
+
     /// #441: trusted replicas as `(replica_id, did, endpoint, trust_tier, registered_at_ms)`.
     /// Consumed by the `/.well-known/iicp-replicas.json` endpoint (DIR-FED-19) and replica
     /// tests. `registered_at_ms` = Unix ms at first registration (accurate for InMemory;
@@ -848,6 +855,7 @@ pub struct InMemoryRepo {
     health_obs: std::sync::Mutex<Vec<(String, String, f64, i64)>>,
     /// #441: trusted replicas — (replica_id, did, endpoint, trust_tier, registered_at_ms).
     replicas: std::sync::Mutex<Vec<ReplicaTuple>>,
+    replica_token_hashes: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// #442: appended signed event log (seq-monotonic).
     events: std::sync::Mutex<Vec<EventRow>>,
     /// #463/#310: operator-identity records keyed by operator_pubkey → [`OperatorRow`].
@@ -889,6 +897,7 @@ impl InMemoryRepo {
             liveness_challenges: std::sync::Mutex::new(std::collections::HashMap::new()),
             health_obs: std::sync::Mutex::new(Vec::new()),
             replicas: std::sync::Mutex::new(Vec::new()),
+            replica_token_hashes: std::sync::Mutex::new(std::collections::HashMap::new()),
             events: std::sync::Mutex::new(Vec::new()),
             operators: std::sync::Mutex::new(std::collections::HashMap::new()),
             dispatch_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1681,6 +1690,31 @@ impl NodeRepository for InMemoryRepo {
             ));
         }
         true
+    }
+
+    async fn set_replica_token_hash(&self, replica_id: &str, token_hash: &str) -> bool {
+        if !self
+            .replicas
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row.0 == replica_id)
+        {
+            return false;
+        }
+        self.replica_token_hashes
+            .lock()
+            .unwrap()
+            .insert(replica_id.to_string(), token_hash.to_string());
+        true
+    }
+
+    async fn replica_token_hash(&self, replica_id: &str) -> Option<String> {
+        self.replica_token_hashes
+            .lock()
+            .unwrap()
+            .get(replica_id)
+            .cloned()
     }
 
     async fn all_replicas(&self) -> Vec<(String, String, String, String, i64)> {

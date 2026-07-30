@@ -1,7 +1,7 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
-Last refreshed: **2026-07-29**. Rust `v0.1.3` pins the current shared
-`contract-v1.10.81.json`, whose PHP runtime authority is `v1.10.81.2`. The
+Last refreshed: **2026-07-30**. Rust `v0.1.3` pins the current shared
+`contract-v1.10.82.json`, whose PHP runtime authority is `v1.10.82`. The
 normalized HTTP and behavior fixtures retain their `v1.10.80.1` authority
 because the trust-boundary release did not change those wire vectors. The older
 contracts remain immutable evidence; none authorizes a production cutover.
@@ -97,8 +97,8 @@ Status legend: ✅ done · 🔶 present but not full production equivalent · �
 | Surface | Rust status |
 |---|---|
 | `GET /api/v1/events` + legacy `/v1/events` | ✅ signed event log supported when signing key configured |
-| `GET /api/v1/snapshot` + legacy `/v1/snapshot` | ✅ |
-| `POST /api/v1/replicas/register` + legacy `/v1/replicas/register` | ✅ |
+| `GET /api/v1/snapshot` + legacy `/v1/snapshot` | ✅ registered-replica JWT required; current and one-window legacy scopes accepted |
+| `POST /api/v1/replicas/register` + legacy `/v1/replicas/register` | ✅ rotates a 90-day snapshot-scoped JWT and stores only its SHA-256 hash |
 | `GET /api/v1/directory-key` + legacy `/v1/directory-key` | ✅ |
 | `POST /api/v1/consumer-token` + legacy `/v1/consumer-token` | ✅ Ed25519 signed |
 | `POST /api/v1/relay/ticket` + legacy `/v1/relay/ticket` | ✅ Ed25519 signed |

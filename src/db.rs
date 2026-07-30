@@ -2668,7 +2668,29 @@ impl NodeRepository for MySqlRepo {
         .execute(&self.pool)
         .await
         .map(|r| r.rows_affected() > 0)
+            .unwrap_or(false)
+    }
+
+    async fn set_replica_token_hash(&self, replica_id: &str, token_hash: &str) -> bool {
+        sqlx::query(
+            "UPDATE replicas SET replica_token_hash = ?, expires_at = NOW() + INTERVAL 90 DAY, \
+             last_seen_at = NOW(), updated_at = NOW() WHERE replica_id = ?",
+        )
+        .bind(token_hash)
+        .bind(replica_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() > 0)
         .unwrap_or(false)
+    }
+
+    async fn replica_token_hash(&self, replica_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT replica_token_hash FROM replicas WHERE replica_id = ?")
+            .bind(replica_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn all_replicas(&self) -> Vec<(String, String, String, String, i64)> {
