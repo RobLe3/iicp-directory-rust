@@ -82,3 +82,11 @@ Otherwise the signed record reports them as `null`. Verify
 `/.well-known/iicp-deployment.json` against the public release assets and DID
 key before advertising the directory. The record contains no database,
 hostname, path or credential information.
+
+## Persistent replica shadow
+
+The Genesis-cutover evidence lane is documented in
+[`ops/PERSISTENT_SHADOW.md`](ops/PERSISTENT_SHADOW.md). It provides an
+environment template and a content-free PHP/Rust observer. Preparing or testing
+that lane does not authorize starting a persistent service; the seven-day
+observation window requires explicit maintainer approval.
