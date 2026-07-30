@@ -134,10 +134,21 @@ fn handshake_url(seed_url: &str) -> String {
 async fn fetch_and_apply_snapshot(
     client: &reqwest::Client,
     seed_url: &str,
+    replica_token: &str,
     repo: &dyn NodeRepository,
 ) -> Option<i64> {
     let url = snapshot_url(seed_url);
-    let snapshot: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+    let snapshot: Value = client
+        .get(&url)
+        .bearer_auth(replica_token)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     let snapshot_seq = snapshot_seq_from(&snapshot);
     let applied = apply_snapshot(repo, &snapshot).await;
     eprintln!("[replica] snapshot applied: {applied} node(s) → since_seq={snapshot_seq}");
@@ -158,12 +169,17 @@ fn snapshot_seq_from(snapshot: &Value) -> i64 {
 /// event so other replicas know about us. Returns the handshake `since_seq` on success
 /// (`None` on any network/parse failure — skipping the handshake is non-fatal; the replica
 /// still tails events, just without appearing in the seed's replica list).
+struct JoinHandshake {
+    since_seq: i64,
+    replica_token: String,
+}
+
 async fn join_handshake(
     client: &reqwest::Client,
     seed_url: &str,
     did: &str,
     endpoint: &str,
-) -> Option<i64> {
+) -> Option<JoinHandshake> {
     let url = handshake_url(seed_url);
     let resp: Value = client
         .post(&url)
@@ -175,12 +191,16 @@ async fn join_handshake(
         .await
         .ok()?;
     let since = resp.get("since_seq").and_then(Value::as_i64).unwrap_or(0);
+    let replica_token = resp.get("replica_token")?.as_str()?.to_string();
     let rid = resp
         .get("replica_id")
         .and_then(Value::as_str)
         .unwrap_or("?");
     eprintln!("[replica] handshake ok: replica_id={rid} since_seq={since}");
-    Some(since)
+    Some(JoinHandshake {
+        since_seq: since,
+        replica_token,
+    })
 }
 
 /// Replica sync loop (DIR-FED-01/02/13): resolve the seed's signing key, perform the
@@ -212,9 +232,11 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
 
     // JOIN HANDSHAKE (DIR-FED-13 §7): announce this replica to the seed.
     // Requires IICP_REPLICA_DID + IICP_REPLICA_ENDPOINT; skipped (non-fatal) if absent.
-    if let (Some(did), Some(endpoint)) = (&cfg.replica_did, &cfg.replica_endpoint) {
-        join_handshake(&client, &cfg.seed_url, did, endpoint).await;
-    }
+    let handshake = if let (Some(did), Some(endpoint)) = (&cfg.replica_did, &cfg.replica_endpoint) {
+        join_handshake(&client, &cfg.seed_url, did, endpoint).await
+    } else {
+        None
+    };
 
     // SNAPSHOT BOOTSTRAP (§5.3): fetch the seed's state snapshot, apply it, and
     // advance `since_seq` to `snapshot_seq` so the poll loop only tails new events.
@@ -222,9 +244,17 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
         eprintln!("[replica] unsigned snapshot skipped; replaying verified event chain from seq=0");
         0
     } else {
-        fetch_and_apply_snapshot(&client, &cfg.seed_url, repo.as_ref())
-            .await
-            .unwrap_or(0)
+        match handshake.as_ref() {
+            Some(join) => {
+                fetch_and_apply_snapshot(&client, &cfg.seed_url, &join.replica_token, repo.as_ref())
+                    .await
+                    .unwrap_or(join.since_seq)
+            }
+            None => {
+                eprintln!("[replica] authenticated snapshot skipped; join token unavailable");
+                0
+            }
+        }
     };
 
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.poll_interval_secs));

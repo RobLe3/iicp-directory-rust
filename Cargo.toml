@@ -8,6 +8,7 @@ description = "Pre-1.0 Rust operator preview of the IICP directory control plane
 repository = "https://github.com/RobLe3/iicp-directory-rust"
 
 [dependencies]
+base64 = "0.22"
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }

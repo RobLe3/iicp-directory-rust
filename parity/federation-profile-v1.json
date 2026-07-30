@@ -1,0 +1,30 @@
+{
+  "schema": "iicp.replica-token-contract.v1",
+  "issuer": "iicp.network",
+  "role": "replica",
+  "current_scope": "GET /v1/snapshot",
+  "legacy_scope": "GET /v1/events",
+  "legacy_scope_policy": "accept_for_one_compatibility_window",
+  "registration": {
+    "method": "POST",
+    "path": "/api/v1/replicas/register",
+    "success_status": 200,
+    "rotates_token": true,
+    "plaintext_token_persisted": false
+  },
+  "snapshot": {
+    "method": "GET",
+    "path": "/api/v1/snapshot",
+    "bearer_required": true,
+    "missing_status": 401,
+    "expired_status": 401,
+    "wrong_scope_status": 401,
+    "rotated_status": 401
+  },
+  "events": {
+    "method": "GET",
+    "path": "/api/v1/events",
+    "bearer_required": false,
+    "signed": true
+  }
+}

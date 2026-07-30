@@ -38,7 +38,7 @@ use std::{net::ToSocketAddrs, time::Duration};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{
     middleware::{self, Next},
@@ -5199,8 +5199,68 @@ async fn events(
 /// so a replica can prime its state in one request before tailing /v1/events. Mirrors the
 /// PHP SnapshotController shape (the Rust replica's apply_snapshot consumes node fields +
 /// capabilities[].{node_id,intent}).
-async fn snapshot(State(st): State<AppState>) -> Json<serde_json::Value> {
+async fn snapshot(State(st): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {"code": "unauthorized", "message": "Missing Authorization header"}
+            })),
+        )
+            .into_response();
+    };
+    let claims = match auth::verify_replica_jwt(token) {
+        Ok(claims) => claims,
+        Err(auth::ReplicaTokenError::Expired) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "token_expired",
+                        "message": "Replica JWT has expired; re-register via POST /v1/replicas/register"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        Err(auth::ReplicaTokenError::Invalid) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": {"code": "unauthorized", "message": "Invalid replica token"}
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(stored_hash) = st.repo.replica_token_hash(&claims.sub).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {"code": "unauthorized", "message": "Replica not registered"}
+            })),
+        )
+            .into_response();
+    };
     use sha2::{Digest, Sha256};
+    if stored_hash != hex::encode(Sha256::digest(token.as_bytes())) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "unauthorized",
+                    "message": "Replica token has been rotated; re-register to obtain a fresh token"
+                }
+            })),
+        )
+            .into_response();
+    }
+
     let records = st.repo.snapshot_records().await;
     let log = st.repo.events_since(0, 1_000_000).await;
     let snapshot_seq = log.last().map(|e| e.seq).unwrap_or(0);
@@ -5241,6 +5301,7 @@ async fn snapshot(State(st): State<AppState>) -> Json<serde_json::Value> {
         "nodes": nodes,
         "capabilities": capabilities,
     }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5283,6 +5344,30 @@ async fn replicas_register(
     st.repo
         .upsert_replica(&replica_id, &req.did, &endpoint, "low")
         .await;
+    let Some(replica_token) = auth::issue_replica_jwt(&replica_id) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {"code": "server_error", "message": "Replica token signing is unavailable"}
+            })),
+        );
+    };
+    {
+        use sha2::{Digest, Sha256};
+        let token_hash = hex::encode(Sha256::digest(replica_token.as_bytes()));
+        if !st
+            .repo
+            .set_replica_token_hash(&replica_id, &token_hash)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {"code": "server_error", "message": "Replica token rotation failed"}
+                })),
+            );
+        }
+    }
     if is_new {
         // Mirror the new replica to other replicas via a signed REPLICA_REGISTERED event.
         emit_event(
@@ -5299,14 +5384,18 @@ async fn replicas_register(
             crate::federation::canonical_json(&e.payload).as_bytes(),
         ))
     });
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
     (
-        StatusCode::CREATED,
+        StatusCode::OK,
         Json(serde_json::json!({
             "replica_id": replica_id,
+            "replica_token": replica_token,
             "since_seq": 0,
             "genesis_hash": genesis_hash,
             "trust_tier": "low",
             "did_acknowledged": true,
+            "is_new_registration": is_new,
+            "expires_at": expires_at,
         })),
     )
 }
@@ -5625,6 +5714,12 @@ mod tests {
     }
 
     fn test_state() -> AppState {
+        // All tests use one deterministic non-secret key. Setting it once avoids
+        // process-global environment races while exercising the production JWT path.
+        static APP_KEY: std::sync::Once = std::sync::Once::new();
+        APP_KEY.call_once(|| unsafe {
+            std::env::set_var("APP_KEY", "test-directory-key-not-for-production");
+        });
         let chat = "urn:iicp:intent:llm:chat:v1";
         let mk = |id: &str, score: f64| NodeRecord {
             node: types::Node {
@@ -6411,22 +6506,30 @@ mod tests {
         // #442: a replica (PHP ReplicaStartCommand / Rust fetch_events) polls
         // {seed}/api/v1/events + /api/v1/snapshot — so a Rust seed MUST serve those paths,
         // not just /v1/*. Without the aliases, federation FROM a Rust seed 404s.
-        for path in ["/api/v1/events", "/api/v1/snapshot"] {
-            let resp = app(test_state())
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(path)
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                200,
-                "{path} must be reachable for cross-flavour federation"
-            );
-        }
+        let events = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.status(), 200);
+        let snapshot = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/snapshot")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.status(),
+            401,
+            "snapshot path must exist and fail closed without replica authentication"
+        );
         // POST /api/v1/replicas/register handshake reachable under /api/v1 too.
         let resp = app(test_state())
             .oneshot(
@@ -6442,7 +6545,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), 201);
+        assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
@@ -6508,10 +6611,33 @@ mod tests {
     async fn snapshot_returns_nodes_and_capabilities() {
         // #442 slice 6: GET /v1/snapshot returns all nodes + capabilities for replica
         // bootstrap (test_state seeds nodes a,b serving llm:chat).
-        let resp = app(test_state())
+        let state = test_state();
+        let registration = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/replicas/register")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "did": "did:web:snapshot.example",
+                            "endpoint": "https://snapshot.example"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let registration_body = registration.into_body().collect().await.unwrap().to_bytes();
+        let registration_json: serde_json::Value =
+            serde_json::from_slice(&registration_body).unwrap();
+        let token = registration_json["replica_token"].as_str().unwrap();
+        let resp = app(state)
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/v1/snapshot")
+                    .header("authorization", format!("Bearer {token}"))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -6557,12 +6683,14 @@ mod tests {
             .oneshot(post(body.clone()))
             .await
             .unwrap();
-        assert_eq!(r1.status(), 201);
+        assert_eq!(r1.status(), 200);
         let v1: serde_json::Value =
             serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
         let rid1 = v1["replica_id"].as_str().unwrap().to_string();
         assert_eq!(v1["trust_tier"], "low");
         assert_eq!(v1["did_acknowledged"], true);
+        assert_eq!(v1["is_new_registration"], true);
+        let token1 = v1["replica_token"].as_str().unwrap().to_string();
 
         // Idempotent on DID → same replica_id, no duplicate row.
         let r2 = app(state.clone())
@@ -6572,7 +6700,33 @@ mod tests {
         let v2: serde_json::Value =
             serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(v2["replica_id"].as_str().unwrap(), rid1);
+        assert_eq!(v2["is_new_registration"], false);
+        let token2 = v2["replica_token"].as_str().unwrap();
+        assert_ne!(token1, token2, "re-registration must rotate the token");
         assert_eq!(repo.all_replicas().await.len(), 1);
+
+        let old_snapshot = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/snapshot")
+                    .header("authorization", format!("Bearer {token1}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_snapshot.status(), 401);
+        let new_snapshot = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/snapshot")
+                    .header("authorization", format!("Bearer {token2}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new_snapshot.status(), 200);
 
         // REPLICA_REGISTERED emitted exactly once (on first registration).
         let events = repo.events_since(0, 100).await;
