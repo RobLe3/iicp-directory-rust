@@ -1,2 +1,4 @@
 target/
 releases/
+__pycache__/
+*.pyc
