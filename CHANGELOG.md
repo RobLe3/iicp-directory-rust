@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.4
+
+- Corrects production replica bootstrap so verification-required replicas fetch
+  and validate the authenticated S.13 snapshot before applying newer signed
+  events.
+- Rejects incomplete snapshot envelopes without mutating the replica database
+  and never substitutes an incomplete public-tail reconstruction.
+- Updates the persistent-shadow and authenticated-preflight procedures to
+  require this immutable release.
+- Does not change the shared HTTP or database contract and does not authorize
+  replica registration, a persistent shadow, Genesis cutover or PHP
+  deprecation.
+
 ## 0.1.3
 
 - Aligns replica authentication with PHP `v1.10.82`: registration rotates a

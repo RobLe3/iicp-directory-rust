@@ -1,0 +1,38 @@
+{
+  "schema": "iicp.directory-implementation-compatibility.v1",
+  "implementation": {
+    "flavor": "rust",
+    "version": "0.1.4",
+    "status": "operator_preview"
+  },
+  "php_parity_baseline": {
+    "version": "1.10.82",
+    "commit": "ad46a02"
+  },
+  "contracts": {
+    "http": {
+      "path": "parity/http-contract-v1.json",
+      "sha256": "62fad592a33305a754353c43f6476d257f01ccf6e3cfdbf391d03717ce4796b5"
+    },
+    "behavior": {
+      "path": "parity/behavior-contract-v1.json",
+      "sha256": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+    },
+    "replica_token": {
+      "path": "parity/federation-profile-v1.json",
+      "sha256": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9"
+    },
+    "schema": {
+      "path": "schema/contract-v1.json",
+      "sha256": "d01c9a142fc365532049ddd55b68bcf10ae681a294d1a7ee44825c139b481417"
+    },
+    "parity_manifest": {
+      "path": "parity/contract-v1.10.82.json",
+      "sha256": "ac1526809331efc42c4fd7b3cdc3ae0e653076026947db52bfb899506eea266e"
+    }
+  },
+  "minimum_sdk_version": "0.7.94",
+  "production_authority": false,
+  "genesis_cutover_authorized": false,
+  "php_deprecation_authorized": false
+}
