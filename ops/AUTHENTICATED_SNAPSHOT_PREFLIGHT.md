@@ -6,11 +6,14 @@ Genesis cutover.
 
 ## Requested production action
 
-After explicit maintainer approval, one disposable Rust `v0.1.3` candidate may
-send `POST /api/v1/replicas/register` to the PHP Genesis Seed using a distinct
-replica DID and HTTPS endpoint. Registration creates or rotates the replica
-record and returns a 90-day bearer scoped to `GET /v1/snapshot`. The token must
-exist only in the external mode-`0600` environment and process memory.
+After explicit maintainer approval, one disposable Rust candidate from the
+first immutable operator-preview release containing commit `0b06ead` may send
+`POST /api/v1/replicas/register` to the PHP Genesis Seed using a distinct
+replica DID and HTTPS endpoint. Do not use `v0.1.3`: its production verification
+path skips the authenticated snapshot. Registration creates or rotates the
+replica record and returns a 90-day bearer scoped to `GET /v1/snapshot`. The
+token must exist only in the external mode-`0600` environment and process
+memory.
 
 The candidate then fetches one authenticated snapshot, validates its complete
 S.13 §5.5 envelope, applies it only to an empty disposable database, and tails
@@ -20,7 +23,8 @@ on missing or invalid signatures.
 
 ## Required inputs
 
-- verified Rust directory `v0.1.3` release artifact and checksums;
+- a verified immutable Rust directory release containing commit `0b06ead`,
+  with its release manifest and checksums;
 - a new empty MySQL database and account;
 - a new APP key and Ed25519 signing identity;
 - a distinct `did:web` document and HTTPS endpoint;
