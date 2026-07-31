@@ -5,8 +5,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-const FIXTURE_BYTES: &[u8] = include_bytes!("../parity/http-contract-v1.json");
-const EXPECTED_SHA256: &str = "62fad592a33305a754353c43f6476d257f01ccf6e3cfdbf391d03717ce4796b5";
+const FIXTURE_BYTES: &[u8] = include_bytes!("../parity/http-contract-v2.json");
+const EXPECTED_SHA256: &str = "08edc5cf302a858e5576cb59e07f5b71657ae6015b5537999985db71cc4128f6";
 
 #[derive(Debug, Deserialize)]
 struct Contract {
@@ -37,11 +37,11 @@ fn php_http_contract_is_the_reviewed_immutable_fixture() {
         EXPECTED_SHA256
     );
     let contract: Contract = serde_json::from_slice(FIXTURE_BYTES).expect("valid HTTP contract");
-    assert_eq!(contract.schema, "iicp.directory.http-contract.v1");
-    assert_eq!(contract.authority.runtime_version, "v1.10.80.1");
-    assert_eq!(contract.authority.php_commit, "08fa5f9");
+    assert_eq!(contract.schema, "iicp.directory.http-contract.v2");
+    assert_eq!(contract.authority.runtime_version, "v1.10.83");
+    assert_eq!(contract.authority.php_commit, "6164049");
     assert_eq!(contract.canonical_prefix, "/api/v1");
-    assert_eq!(contract.routes.len(), 43);
+    assert_eq!(contract.routes.len(), 44);
 }
 
 #[test]

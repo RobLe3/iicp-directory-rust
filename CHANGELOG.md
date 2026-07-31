@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5
+
+- Added `/iicp/health` for registration dial-back compatibility.
+- Bound replica DID documents, deployment records and locally signed event
+  metadata to the configured replica identity instead of the Genesis DID.
+- Added authenticated, atomic replica decommissioning and same-DID low-trust
+  reactivation with shared PHP/Rust contract fixtures.
+- Added a launchd-compatible Quick Tunnel supervisor that keeps the stable DID
+  separate from its rotating endpoint and reads secrets from a mode-0600 file.
+
 ## 0.1.4
 
 - Corrects production replica bootstrap so verification-required replicas fetch

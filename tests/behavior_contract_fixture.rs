@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 const BYTES: &[u8] = include_bytes!("../parity/behavior-contract-v1.json");
 const MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.80.json");
 const CURRENT_MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.82.json");
+const LIFECYCLE_MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.83.json");
 const EXPECTED_SHA256: &str = "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f";
 
 #[derive(Deserialize)]
@@ -171,5 +172,17 @@ fn v1_10_82_manifest_adds_replica_auth_without_rewriting_existing_contracts() {
     assert_eq!(
         manifest["fixtures"]["federation-profile-v1.json"],
         "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9"
+    );
+}
+
+#[test]
+fn v1_10_83_manifest_adds_safe_replica_lifecycle_contracts() {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(LIFECYCLE_MANIFEST_BYTES).expect("valid lifecycle manifest");
+    assert_eq!(manifest["contract_version"], "v1.10.83");
+    assert_eq!(manifest["authority"]["runtime_version"], "v1.10.83");
+    assert_eq!(
+        manifest["fixtures"]["replica-lifecycle-contract-v1.json"],
+        "9ae2e3536891c3488a2b4d04e543364359a2b9a2c389203ece0eaca1a341b541"
     );
 }

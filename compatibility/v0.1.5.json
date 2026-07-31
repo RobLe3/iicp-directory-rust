@@ -1,0 +1,42 @@
+{
+  "contracts": {
+    "behavior": {
+      "path": "parity/behavior-contract-v1.json",
+      "sha256": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+    },
+    "http": {
+      "path": "parity/http-contract-v2.json",
+      "sha256": "08edc5cf302a858e5576cb59e07f5b71657ae6015b5537999985db71cc4128f6"
+    },
+    "parity_manifest": {
+      "path": "parity/contract-v1.10.83.json",
+      "sha256": "6032755aa9a91df6e888203d2d0c5fb0261379cab2d78f95a6afaceb12058a35"
+    },
+    "replica_lifecycle": {
+      "path": "parity/replica-lifecycle-contract-v1.json",
+      "sha256": "9ae2e3536891c3488a2b4d04e543364359a2b9a2c389203ece0eaca1a341b541"
+    },
+    "replica_token": {
+      "path": "parity/federation-profile-v1.json",
+      "sha256": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9"
+    },
+    "schema": {
+      "path": "schema/contract-v1.json",
+      "sha256": "d01c9a142fc365532049ddd55b68bcf10ae681a294d1a7ee44825c139b481417"
+    }
+  },
+  "genesis_cutover_authorized": false,
+  "implementation": {
+    "flavor": "rust",
+    "status": "operator_preview",
+    "version": "0.1.5"
+  },
+  "minimum_sdk_version": "0.7.94",
+  "php_deprecation_authorized": false,
+  "php_parity_baseline": {
+    "commit": "328b4da",
+    "version": "1.10.83"
+  },
+  "production_authority": false,
+  "schema": "iicp.directory-implementation-compatibility.v1"
+}

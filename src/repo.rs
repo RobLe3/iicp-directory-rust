@@ -539,11 +539,29 @@ pub trait NodeRepository: Send + Sync {
     /// Return the stored hash for the current replica JWT.
     async fn replica_token_hash(&self, replica_id: &str) -> Option<String>;
 
+    /// Persistent lifecycle gate, independent of JWT validity.
+    async fn replica_is_active(&self, replica_id: &str) -> bool;
+
+    /// Retain an audit tombstone while invalidating the active registration.
+    async fn decommission_replica(&self, replica_id: &str) -> bool;
+
+    /// Seed-side atomic lifecycle write: decommission plus signed event append.
+    async fn decommission_replica_with_event(
+        &self,
+        replica_id: &str,
+        did: &str,
+        secret_key_hex: &str,
+    ) -> bool;
+
     /// #441: trusted replicas as `(replica_id, did, endpoint, trust_tier, registered_at_ms)`.
     /// Consumed by the `/.well-known/iicp-replicas.json` endpoint (DIR-FED-19) and replica
     /// tests. `registered_at_ms` = Unix ms at first registration (accurate for InMemory;
     /// MySQL uses `created_at`).
     async fn all_replicas(&self) -> Vec<(String, String, String, String, i64)>;
+
+    /// Stable identity lookup includes lifecycle tombstones so same-DID
+    /// re-registration reuses the original replica_id.
+    async fn replica_id_by_did(&self, did: &str) -> Option<String>;
 
     /// #442 (seed side): append a signed event to `node_events` — assign the next monotonic
     /// `seq`, mint an event_id, stamp ts_ms, Ed25519-sign via `federation::sign_event` (when
@@ -856,6 +874,7 @@ pub struct InMemoryRepo {
     /// #441: trusted replicas — (replica_id, did, endpoint, trust_tier, registered_at_ms).
     replicas: std::sync::Mutex<Vec<ReplicaTuple>>,
     replica_token_hashes: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    decommissioned_replicas: std::sync::Mutex<std::collections::HashSet<String>>,
     /// #442: appended signed event log (seq-monotonic).
     events: std::sync::Mutex<Vec<EventRow>>,
     /// #463/#310: operator-identity records keyed by operator_pubkey → [`OperatorRow`].
@@ -898,6 +917,7 @@ impl InMemoryRepo {
             health_obs: std::sync::Mutex::new(Vec::new()),
             replicas: std::sync::Mutex::new(Vec::new()),
             replica_token_hashes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            decommissioned_replicas: std::sync::Mutex::new(std::collections::HashSet::new()),
             events: std::sync::Mutex::new(Vec::new()),
             operators: std::sync::Mutex::new(std::collections::HashMap::new()),
             dispatch_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1689,6 +1709,10 @@ impl NodeRepository for InMemoryRepo {
                 now,
             ));
         }
+        self.decommissioned_replicas
+            .lock()
+            .unwrap()
+            .remove(replica_id);
         true
     }
 
@@ -1717,8 +1741,74 @@ impl NodeRepository for InMemoryRepo {
             .cloned()
     }
 
+    async fn replica_is_active(&self, replica_id: &str) -> bool {
+        self.replicas
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row.0 == replica_id)
+            && !self
+                .decommissioned_replicas
+                .lock()
+                .unwrap()
+                .contains(replica_id)
+    }
+
+    async fn decommission_replica(&self, replica_id: &str) -> bool {
+        if !self
+            .replicas
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row.0 == replica_id)
+        {
+            return false;
+        }
+        self.replica_token_hashes.lock().unwrap().remove(replica_id);
+        self.decommissioned_replicas
+            .lock()
+            .unwrap()
+            .insert(replica_id.to_string());
+        true
+    }
+
+    async fn decommission_replica_with_event(
+        &self,
+        replica_id: &str,
+        did: &str,
+        secret_key_hex: &str,
+    ) -> bool {
+        if !self.decommission_replica(replica_id).await {
+            return false;
+        }
+        self.append_signed_event(
+            secret_key_hex,
+            "REPLICA_DEREGISTERED",
+            replica_id,
+            &serde_json::json!({"did": did}),
+        )
+        .await
+        .is_some()
+    }
+
     async fn all_replicas(&self) -> Vec<(String, String, String, String, i64)> {
-        self.replicas.lock().unwrap().clone()
+        let decommissioned = self.decommissioned_replicas.lock().unwrap();
+        self.replicas
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| !decommissioned.contains(&row.0))
+            .cloned()
+            .collect()
+    }
+
+    async fn replica_id_by_did(&self, did: &str) -> Option<String> {
+        self.replicas
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.1 == did)
+            .map(|row| row.0.clone())
     }
 
     async fn append_signed_event(

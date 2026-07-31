@@ -8,7 +8,7 @@ database change, PHP deprecation or cutover.
 
 The shadow must use its own MySQL database, database account, APP key, Ed25519
 signing identity, DID, replica registration and external port. Do not clone the
-Genesis database or reuse any Genesis secret. Start from the immutable `v0.1.4`
+Genesis database or reuse any Genesis secret. Start from the immutable `v0.1.5`
 release assets and verify their published checksums before installation.
 
 Copy `ops/shadow.env.example` to a location outside every repository, set mode
@@ -26,17 +26,39 @@ approved replica endpoint. Do not reuse the Genesis virtual host.
 3. Run `./scripts/check_quality.sh` and `./ops/run_distribution_evidence.sh`.
 4. Start the release with the external environment file and hardened container
    settings from `OPERATIONS.md`.
-5. Require `/health`, `/api/v1/stats`, public discovery and the signed
+5. Require `/health`, `/iicp/health`, `/api/v1/stats`, public discovery and the signed
    deployment record to succeed. Confirm writes redirect to Genesis.
+   Confirm the DID document, deployment record and signed event responses all
+   identify `did:web:rust-shadow.iicp.network`; a rotating Quick Tunnel is an
+   endpoint only and must never become the directory identity.
 6. Stop and restart the shadow. A new replica handshake must rotate the
    snapshot credential while event replay remains signature-verified.
 7. Restore only into a fresh disposable database. Never test restoration over
    the running shadow.
 
-Rollback means stopping the Rust shadow, removing it from routing and replica
+Rollback first calls authenticated `POST /api/v1/replicas/deregister`, then
+means stopping the Rust shadow, removing it from routing and replica
 presentation, retaining the database for the reviewed evidence period, and
 returning clients to PHP Genesis. It never means rolling the Genesis schema
 back to a Rust schema.
+
+Quick Tunnel availability is operator-preview evidence only. It cannot satisfy
+an independent-host, stable-endpoint, federation, or Genesis-cutover gate.
+
+### Local macOS Quick Tunnel supervisor
+
+`ops/run_quick_tunnel_shadow.sh` starts a disposable tunnel, updates only the
+configured stable shadow CNAME, then launches the directory with the rotating
+tunnel URL as `IICP_REPLICA_ENDPOINT`. If either child exits, launchd restarts
+the pair and the directory re-registers the same stable DID with a rotated
+bearer. The script refuses env files that are not mode `0600`; credentials are
+read from that external file and are never passed as command arguments.
+
+Copy `ops/network.iicp.directory-rust-shadow.plist.example` outside the
+repository, replace its three `REQUIRED_...` paths, install it under
+`~/Library/LaunchAgents`, and validate it with `plutil -lint` before loading.
+Use `launchctl kickstart -k gui/$(id -u)/network.iicp.directory-rust-shadow`
+for an intentional restart. Do not run a second ad-hoc tunnel alongside it.
 
 ## Content-free comparison
 
