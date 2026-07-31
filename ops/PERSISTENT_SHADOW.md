@@ -40,6 +40,21 @@ back to a Rust schema.
 
 ## Content-free comparison
 
+Before any persistent shadow is authorized, run the public, read-only preflight:
+
+```bash
+python3 -c 'import cryptography' # required for Ed25519 verification
+python3 ops/assess_prod_seed.py \
+  --output /tmp/iicp-rust-public-seed-assessment.json
+```
+
+The preflight verifies the retained signed event stream and attempts to reconstruct
+the public node set without registering a replica or fetching an authenticated
+snapshot. Historical unsigned events are counted but never applied. If the public
+stream cannot reconstruct current state, retain the content-free negative result and
+stop: replica registration and snapshot access require a separate production-write
+authorization.
+
 Run the observer from a trusted operator host:
 
 ```bash
