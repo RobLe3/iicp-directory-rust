@@ -549,6 +549,11 @@ pub async fn apply_event(repo: &dyn NodeRepository, ev: &FederatedEvent) -> Appl
         "REPUTATION_DECAY" => apply_reputation_decay(repo, ev).await,
         "CREDIT_AWARD" => apply_credit_award(repo, ev).await,
         "REPLICA_REGISTERED" => apply_replica_registered(repo, ev).await,
+        "REPLICA_DEREGISTERED" => match ev.node_id.as_deref() {
+            Some(id) if repo.decommission_replica(id).await => ApplyOutcome::Applied,
+            Some(_) => ApplyOutcome::Skipped,
+            None => ApplyOutcome::Rejected("REPLICA_DEREGISTERED missing replica_id"),
+        },
         // Uptime tracking (#508): replicas self-maintain liveness via their own
         // expire_stale() loop, so EVICT/REACTIVATE don't mutate replica state.
         // Acknowledged (not unknown) to avoid noisy "unsupported event_type" logs.
@@ -1229,6 +1234,39 @@ mod tests {
             .await,
             ApplyOutcome::Rejected(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn replica_deregistered_decommissions_registry_entry() {
+        let repo = InMemoryRepo::new(vec![]);
+        assert_eq!(
+            apply_event(
+                &repo,
+                &typed_event(
+                    "REPLICA_REGISTERED",
+                    "rep-1",
+                    1,
+                    json!({"did":"did:web:r.example","endpoint":"https://r.example"})
+                )
+            )
+            .await,
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            apply_event(
+                &repo,
+                &typed_event(
+                    "REPLICA_DEREGISTERED",
+                    "rep-1",
+                    2,
+                    json!({"did":"did:web:r.example"})
+                )
+            )
+            .await,
+            ApplyOutcome::Applied
+        );
+        assert!(repo.all_replicas().await.is_empty());
+        assert!(!repo.replica_is_active("rep-1").await);
     }
 
     #[test]

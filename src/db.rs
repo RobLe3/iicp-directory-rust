@@ -2659,7 +2659,8 @@ impl NodeRepository for MySqlRepo {
              VALUES (?, ?, ?, ?, '', NOW() + INTERVAL 90 DAY, NOW(), NOW(), NOW()) \
              ON DUPLICATE KEY UPDATE \
                 replica_id = VALUES(replica_id), endpoint = VALUES(endpoint), \
-                trust_tier = VALUES(trust_tier), last_seen_at = NOW(), updated_at = NOW()",
+                trust_tier = 'low', status = 'active', expires_at = NOW() + INTERVAL 90 DAY, \
+                last_seen_at = NOW(), updated_at = NOW()",
         )
         .bind(replica_id)
         .bind(did)
@@ -2693,16 +2694,107 @@ impl NodeRepository for MySqlRepo {
             .flatten()
     }
 
+    async fn replica_is_active(&self, replica_id: &str) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM replicas WHERE replica_id = ? AND status = 'active' AND expires_at > NOW()",
+        )
+        .bind(replica_id).fetch_one(&self.pool).await.unwrap_or(0) > 0
+    }
+
+    async fn decommission_replica(&self, replica_id: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        let tombstone = hex::encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
+        sqlx::query(
+            "UPDATE replicas SET status = 'decommissioned', expires_at = NOW(), \
+             replica_token_hash = ?, last_seen_at = NOW(), updated_at = NOW() WHERE replica_id = ?",
+        )
+        .bind(tombstone)
+        .bind(replica_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() > 0)
+        .unwrap_or(false)
+    }
+
+    async fn decommission_replica_with_event(
+        &self,
+        replica_id: &str,
+        did: &str,
+        secret_key_hex: &str,
+    ) -> bool {
+        let Ok(mut tx) = self.pool.begin().await else {
+            return false;
+        };
+        let active = sqlx::query_as::<_, (String, i8)>(
+            "SELECT status, expires_at > NOW() FROM replicas WHERE replica_id = ? FOR UPDATE",
+        )
+        .bind(replica_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|(status, unexpired)| status == "active" && unexpired == 1);
+        if !active {
+            let _ = tx.rollback().await;
+            return false;
+        }
+        let Ok((last_seq, prev_sig)) = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT CAST(last_seq AS SIGNED), last_signature FROM node_event_chain_heads WHERE chain_id = 'genesis' FOR UPDATE",
+        ).fetch_one(&mut *tx).await else { let _ = tx.rollback().await; return false };
+        let seq = last_seq + 1;
+        let prev_hash = crate::federation::prev_hash_from(prev_sig.as_deref());
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let ts_ms = chrono::Utc::now().timestamp_millis();
+        let payload = serde_json::json!({"did": did});
+        let sig = crate::federation::sign_event(
+            secret_key_hex,
+            &event_id,
+            "REPLICA_DEREGISTERED",
+            seq,
+            ts_ms,
+            &payload,
+            &prev_hash,
+        );
+        use sha2::{Digest, Sha256};
+        let tombstone = hex::encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
+        let writes = sqlx::query(
+            "UPDATE replicas SET status='decommissioned', expires_at=NOW(), replica_token_hash=?, last_seen_at=NOW(), updated_at=NOW() WHERE replica_id=?",
+        ).bind(tombstone).bind(replica_id).execute(&mut *tx).await.is_ok()
+            && sqlx::query(
+                "INSERT INTO node_events (event_id,seq,event_type,node_id,ts_ms,payload,prev_hash,signature) VALUES (?,?,?,?,?,?,?,?)",
+            ).bind(&event_id).bind(seq).bind("REPLICA_DEREGISTERED").bind(replica_id)
+                .bind(ts_ms).bind(payload.to_string()).bind(&prev_hash).bind(&sig)
+                .execute(&mut *tx).await.is_ok()
+            && sqlx::query(
+                "UPDATE node_event_chain_heads SET last_seq=?, last_signature=?, updated_at=NOW() WHERE chain_id='genesis'",
+            ).bind(seq).bind(&sig).execute(&mut *tx).await.is_ok();
+        if writes {
+            tx.commit().await.is_ok()
+        } else {
+            let _ = tx.rollback().await;
+            false
+        }
+    }
+
     async fn all_replicas(&self) -> Vec<(String, String, String, String, i64)> {
         // UNIX_TIMESTAMP returns NULL when created_at is NULL; fall back to 0.
         sqlx::query_as(
             "SELECT replica_id, did, endpoint, trust_tier, \
              CAST(COALESCE(UNIX_TIMESTAMP(created_at) * 1000, 0) AS SIGNED) \
-             FROM replicas",
+             FROM replicas WHERE status = 'active' AND expires_at > NOW()",
         )
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default()
+    }
+
+    async fn replica_id_by_did(&self, did: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT replica_id FROM replicas WHERE did = ?")
+            .bind(did)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn append_signed_event(
@@ -3741,6 +3833,51 @@ mod tests {
         assert!((median_outlier_weight(400.0, &sample) - 1.0).abs() < 1e-9);
         // 500 > 3*150=450 → outlier
         assert!((median_outlier_weight(500.0, &sample) - 0.1).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn replica_lifecycle_revokes_and_reactivates_stable_identity() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        let repo = MySqlRepo::new(pool);
+        let id = uuid::Uuid::new_v4().to_string();
+        let did = format!("did:web:{}.example", uuid::Uuid::new_v4());
+        assert!(
+            repo.upsert_replica(&id, &did, "https://shadow.example", "low")
+                .await
+        );
+        assert!(repo.set_replica_token_hash(&id, &"a".repeat(64)).await);
+        assert!(repo.replica_is_active(&id).await);
+        let public_key = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        let signing_key = format!("{}{}", "11".repeat(32), public_key);
+        assert!(
+            repo.decommission_replica_with_event(&id, &did, &signing_key)
+                .await
+        );
+        assert!(!repo.replica_is_active(&id).await);
+        assert!(repo.all_replicas().await.iter().all(|row| row.0 != id));
+        assert_eq!(
+            repo.replica_id_by_did(&did).await.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            repo.events_since(0, 100)
+                .await
+                .iter()
+                .filter(|event| event.event_type == "REPLICA_DEREGISTERED" && event.node_id == id)
+                .count(),
+            1
+        );
+        assert!(
+            repo.upsert_replica(&id, &did, "https://new-shadow.example", "low")
+                .await
+        );
+        assert!(repo.replica_is_active(&id).await);
     }
 
     #[tokio::test]

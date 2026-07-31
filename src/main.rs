@@ -138,7 +138,7 @@ static OPERATOR_CHALLENGES: std::sync::OnceLock<std::sync::Mutex<HashMap<String,
     std::sync::OnceLock::new();
 
 /// This directory's DID (single source for /.well-known/did.json + signed-event signer_did).
-const DIRECTORY_DID: &str = "did:web:iicp.network";
+const DEFAULT_DIRECTORY_DID: &str = "did:web:iicp.network";
 
 /// Derive `address_family` from an endpoint URL (PHP NodeScorer::detectAddressFamily parity).
 /// Returns "ipv4" | "ipv6" | "hostname" | "unknown".
@@ -224,6 +224,10 @@ struct AppState {
     /// IICP_GENESIS_ED25519_SECRET_KEY. `None` → events emit unsigned (PHP parity: when no
     /// key is configured, NodeEventLogger::sign returns null).
     signing_key: Option<String>,
+    /// Served identity and public service endpoint. Replica mode binds this DID
+    /// to IICP_REPLICA_DID instead of impersonating the Genesis Seed.
+    directory_did: String,
+    directory_service_endpoint: String,
     /// IICP-E034 registration rate-limit counter, per source IP (W-033 PHP parity).
     register_rate: RegisterRateMap,
     /// Adoption-gated E050 E′ hardening. False preserves the migration-safe
@@ -250,6 +254,7 @@ async fn emit_event(st: &AppState, event_type: &str, node_id: &str, payload: ser
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/iicp/health", get(health))
         .route("/v1/stats", get(stats))
         .route("/api/v1/stats", get(stats))
         .route("/v1/metrics", get(metrics))
@@ -270,6 +275,8 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/events", get(events))
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/replicas/register", post(replicas_register))
+        .route("/v1/replicas/deregister", post(replicas_deregister))
+        .route("/api/v1/replicas/deregister", post(replicas_deregister))
         .route("/v1/me", get(me))
         .route("/api/v1/me", get(me))
         .route("/v1/node/:id", get(node_detail))
@@ -3733,22 +3740,22 @@ async fn registry_intents(State(st): State<AppState>) -> Json<serde_json::Value>
 async fn did_document(State(st): State<AppState>) -> Json<serde_json::Value> {
     let verification_method = match st.signing_key.as_deref().and_then(seed_pubkey_jwk) {
         Some(jwk) => vec![serde_json::json!({
-            "id": format!("{DIRECTORY_DID}#key-1"),
+            "id": format!("{}#key-1", st.directory_did),
             "type": "JsonWebKey2020",
-            "controller": DIRECTORY_DID,
+            "controller": st.directory_did,
             "publicKeyJwk": jwk,
         })],
         None => vec![],
     };
     Json(serde_json::json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
-        "id": DIRECTORY_DID,
-        "controller": DIRECTORY_DID,
+        "id": st.directory_did,
+        "controller": st.directory_did,
         "verificationMethod": verification_method,
         "service": [{
-            "id": format!("{DIRECTORY_DID}#iicp-directory"),
+            "id": format!("{}#iicp-directory", st.directory_did),
             "type": "IICPDirectory",
-            "serviceEndpoint": "https://iicp.network/v1"
+            "serviceEndpoint": st.directory_service_endpoint
         }]
     }))
 }
@@ -4093,7 +4100,7 @@ async fn compliance_attestation(
     let mut out = document;
     out["attestation_hash"] = serde_json::json!(hash);
     out["signature"] = serde_json::json!(signature);
-    out["signer_did"] = serde_json::json!(DIRECTORY_DID);
+    out["signer_did"] = serde_json::json!(st.directory_did);
     (StatusCode::OK, Json(out))
 }
 
@@ -4122,7 +4129,7 @@ async fn iicp_replicas(State(st): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "@context":      "https://iicp.network/ns/replicas/v1",
         "schema_version": "2",
-        "genesis_seed":  DIRECTORY_DID,
+        "genesis_seed":  DEFAULT_DIRECTORY_DID,
         "replicas":      entries,
         "updated_at":    ts_now,
     });
@@ -5188,7 +5195,7 @@ async fn events(
                 "payload": r.payload,
                 "prev_hash": r.prev_hash,
                 "sig": r.sig,
-                "signer_did": DIRECTORY_DID,
+                "signer_did": st.directory_did,
             })
         })
         .collect();
@@ -5247,6 +5254,15 @@ async fn snapshot(State(st): State<AppState>, headers: HeaderMap) -> axum::respo
         )
             .into_response();
     };
+    if !st.repo.replica_is_active(&claims.sub).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {"code": "unauthorized", "message": "Replica is not active; re-register to reactivate"}
+            })),
+        )
+            .into_response();
+    }
     use sha2::{Digest, Sha256};
     if stored_hash != hex::encode(Sha256::digest(token.as_bytes())) {
         return (
@@ -5331,14 +5347,9 @@ async fn replicas_register(
     }
     let endpoint = req.endpoint.trim_end_matches('/').to_string();
     // Idempotent on DID (DIR-FED-13): reuse the existing replica_id, else mint one.
-    let existing = st
-        .repo
-        .all_replicas()
-        .await
-        .into_iter()
-        .find(|(_, d, _, _, _)| d == &req.did);
+    let existing = st.repo.replica_id_by_did(&req.did).await;
     let (replica_id, is_new) = match existing {
-        Some((rid, _, _, _, _)) => (rid, false),
+        Some(rid) => (rid, false),
         None => (uuid::Uuid::new_v4().to_string(), true),
     };
     st.repo
@@ -5368,16 +5379,14 @@ async fn replicas_register(
             );
         }
     }
-    if is_new {
-        // Mirror the new replica to other replicas via a signed REPLICA_REGISTERED event.
-        emit_event(
-            &st,
-            "REPLICA_REGISTERED",
-            &replica_id,
-            serde_json::json!({ "did": req.did, "endpoint": endpoint, "trust_tier": "low" }),
-        )
-        .await;
-    }
+    // Mirror registration, endpoint rotation and reactivation to every replica.
+    emit_event(
+        &st,
+        "REPLICA_REGISTERED",
+        &replica_id,
+        serde_json::json!({ "did": req.did, "endpoint": endpoint, "trust_tier": "low" }),
+    )
+    .await;
     let genesis_hash = st.repo.events_since(0, 1).await.first().map(|e| {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(
@@ -5397,6 +5406,90 @@ async fn replicas_register(
             "is_new_registration": is_new,
             "expires_at": expires_at,
         })),
+    )
+}
+
+/// `POST /v1/replicas/deregister` (DIR-FED-22) — authenticate the current
+/// replica credential, retain a decommissioned audit row, invalidate the
+/// bearer, and federate the lifecycle tombstone.
+async fn replicas_deregister(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+    else {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing Authorization header",
+        );
+    };
+    let claims = match auth::verify_replica_jwt(token) {
+        Ok(claims) => claims,
+        Err(auth::ReplicaTokenError::Expired) => {
+            return err_json(
+                StatusCode::UNAUTHORIZED,
+                "token_expired",
+                "Replica JWT has expired",
+            )
+        }
+        Err(auth::ReplicaTokenError::Invalid) => {
+            return err_json(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Invalid replica token",
+            )
+        }
+    };
+    if !st.repo.replica_is_active(&claims.sub).await {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Replica is not active; re-register to reactivate",
+        );
+    }
+    use sha2::{Digest, Sha256};
+    let presented_hash = hex::encode(Sha256::digest(token.as_bytes()));
+    if st.repo.replica_token_hash(&claims.sub).await.as_deref() != Some(&presented_hash) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Replica token has been rotated; re-register to obtain a fresh token",
+        );
+    }
+    let did = st
+        .repo
+        .all_replicas()
+        .await
+        .into_iter()
+        .find(|row| row.0 == claims.sub)
+        .map(|row| row.1)
+        .unwrap_or_default();
+    let Some(signing_key) = st.signing_key.as_deref() else {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "event_signing_unavailable",
+            "Replica deregistration requires event signing",
+        );
+    };
+    if !st
+        .repo
+        .decommission_replica_with_event(&claims.sub, &did, signing_key)
+        .await
+    {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decommission_failed",
+            "Replica deregistration was not committed",
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "decommissioned"})),
     )
 }
 
@@ -5622,7 +5715,42 @@ async fn main() {
     // signed event log and mirror its state so this instance serves as a replica.
     // Capture the seed URL first: it both drives the sync loop and the write-gate
     // (DIR-FED-18) so the replica 307-redirects writes to the seed.
-    let replica_seed_url: Option<String> = match replica::ReplicaConfig::from_env() {
+    let replica_config = replica::ReplicaConfig::from_env();
+    let (directory_did, directory_service_endpoint) = match replica_config.as_ref() {
+        Some(cfg) => {
+            let Some(did) = cfg
+                .replica_did
+                .as_ref()
+                .filter(|did| did.starts_with("did:web:"))
+            else {
+                eprintln!("FATAL: replica mode requires a valid IICP_REPLICA_DID");
+                std::process::exit(1);
+            };
+            let Some(endpoint) = cfg
+                .replica_endpoint
+                .as_ref()
+                .filter(|url| url.starts_with("https://"))
+            else {
+                eprintln!("FATAL: replica mode requires an HTTPS IICP_REPLICA_ENDPOINT");
+                std::process::exit(1);
+            };
+            if std::env::var("IICP_DIRECTORY_DID")
+                .ok()
+                .is_some_and(|served| served != *did)
+            {
+                eprintln!("FATAL: IICP_DIRECTORY_DID must equal IICP_REPLICA_DID in replica mode");
+                std::process::exit(1);
+            }
+            (did.clone(), endpoint.trim_end_matches('/').to_string())
+        }
+        None => (
+            std::env::var("IICP_DIRECTORY_DID")
+                .unwrap_or_else(|_| DEFAULT_DIRECTORY_DID.to_string()),
+            std::env::var("IICP_DIRECTORY_ENDPOINT")
+                .unwrap_or_else(|_| "https://iicp.network/v1".to_string()),
+        ),
+    };
+    let replica_seed_url: Option<String> = match replica_config {
         Some(cfg) => {
             eprintln!(
                 "[replica] IICP_REPLICA_MODE active — federating from seed {} (writes 307→seed)",
@@ -5650,6 +5778,8 @@ async fn main() {
         repo,
         env,
         signing_key,
+        directory_did,
+        directory_service_endpoint,
         register_rate: new_register_rate(),
         strict_e050_secured: std::env::var("IICP_E050_STRICT_SECURED").is_ok_and(|value| {
             matches!(
@@ -5785,6 +5915,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![mk("a", 0.9), mk("b", 0.5)])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,
@@ -6701,7 +6833,7 @@ mod tests {
             serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(v2["replica_id"].as_str().unwrap(), rid1);
         assert_eq!(v2["is_new_registration"], false);
-        let token2 = v2["replica_token"].as_str().unwrap();
+        let token2 = v2["replica_token"].as_str().unwrap().to_string();
         assert_ne!(token1, token2, "re-registration must rotate the token");
         assert_eq!(repo.all_replicas().await.len(), 1);
 
@@ -6728,12 +6860,58 @@ mod tests {
             .unwrap();
         assert_eq!(new_snapshot.status(), 200);
 
-        // REPLICA_REGISTERED emitted exactly once (on first registration).
+        let decommission = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/replicas/deregister")
+                    .header("authorization", format!("Bearer {token2}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decommission.status(), 200);
+        assert!(
+            repo.all_replicas().await.is_empty(),
+            "decommissioned replica must leave public registry"
+        );
+        let revoked = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/snapshot")
+                    .header("authorization", format!("Bearer {token2}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), 401);
+
+        let reactivated = app(state.clone())
+            .oneshot(post(body.clone()))
+            .await
+            .unwrap();
+        let reactivated_json: serde_json::Value =
+            serde_json::from_slice(&reactivated.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(reactivated_json["replica_id"], rid1);
+        assert_eq!(reactivated_json["trust_tier"], "low");
+        assert_eq!(repo.all_replicas().await.len(), 1);
+
+        // Every registration/rotation/reactivation and explicit decommissioning is signed.
         let events = repo.events_since(0, 100).await;
         assert_eq!(
             events
                 .iter()
                 .filter(|e| e.event_type == "REPLICA_REGISTERED")
+                .count(),
+            3
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "REPLICA_DEREGISTERED")
                 .count(),
             1
         );
@@ -6746,6 +6924,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r3.status(), 422);
+    }
+
+    #[tokio::test]
+    async fn health_alias_and_configured_directory_identity_are_served() {
+        let mut state = test_state();
+        state.directory_did = "did:web:rust-shadow.iicp.network".to_string();
+        state.directory_service_endpoint = "https://shadow.example/v1".to_string();
+        let health = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/iicp/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200);
+        let did = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/.well-known/did.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&did.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["id"], "did:web:rust-shadow.iicp.network");
+        assert_eq!(body["controller"], "did:web:rust-shadow.iicp.network");
+        assert_eq!(
+            body["service"][0]["serviceEndpoint"],
+            "https://shadow.example/v1"
+        );
     }
 
     // DIR-FED-19: /.well-known/iicp-replicas.json dynamic endpoint
@@ -8586,6 +8798,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,
@@ -8656,6 +8870,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,
@@ -8710,6 +8926,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,
@@ -9353,6 +9571,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,
@@ -9368,6 +9588,8 @@ mod tests {
                 repo: Arc::new(InMemoryRepo::new(vec![])),
                 env: Env::Production,
                 signing_key: None,
+                directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+                directory_service_endpoint: "https://iicp.network/v1".to_string(),
                 register_rate: new_register_rate(),
                 strict_e050_secured: false,
                 allow_insecure_tls: false,
@@ -9398,6 +9620,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,
@@ -9425,6 +9649,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,
@@ -9505,6 +9731,8 @@ mod tests {
             repo: Arc::new(InMemoryRepo::new(vec![])),
             env: Env::Production,
             signing_key: None,
+            directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+            directory_service_endpoint: "https://iicp.network/v1".to_string(),
             register_rate: new_register_rate(),
             strict_e050_secured: false,
             allow_insecure_tls: false,

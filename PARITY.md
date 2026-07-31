@@ -55,7 +55,7 @@ Status legend: ✅ done · 🔶 present but not full production equivalent · �
 
 | Surface | Rust status |
 |---|---|
-| `GET /health` | ✅ |
+| `GET /health` + registration-compatible `/iicp/health` | ✅ |
 | `GET /api/v1/stats` + legacy `/v1/stats` | ✅ |
 | `GET /api/v1/metrics` + legacy `/v1/metrics` | ✅ |
 | `GET /api/v1/discover` + legacy `/v1/discover` | ✅ live-shape fields added 2026-06-30 |
