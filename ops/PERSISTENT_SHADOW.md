@@ -55,6 +55,11 @@ stream cannot reconstruct current state, retain the content-free negative result
 stop: replica registration and snapshot access require a separate production-write
 authorization.
 
+Use `AUTHENTICATED_SNAPSHOT_PREFLIGHT.md` for that authorization boundary. A
+configured replica must obtain and validate the authenticated snapshot before
+applying newer signed events; it must not silently substitute an incomplete
+public-tail reconstruction.
+
 Run the observer from a trusted operator host:
 
 ```bash

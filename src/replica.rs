@@ -149,19 +149,28 @@ async fn fetch_and_apply_snapshot(
         .json()
         .await
         .ok()?;
-    let snapshot_seq = snapshot_seq_from(&snapshot);
+    let snapshot_seq = validated_snapshot_seq(&snapshot)?;
     let applied = apply_snapshot(repo, &snapshot).await;
     eprintln!("[replica] snapshot applied: {applied} node(s) → since_seq={snapshot_seq}");
     Some(snapshot_seq)
 }
 
-/// Extract `snapshot_seq` from a snapshot response (falls back to 0 if missing).
-/// Pure helper so the seq-extraction logic can be unit-tested independently of HTTP.
-fn snapshot_seq_from(snapshot: &Value) -> i64 {
-    snapshot
-        .get("snapshot_seq")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
+/// Accept only the complete snapshot envelope defined by S.13 §5.5.  The
+/// snapshot is authenticated by the rotating replica bearer and the Genesis
+/// HTTPS origin; event-tail mutations remain subject to Ed25519 verification.
+/// Rejecting malformed envelopes before applying any row keeps a transient or
+/// partial response from becoming local directory state.
+fn validated_snapshot_seq(snapshot: &Value) -> Option<i64> {
+    let schema = snapshot.get("schema_version")?.as_str()?;
+    let seq = snapshot.get("snapshot_seq")?.as_i64()?;
+    if schema.is_empty()
+        || seq < 0
+        || !snapshot.get("nodes").is_some_and(Value::is_array)
+        || !snapshot.get("capabilities").is_some_and(Value::is_array)
+    {
+        return None;
+    }
+    Some(seq)
 }
 
 /// Join handshake (DIR-FED-13 §7): announce this replica to the seed with our DID +
@@ -238,22 +247,28 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
         None
     };
 
-    // SNAPSHOT BOOTSTRAP (§5.3): fetch the seed's state snapshot, apply it, and
-    // advance `since_seq` to `snapshot_seq` so the poll loop only tails new events.
-    let mut since_seq: i64 = if cfg.verification_required {
-        eprintln!("[replica] unsigned snapshot skipped; replaying verified event chain from seq=0");
-        0
-    } else {
-        match handshake.as_ref() {
-            Some(join) => {
+    // SNAPSHOT BOOTSTRAP (§5.3): Genesis snapshots are authenticated by the
+    // rotating replica bearer and trusted Genesis TLS+DNS boundary (S.13
+    // §5.5/§6.5). `verification_required` applies to the public event tail; it
+    // must not disable the authenticated snapshot that supplies canonical
+    // current state.  A configured replica fails closed and retries rather
+    // than skipping historical state after a transient snapshot failure.
+    let mut since_seq: i64 = match handshake.as_ref() {
+        Some(join) => loop {
+            if let Some(seq) =
                 fetch_and_apply_snapshot(&client, &cfg.seed_url, &join.replica_token, repo.as_ref())
                     .await
-                    .unwrap_or(join.since_seq)
+            {
+                break seq;
             }
-            None => {
-                eprintln!("[replica] authenticated snapshot skipped; join token unavailable");
-                0
-            }
+            eprintln!(
+                "[replica] authenticated snapshot unavailable or malformed; no event mutation"
+            );
+            tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs)).await;
+        },
+        None => {
+            eprintln!("[replica] authenticated snapshot skipped; join token unavailable");
+            0
         }
     };
 
@@ -1294,12 +1309,33 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_seq_extraction_advances_cursor() {
-        // The poll loop uses snapshot_seq_from() to advance since_seq past the snapshot.
-        // Without this, it would start from 0 and re-apply every historical event.
-        assert_eq!(snapshot_seq_from(&json!({"snapshot_seq": 42})), 42);
-        assert_eq!(snapshot_seq_from(&json!({"snapshot_seq": 0})), 0);
-        assert_eq!(snapshot_seq_from(&json!({})), 0, "missing key → 0 fallback");
+    fn authenticated_snapshot_requires_complete_envelope_before_apply_and_advances_cursor() {
+        let valid = json!({
+            "schema_version": "v0.3.0",
+            "snapshot_seq": 42,
+            "nodes": [],
+            "capabilities": []
+        });
+        assert_eq!(validated_snapshot_seq(&valid), Some(42));
+        assert_eq!(validated_snapshot_seq(&json!({"snapshot_seq": 42})), None);
+        assert_eq!(
+            validated_snapshot_seq(&json!({
+                "schema_version": "v0.3.0",
+                "snapshot_seq": -1,
+                "nodes": [],
+                "capabilities": []
+            })),
+            None
+        );
+        assert_eq!(
+            validated_snapshot_seq(&json!({
+                "schema_version": "v0.3.0",
+                "snapshot_seq": 42,
+                "nodes": {},
+                "capabilities": []
+            })),
+            None
+        );
     }
 
     #[tokio::test]
