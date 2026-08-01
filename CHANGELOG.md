@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.6
+
 - Added PHP-compatible discovery evidence for health dimensions, Gold threshold
   state, latency basis, SDK currency and aggregate operator diversity.
 - Preserved ranking, routing and the operator-preview boundary.
