@@ -195,7 +195,7 @@ fn v1_10_84_manifest_adds_discovery_evidence_contract() {
     assert_eq!(manifest["contract_version"], "v1.10.84");
     assert_eq!(manifest["authority"]["runtime_version"], "v1.10.84");
     assert_eq!(
-        manifest["fixtures"]["discovery-evidence-v1.json"],
+        manifest["fixtures"]["discovery-evidence-v1.10.84.json"],
         "de652ce2b39626729afba93576a69d894c837631e341f3d352586b5eb4d041cd"
     );
 }

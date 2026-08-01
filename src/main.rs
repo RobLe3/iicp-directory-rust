@@ -56,7 +56,7 @@ use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
 const SDK_BASELINE_VERSION: &str = "0.7.68";
-const SDK_LATEST_KNOWN_VERSION: &str = "0.7.99";
+const SDK_LATEST_KNOWN_VERSION: &str = "0.7.100";
 
 #[derive(Debug, Parser)]
 #[command(name = "iicp-directory-rs", version, about)]
@@ -6171,7 +6171,7 @@ mod tests {
             );
         }
         assert_eq!(node["sdk_baseline_version"], SDK_BASELINE_VERSION);
-        assert_eq!(node["sdk_release"]["latest_known_version"], "0.7.99");
+        assert_eq!(node["sdk_release"]["latest_known_version"], "0.7.100");
         assert_eq!(node["latency_evidence"]["basis"], "none");
         assert_eq!(node["health_reasons"][0]["dimension"], "reachability");
         assert!(node["trust_progress"]["remaining_gold_requirements"].is_array());
