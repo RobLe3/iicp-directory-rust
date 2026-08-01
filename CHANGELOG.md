@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Corrected the discovery evidence `latest_known` default to the current
+  released SDK version. Compatibility and upgrade-required floors are unchanged.
+
 ## 0.1.6
 
 - Added PHP-compatible discovery evidence for health dimensions, Gold threshold
