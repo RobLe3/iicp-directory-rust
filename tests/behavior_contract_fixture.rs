@@ -12,6 +12,7 @@ const MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.80.json")
 const CURRENT_MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.82.json");
 const LIFECYCLE_MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.83.json");
 const DISCOVERY_EVIDENCE_MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.84.json");
+const RELEASE_CURRENCY_MANIFEST_BYTES: &[u8] = include_bytes!("../parity/contract-v1.10.85.json");
 const EXPECTED_SHA256: &str = "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f";
 
 #[derive(Deserialize)]
@@ -197,5 +198,17 @@ fn v1_10_84_manifest_adds_discovery_evidence_contract() {
     assert_eq!(
         manifest["fixtures"]["discovery-evidence-v1.10.84.json"],
         "de652ce2b39626729afba93576a69d894c837631e341f3d352586b5eb4d041cd"
+    );
+}
+
+#[test]
+fn v1_10_85_manifest_advances_sdk_release_currency_only() {
+    let manifest: serde_json::Value = serde_json::from_slice(RELEASE_CURRENCY_MANIFEST_BYTES)
+        .expect("valid release-currency manifest");
+    assert_eq!(manifest["contract_version"], "v1.10.85");
+    assert_eq!(manifest["authority"]["runtime_version"], "v1.10.85");
+    assert_eq!(
+        manifest["fixtures"]["discovery-evidence-v1.json"],
+        "9b7b1302ee68af4a4889074e42e123c380e4e5e5fd0c80b78050c97b13f45f0c"
     );
 }

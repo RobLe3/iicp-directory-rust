@@ -1,0 +1,17 @@
+{
+  "authority": {
+    "php_commit": "53ab0b2",
+    "runtime_version": "v1.10.85"
+  },
+  "contract_version": "v1.10.85",
+  "fixtures": {
+    "behavior-contract-v1.json": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+    "discovery-evidence-v1.json": "9b7b1302ee68af4a4889074e42e123c380e4e5e5fd0c80b78050c97b13f45f0c",
+    "federation-profile-v1.json": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9",
+    "http-contract-v2.json": "08edc5cf302a858e5576cb59e07f5b71657ae6015b5537999985db71cc4128f6",
+    "replica-lifecycle-contract-v1.json": "9ae2e3536891c3488a2b4d04e543364359a2b9a2c389203ece0eaca1a341b541"
+  },
+  "scope": [
+    "sdk_release_currency_correction"
+  ]
+}
