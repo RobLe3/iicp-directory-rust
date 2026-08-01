@@ -56,6 +56,7 @@ use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
 const SDK_BASELINE_VERSION: &str = "0.7.68";
+const SDK_LATEST_KNOWN_VERSION: &str = "0.7.99";
 
 #[derive(Debug, Parser)]
 #[command(name = "iicp-directory-rs", version, about)]
@@ -607,6 +608,22 @@ async fn build_discover_response(
     let response_started = Instant::now();
     let count = nodes.len() as u32;
     let relay_available = nodes.iter().any(|n| n.relay_capable.unwrap_or(false));
+    let verified_operator_keys = nodes
+        .iter()
+        .filter(|node| node.operator_verified)
+        .filter_map(|node| node.operator_pubkey.as_deref())
+        .collect::<Vec<_>>();
+    let distinct_verified_operators = verified_operator_keys
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let distinct_regions = nodes
+        .iter()
+        .map(|node| node.region.as_str())
+        .filter(|region| !region.is_empty())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     state
         .repo
         .record_dispatch_usage(if public_view {
@@ -639,6 +656,16 @@ async fn build_discover_response(
         "view": if public_view { "public" } else { "dispatch" },
         "data_class": data_class,
         "route_fields_present": !public_view,
+        "diversity_evidence": {
+            "nodes": count,
+            "nodes_with_verified_operator": verified_operator_keys.len(),
+            "distinct_verified_operators": distinct_verified_operators,
+            "distinct_regions": distinct_regions,
+            "operator_basis": "verified_operator_key_aggregate",
+            "failure_domain_count": serde_json::Value::Null,
+            "failure_domain_basis": "not_attested",
+            "identity_material_exposed": false
+        },
     });
     if let Some(negotiation) = negotiated_profile {
         body["profile_negotiation"] = negotiation;
@@ -1099,6 +1126,23 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
         "upgrade_required".into(),
         serde_json::json!(sdk_status != "current"),
     );
+    let sdk_relation = match n.sdk_version.as_deref() {
+        None => "unknown",
+        Some(version) if version_parts(version) == version_parts(SDK_LATEST_KNOWN_VERSION) => {
+            "latest_known"
+        }
+        Some(version) if version_at_least(version, SDK_LATEST_KNOWN_VERSION) => "ahead_of_known",
+        Some(_) => "behind_known",
+    };
+    obj.insert(
+        "sdk_release".into(),
+        serde_json::json!({
+            "compatibility": sdk_status,
+            "relation": sdk_relation,
+            "latest_known_version": SDK_LATEST_KNOWN_VERSION,
+            "latest_known_source": "directory_release_manifest"
+        }),
+    );
     obj.insert(
         "auto_update".into(),
         serde_json::json!({
@@ -1112,6 +1156,13 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
     );
 
     let completed = n.completed_tasks_count;
+    let remaining_gold_requirements = [
+        (completed < 100).then_some("completed_tasks"),
+        (n.reputation_score < 0.65).then_some("reputation_score"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     obj.insert("probation".into(), serde_json::json!(completed < 100));
     obj.insert(
         "trust_progress".into(),
@@ -1121,6 +1172,9 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
             "platinum_min_tasks": 1000,
             "tasks_until_gold": 100_u64.saturating_sub(completed),
             "tasks_until_platinum": 1000_u64.saturating_sub(completed),
+            "gold_task_threshold_met": completed >= 100,
+            "gold_reputation_threshold_met": n.reputation_score >= 0.65,
+            "remaining_gold_requirements": remaining_gold_requirements,
             "probation": completed < 100
         }),
     );
@@ -1206,6 +1260,49 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
             "health_impact": "separate_from_operational_health",
             "summary": "Task/inference latency is a performance signal, not a reachability-health input."
         }),
+    );
+    obj.insert(
+        "latency_evidence".into(),
+        serde_json::json!({
+            "estimate_ms": n.latency_estimate_ms,
+            "basis": if n.latency_estimate_ms.is_some() { "multi_proxy_ema" } else { "none" }
+        }),
+    );
+    let policy = obj
+        .get("node_policy_manifest")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let policy_status = policy
+        .pointer("/verification/status")
+        .and_then(serde_json::Value::as_str);
+    obj.insert(
+        "health_reasons".into(),
+        serde_json::json!([
+            {
+                "dimension": "reachability",
+                "state": if n.reachability_signal >= 1.0 { "reachable" } else { "unknown" },
+                "reason": if n.reachability_signal >= 1.0 { "directory_observation" } else { "not_directory_observed" },
+                "evidence": if n.reachability_signal >= 1.0 { "directory_observed" } else { "none" }
+            },
+            {
+                "dimension": "backend",
+                "state": "unknown",
+                "reason": "not_reported",
+                "evidence": "not_reported"
+            },
+            {
+                "dimension": "trust",
+                "state": if completed < 100 { "probation" } else { "established" },
+                "reason": if completed < 100 { "task_threshold_pending" } else { "task_threshold_met" },
+                "evidence": "directory_accounting"
+            },
+            {
+                "dimension": "policy",
+                "state": if policy.is_null() { "missing" } else if policy_status == Some("verified") { "verified" } else { "unverified" },
+                "reason": if policy.is_null() { "manifest_not_provided" } else { policy_status.unwrap_or("signature_not_verified") },
+                "evidence": if policy.is_null() { "none" } else { "manifest_projection" }
+            }
+        ]),
     );
     if !obj.contains_key("health_confidence") {
         obj.insert(
@@ -6058,11 +6155,14 @@ mod tests {
             "route_evidence",
             "routing_hint",
             "sdk_status",
+            "sdk_release",
             "sdk_baseline_version",
             "capability_summary",
             "browser_usable",
             "directory_observed_reachable",
             "performance",
+            "latency_evidence",
+            "health_reasons",
             "input_modalities",
         ] {
             assert!(
@@ -6071,6 +6171,15 @@ mod tests {
             );
         }
         assert_eq!(node["sdk_baseline_version"], SDK_BASELINE_VERSION);
+        assert_eq!(node["sdk_release"]["latest_known_version"], "0.7.99");
+        assert_eq!(node["latency_evidence"]["basis"], "none");
+        assert_eq!(node["health_reasons"][0]["dimension"], "reachability");
+        assert!(node["trust_progress"]["remaining_gold_requirements"].is_array());
+        assert_eq!(v["diversity_evidence"]["identity_material_exposed"], false);
+        assert_eq!(
+            v["diversity_evidence"]["failure_domain_count"],
+            serde_json::Value::Null
+        );
         assert_eq!(node["privacy_routing_status"], "transitional");
         assert_eq!(node["response_encryption_ready"], false);
         assert_eq!(node["browser_usable"], true);
@@ -7683,6 +7792,12 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["route_fields_present"], false);
+        assert_eq!(
+            body["diversity_evidence"]["identity_material_exposed"],
+            false
+        );
+        let raw = body.to_string();
+        assert!(!raw.contains("operator_pubkey"));
         for node in body["nodes"].as_array().unwrap() {
             assert!(node.get("endpoint").is_none());
             assert!(node.get("transport_endpoint").is_none());
