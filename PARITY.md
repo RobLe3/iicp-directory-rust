@@ -1,7 +1,7 @@
 # iicp-directory-rs — PHP Feature Parity Checklist
 
-Last refreshed: **2026-08-01**. Rust `v0.1.6` pins the shared
-`contract-v1.10.84.json`, whose PHP runtime authority is `v1.10.84`. The
+Last refreshed: **2026-08-01**. Rust `v0.1.7` pins the shared
+`contract-v1.10.85.json`, whose PHP runtime authority is `v1.10.85`. The
 normalized HTTP and behavior fixtures retain their earlier authority because
 this additive release introduces a separate content-free discovery-evidence
 fixture rather than rewriting those vectors. Older contracts remain immutable

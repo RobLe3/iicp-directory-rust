@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- Corrected the discovery evidence `latest_known` default to the current
-  released SDK version. Compatibility and upgrade-required floors are unchanged.
+## 0.1.7 — 2026-08-01
+
+- Advanced shared discovery release-currency evidence to SDK `0.7.101`.
+- Pinned the PHP `v1.10.85` parity manifest without changing schema, wire
+  behavior, or the operator-preview deployment boundary.
 
 ## 0.1.6
 
