@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added PHP-compatible discovery evidence for health dimensions, Gold threshold
+  state, latency basis, SDK currency and aggregate operator diversity.
+- Preserved ranking, routing and the operator-preview boundary.
+
 ## 0.1.5
 
 - Added `/iicp/health` for registration dial-back compatibility.
