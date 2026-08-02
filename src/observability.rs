@@ -253,3 +253,51 @@ pub(crate) fn compute_directory_health(agg: &crate::repo::ProbeAggregate24h) -> 
         "window": "24h",
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn health_reports_current_version() {
+        let Json(value) = health().await;
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["version"], VERSION);
+    }
+
+    #[test]
+    fn directory_health_is_unavailable_without_probe_data() {
+        let aggregate = crate::repo::ProbeAggregate24h::default();
+        let health = compute_directory_health(&aggregate);
+        assert_eq!(health["label"], "unavailable");
+        assert!(health["score"].is_null());
+    }
+
+    #[test]
+    fn directory_health_is_healthy_for_fast_conformant_probes() {
+        let aggregate = crate::repo::ProbeAggregate24h {
+            discover_p50_ms: Some(50.0),
+            conformance_passed: 100,
+            conformance_failed: 0,
+            ..Default::default()
+        };
+        let health = compute_directory_health(&aggregate);
+        assert_eq!(health["label"], "healthy");
+        let score = health["score"].as_f64().expect("numeric score");
+        assert!((score - 1.0).abs() < 0.001, "score was {score}");
+    }
+
+    #[test]
+    fn directory_health_is_critical_for_slow_half_failing_probes() {
+        let aggregate = crate::repo::ProbeAggregate24h {
+            discover_p50_ms: Some(500.0),
+            conformance_passed: 50,
+            conformance_failed: 50,
+            ..Default::default()
+        };
+        let health = compute_directory_health(&aggregate);
+        assert_eq!(health["label"], "critical");
+        let score = health["score"].as_f64().expect("numeric score");
+        assert!(score < 0.40, "score was {score}");
+    }
+}
