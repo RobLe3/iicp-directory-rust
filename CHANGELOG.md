@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.8 — 2026-08-02
+
 - Added separate provider implementation name/version and SDK compatibility
   version axes, with legacy alias support and conflicting dual values rejected.
 - Advanced deployment compatibility metadata to OpenAPI 1.7.0 while preserving
