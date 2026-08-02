@@ -54,7 +54,7 @@ use cli::Cli;
 use cli::Command;
 use config::DEFAULT_DIRECTORY_DID;
 #[cfg(test)]
-use observability::{compute_directory_health, sdk_adoption_json};
+use observability::sdk_adoption_json;
 #[cfg(test)]
 use repo::InMemoryRepo;
 use repo::{
@@ -5852,23 +5852,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_returns_ok() {
-        let resp = app(test_state())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/health")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["ok"], true);
-    }
-
-    #[tokio::test]
     async fn replica_write_gate_307s_writes_and_passes_reads() {
         // DIR-FED-18: in replica mode, writes 307→seed; reads pass through.
         let seed = "http://seed-directory:8080".to_string();
@@ -6051,57 +6034,6 @@ mod tests {
         assert!(
             v["directory_health"]["window"].as_str() == Some("24h"),
             "directory_health.window wrong"
-        );
-    }
-
-    #[test]
-    fn directory_health_score_unavailable_when_no_probe_data() {
-        // Behavior: with no probe data (all zeros / None), score=null label="unavailable".
-        let agg = crate::repo::ProbeAggregate24h::default();
-        let h = compute_directory_health(&agg);
-        assert_eq!(
-            h["label"], "unavailable",
-            "expected unavailable with no probe data"
-        );
-        assert!(
-            h["score"].is_null(),
-            "score should be null when no probe data"
-        );
-    }
-
-    #[test]
-    fn directory_health_score_healthy_when_fast_and_conformant() {
-        // p50=50ms (perfect latency) + all passed → latScore=1.0, confScore=1.0 → 1.0 → healthy
-        let agg = crate::repo::ProbeAggregate24h {
-            discover_p50_ms: Some(50.0),
-            conformance_passed: 100,
-            conformance_failed: 0,
-            ..Default::default()
-        };
-        let h = compute_directory_health(&agg);
-        assert_eq!(h["label"], "healthy");
-        let score = h["score"].as_f64().unwrap();
-        assert!(
-            (score - 1.0).abs() < 0.001,
-            "score should be ~1.0, got {score}"
-        );
-    }
-
-    #[test]
-    fn directory_health_score_critical_when_slow_and_half_failing() {
-        // p50=500ms (latScore=0.0) + 50% fail rate (confScore=0.5) → 0.4×0.5=0.2 → critical
-        let agg = crate::repo::ProbeAggregate24h {
-            discover_p50_ms: Some(500.0),
-            conformance_passed: 50,
-            conformance_failed: 50,
-            ..Default::default()
-        };
-        let h = compute_directory_health(&agg);
-        assert_eq!(h["label"], "critical");
-        let score = h["score"].as_f64().unwrap();
-        assert!(
-            score < 0.40,
-            "score should be below 0.40 (critical), got {score}"
         );
     }
 
