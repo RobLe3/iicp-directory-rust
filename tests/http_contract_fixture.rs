@@ -47,7 +47,7 @@ fn php_http_contract_is_the_reviewed_immutable_fixture() {
 #[test]
 fn every_authoritative_route_is_acknowledged_by_the_rust_router() {
     let contract: Contract = serde_json::from_slice(FIXTURE_BYTES).expect("valid HTTP contract");
-    let source = include_str!("../src/main.rs");
+    let source = include_str!("../src/router.rs");
     let allowed_auth = BTreeSet::from([
         "public",
         "node_token",

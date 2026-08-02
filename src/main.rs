@@ -28,6 +28,7 @@ mod registration_store;
 mod replica;
 mod repo;
 mod reputation;
+mod router;
 mod runtime;
 mod schema;
 mod state;
@@ -40,14 +41,12 @@ use std::time::Instant;
 use std::{net::ToSocketAddrs, time::Duration};
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Query, Request, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+#[cfg(test)]
+use axum::extract::Request;
+use axum::extract::{Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::{
-    middleware::{self, Next},
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{middleware, Json};
 use clap::Parser;
 use cli::Cli;
 #[cfg(test)]
@@ -59,6 +58,7 @@ use repo::{
     AuditResult, ConformanceBadge, CreditError, DiscoverQuery, IntentSummary,
     OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
 };
+use router::{app, replica_write_gate};
 use serde::Deserialize;
 use state::{new_register_rate, AppState};
 #[cfg(test)]
@@ -168,179 +168,6 @@ async fn emit_event(st: &AppState, event_type: &str, node_id: &str, payload: ser
             .append_signed_event(key, event_type, node_id, &payload)
             .await;
     }
-}
-
-fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/iicp/health", get(health))
-        .route("/v1/stats", get(stats))
-        .route("/api/v1/stats", get(stats))
-        .route("/v1/metrics", get(metrics))
-        .route("/api/v1/metrics", get(metrics))
-        .route("/v1/discover", get(discover))
-        .route("/api/v1/discover", get(discover))
-        .route("/v1/dispatch/ticket", post(dispatch_ticket_issue))
-        .route("/api/v1/dispatch/ticket", post(dispatch_ticket_issue))
-        .route("/v1/bootstrap", get(bootstrap))
-        .route("/api/v1/bootstrap", get(bootstrap))
-        .route("/v1/events", get(events))
-        .route("/v1/snapshot", get(snapshot))
-        // #442 — federation endpoints are also served under /api/v1 so a replica (PHP or
-        // Rust) can federate FROM a Rust seed: ReplicaStartCommand + replica::fetch_events
-        // both poll `{seed}/api/v1/events` + `/api/v1/snapshot` + `/api/v1/replicas/register`
-        // (the PHP seed mounts everything under /api). Without these aliases a Rust seed is
-        // unreachable to /api/v1-expecting replicas (404 on the path).
-        .route("/api/v1/events", get(events))
-        .route("/api/v1/snapshot", get(snapshot))
-        .route("/api/v1/replicas/register", post(replicas_register))
-        .route("/v1/replicas/deregister", post(replicas_deregister))
-        .route("/api/v1/replicas/deregister", post(replicas_deregister))
-        .route("/v1/me", get(me))
-        .route("/api/v1/me", get(me))
-        .route("/v1/node/:id", get(node_detail))
-        .route("/api/v1/node/:id", get(node_detail))
-        .route("/v1/register", post(register).delete(deregister))
-        .route("/api/v1/register", post(register).delete(deregister))
-        .route("/v1/operator/rename", post(operator_rename))
-        .route("/api/v1/operator/rename", post(operator_rename))
-        .route("/v1/operator/challenge", post(operator_challenge))
-        .route("/api/v1/operator/challenge", post(operator_challenge))
-        .route("/v1/operator/acceptance", post(operator_acceptance))
-        .route("/api/v1/operator/acceptance", post(operator_acceptance))
-        .route("/v1/operator/dsr/export", post(operator_dsr_export))
-        .route("/api/v1/operator/dsr/export", post(operator_dsr_export))
-        .route("/v1/operator/dsr/restrict", post(operator_dsr_restrict))
-        .route("/api/v1/operator/dsr/restrict", post(operator_dsr_restrict))
-        .route("/v1/operator/dsr/anonymize", post(operator_dsr_anonymize))
-        .route(
-            "/api/v1/operator/dsr/anonymize",
-            post(operator_dsr_anonymize),
-        )
-        .route("/v1/operator/key/rotate", post(operator_key_rotate))
-        .route("/api/v1/operator/key/rotate", post(operator_key_rotate))
-        .route("/v1/operator/key/revoke", post(operator_key_revoke))
-        .route("/api/v1/operator/key/revoke", post(operator_key_revoke))
-        .route("/v1/leaderboards/:board_id", get(leaderboard))
-        .route("/api/v1/leaderboards/:board_id", get(leaderboard))
-        .route("/v1/replicas/register", post(replicas_register))
-        .route("/v1/peers", post(peers))
-        .route("/api/v1/peers", post(peers))
-        .route("/v1/heartbeat", post(heartbeat))
-        .route("/api/v1/heartbeat", post(heartbeat))
-        .route("/v1/registry/nodes", get(registry_nodes))
-        .route("/api/v1/registry/nodes", get(registry_nodes))
-        .route("/v1/registry/nodes/:id", get(registry_node_detail))
-        .route("/api/v1/registry/nodes/:id", get(registry_node_detail))
-        .route("/v1/registry/intents", get(registry_intents))
-        .route("/api/v1/registry/intents", get(registry_intents))
-        .route("/v1/registry/stats", get(registry_stats))
-        .route("/api/v1/registry/stats", get(registry_stats))
-        .route("/.well-known/did.json", get(did_document))
-        .route("/.well-known/iicp-deployment.json", get(deployment_record))
-        .route("/.well-known/iicp-replicas.json", get(iicp_replicas))
-        .route("/v1/directory-key", get(directory_key))
-        .route("/api/v1/directory-key", get(directory_key))
-        .route("/v1/consumer-token", post(consumer_token_issue))
-        .route("/api/v1/consumer-token", post(consumer_token_issue))
-        .route("/v1/relay/ticket", post(relay_ticket_issue))
-        .route("/api/v1/relay/ticket", post(relay_ticket_issue))
-        .route("/v1/compliance-attestation", get(compliance_attestation))
-        .route(
-            "/api/v1/compliance-attestation",
-            get(compliance_attestation),
-        )
-        .route("/v1/credits/balance", get(credits_balance))
-        .route("/api/v1/credits/balance", get(credits_balance))
-        .route("/v1/credits/summary", get(credits_summary))
-        .route("/api/v1/credits/summary", get(credits_summary))
-        .route("/v1/credits/award", post(credits_award))
-        .route("/api/v1/credits/award", post(credits_award))
-        .route("/v1/credits/transactions", get(credits_transactions))
-        .route("/api/v1/credits/transactions", get(credits_transactions))
-        .route("/v1/audit-report", post(audit_report))
-        .route("/api/v1/audit-report", post(audit_report))
-        .route("/v1/telemetry/probe", post(telemetry_probe))
-        .route("/api/v1/telemetry/probe", post(telemetry_probe))
-        .route("/v1/telemetry", post(telemetry_proxy))
-        .route("/api/v1/telemetry", post(telemetry_proxy))
-        .route("/v1/credits/quote", get(credits_quote))
-        .route("/api/v1/credits/quote", get(credits_quote))
-        .route("/v1/badges", get(badges_list))
-        .route("/api/v1/conformance/badges", get(badges_list))
-        .route("/v1/badge/:tier", get(badge_svg))
-        .route("/api/v1/badge/:tier", get(badge_svg))
-        .route("/v1/submit", post(conformance_submit))
-        .route("/api/v1/conformance/submit", post(conformance_submit))
-        .route("/v1/verify", get(conformance_verify))
-        .route("/api/v1/conformance/verify", get(conformance_verify))
-        .route("/v1/probe", get(probe_node))
-        .route("/api/v1/probe", get(probe_node))
-        .route("/", get(root_info))
-        .layer(middleware::from_fn(json_error_boundary))
-        .with_state(state)
-}
-
-/// Axum extractor rejections otherwise expose plain-text parser details (and
-/// can include the phrase "at line"). Keep every API error JSON-shaped and
-/// content-free, matching the PHP authority's PROTO-MSG-05/SEC-LEAK contract.
-async fn json_error_boundary(req: Request, next: Next) -> Response {
-    let response = next.run(req).await;
-    let status = response.status();
-    let is_json = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("application/json"));
-    if (status.is_client_error() || status.is_server_error()) && !is_json {
-        return (
-            status,
-            Json(serde_json::json!({
-                "error": {
-                    "code": if status == StatusCode::UNPROCESSABLE_ENTITY {
-                        "validation_error"
-                    } else {
-                        "request_error"
-                    },
-                    "message": "request rejected"
-                }
-            })),
-        )
-            .into_response();
-    }
-    response
-}
-
-/// Replica write-gate (DIR-FED-18): when this directory runs as a replica
-/// (`IICP_REPLICA_MODE=true`), it MUST NOT accept writes — token issuance and the
-/// event log are single-source on the seed. Unsafe methods (POST/PUT/PATCH/DELETE) get
-/// a 307 Temporary Redirect to the seed, preserving path + query; reads pass through.
-/// Reciprocal of the PHP `ReplicaModeRedirect` middleware. Applied only in replica mode.
-async fn replica_write_gate(State(seed_url): State<String>, req: Request, next: Next) -> Response {
-    if matches!(
-        *req.method(),
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    ) {
-        let path_q = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
-        let location = format!("{}{}", seed_url.trim_end_matches('/'), path_q);
-        return (
-            StatusCode::TEMPORARY_REDIRECT,
-            [
-                (header::LOCATION, location),
-                (
-                    header::HeaderName::from_static("x-iicp-redirect-reason"),
-                    "replica_mode".to_string(),
-                ),
-                (header::RETRY_AFTER, "0".to_string()),
-            ],
-        )
-            .into_response();
-    }
-    next.run(req).await
 }
 
 async fn health() -> Json<serde_json::Value> {
