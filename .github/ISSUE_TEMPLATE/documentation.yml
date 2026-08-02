@@ -1,0 +1,22 @@
+name: Documentation defect
+description: Report unclear, stale, contradictory, or inaccessible implementation documentation.
+title: "[docs] "
+labels: ["documentation"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Document and section
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and reader impact
+      description: Explain the concrete decision, command, or behavior that becomes unclear.
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: Suggested correction or authoritative evidence

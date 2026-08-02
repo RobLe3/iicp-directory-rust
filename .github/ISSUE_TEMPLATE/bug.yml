@@ -1,0 +1,36 @@
+name: Implementation bug
+description: Report reproducible behavior in this implementation.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private topology, production records, task payloads, personal data, or unmitigated vulnerabilities.
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Describe the behavior using a local, test, or disposable environment.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Link the applicable specification, public contract, or documentation when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Content-free reproduction
+      description: Provide minimal steps, a failing test, or sanitized fixtures.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Released version and environment
+      description: Include the released component version, runtime/toolchain, operating system, and relevant non-sensitive configuration.
+    validations:
+      required: true

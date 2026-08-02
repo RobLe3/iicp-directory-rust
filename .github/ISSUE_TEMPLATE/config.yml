@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Protocol or cross-component proposal
+    url: https://github.com/RobLe3/IICP/issues/new?template=protocol-proposal.yml
+    about: Propose normative or ecosystem-wide changes in the public protocol repository.
+  - name: Community discussion
+    url: https://iicp.network/forum/
+    about: Discuss use cases and questions that are not yet actionable implementation work.
+  - name: Security vulnerability
+    url: https://github.com/RobLe3/iicp-directory-rust/security/advisories/new
+    about: Report vulnerabilities privately. Do not disclose them in a public issue.
