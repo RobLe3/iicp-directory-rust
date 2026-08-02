@@ -112,6 +112,15 @@ input and the signing key are present.
 Current local verification:
 
 ```bash
+./scripts/run_lifecycle_conformance.sh
+```
+
+This lane runs the IICP v1.10.8 lifecycle profile against a disposable,
+MySQL-backed loopback directory. It rechecks production endpoint rejection,
+uses only the explicit testing liveness bypass, removes the container and state
+afterward, and emits a content-free summary. It never contacts Genesis.
+
+```bash
 cd iicp-directory-rs
 ./scripts/check_quality.sh
 ```
