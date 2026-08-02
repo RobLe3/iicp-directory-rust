@@ -26,6 +26,7 @@ fn rust_source_consumes_current_control_plane_contract() {
     let source = [
         include_str!("../src/main.rs"),
         include_str!("../src/router.rs"),
+        include_str!("../src/observability.rs"),
         include_str!("../src/repo.rs"),
         include_str!("../src/db.rs"),
         include_str!("../src/policy_manifest.rs"),
