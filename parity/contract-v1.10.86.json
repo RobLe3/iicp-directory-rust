@@ -1,0 +1,21 @@
+{
+  "authority": {
+    "php_commit": "4143326",
+    "runtime_version": "v1.10.86"
+  },
+  "contract_version": "v1.10.86",
+  "fixtures": {
+    "behavior-contract-v1.json": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+    "directory-implementation-metadata-v1.json": "5bdd9ebd838cd5c4c972176fabebb4971a759b0ca69014328e8370a02d6ee08f",
+    "discovery-evidence-v1.json": "9b7b1302ee68af4a4889074e42e123c380e4e5e5fd0c80b78050c97b13f45f0c",
+    "dsr-related-records-v1.json": "7bd168004f557ec4979c6d3289d38b4478a02d7a486c8a0ef107a35e556a39ab",
+    "federation-profile-v1.json": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9",
+    "http-contract-v2.json": "08edc5cf302a858e5576cb59e07f5b71657ae6015b5537999985db71cc4128f6",
+    "replica-lifecycle-contract-v1.json": "9ae2e3536891c3488a2b4d04e543364359a2b9a2c389203ece0eaca1a341b541"
+  },
+  "scope": [
+    "provider_implementation_metadata_axes",
+    "openapi_1.7.0",
+    "reversible_node_metadata_migration"
+  ]
+}
