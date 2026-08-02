@@ -23,6 +23,7 @@ mod maintenance;
 mod observability;
 mod policy;
 mod policy_manifest;
+mod probe;
 mod recognition;
 mod registration;
 mod registration_store;
@@ -39,7 +40,6 @@ mod validate;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
-use std::{net::ToSocketAddrs, time::Duration};
 
 use axum::extract::rejection::JsonRejection;
 #[cfg(test)]
@@ -4335,124 +4335,6 @@ async fn conformance_verify(
             Json(serde_json::json!({ "verified": false, "reason": "no badge for this tier" })),
         ),
     }
-}
-
-/// `GET /v1/probe` — SSRF-guarded node reachability check (PHP ProbeController parity).
-/// Blocks private/loopback/RFC-1918 IPs with 422 {error: "private_address"}.
-/// For public targets, performs DNS resolution + a 5s TCP reachability probe and
-/// reports latency_ms on success.
-async fn probe_node(Query(p): Query<ProbeParams>) -> (StatusCode, Json<serde_json::Value>) {
-    let host = p.host.trim();
-    if host.is_empty() || p.port < 1024 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(
-                serde_json::json!({"error": "validation_error", "message": "host and port (≥1024) required"}),
-            ),
-        );
-    }
-    // SSRF guard: block private/loopback IPs before any network activity.
-    if is_private_host(host) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(
-                serde_json::json!({"reachable": false, "latency_ms": null, "error": "private_address"}),
-            ),
-        );
-    }
-
-    match probe_node_host(host, p.port).await {
-        Ok((reachable, latency_ms)) => {
-            if reachable {
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"reachable": true, "latency_ms": latency_ms})),
-                )
-            } else {
-                (
-                    StatusCode::OK,
-                    Json(
-                        serde_json::json!({"reachable": false, "latency_ms": null, "error": "unreachable"}),
-                    ),
-                )
-            }
-        }
-        Err(error) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"reachable": false, "latency_ms": null, "error": error})),
-        ),
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ProbeParams {
-    #[serde(default)]
-    host: String,
-    #[serde(default)]
-    port: u16,
-}
-
-async fn probe_node_host(host: &str, port: u16) -> Result<(bool, Option<u64>), &'static str> {
-    let addrs = resolve_probe_addresses(host, port)?;
-    for addr in addrs {
-        let start = std::time::Instant::now();
-        let probe = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await;
-        if probe.is_ok_and(|r| r.is_ok()) {
-            return Ok((true, Some(start.elapsed().as_millis() as u64)));
-        }
-    }
-    Ok((false, None))
-}
-
-fn resolve_probe_addresses(
-    host: &str,
-    port: u16,
-) -> Result<Vec<std::net::SocketAddr>, &'static str> {
-    let mut addrs = Vec::new();
-    for socket in (host, port)
-        .to_socket_addrs()
-        .map_err(|_| "unresolved_host")?
-    {
-        if is_private_host(&socket.ip().to_string()) {
-            return Err("unroutable_address");
-        }
-        addrs.push(socket);
-    }
-    if addrs.is_empty() {
-        return Err("unresolved_host");
-    }
-    Ok(addrs)
-}
-
-fn is_private_host(host: &str) -> bool {
-    let h = host.trim_matches(|c| c == '[' || c == ']');
-    behavior_contract::blocked_ip(h)
-        || is_loopback_or_unspecified(h)
-        || is_rfc1918_v4(h)
-        || is_ipv6_private(h)
-}
-
-fn is_loopback_or_unspecified(h: &str) -> bool {
-    h.starts_with("127.") || h == "0.0.0.0" || h == "::1" || h == "localhost" || h == "::"
-}
-
-fn is_rfc1918_v4(h: &str) -> bool {
-    if h.starts_with("10.") || h.starts_with("192.168.") || h.starts_with("169.254.") {
-        return true;
-    }
-    // 172.16.0.0/12 — second octet [16, 31]
-    h.strip_prefix("172.")
-        .and_then(|r| r.split('.').next())
-        .and_then(|o| o.parse::<u8>().ok())
-        .is_some_and(|n| (16..=31).contains(&n))
-}
-
-fn is_ipv6_private(h: &str) -> bool {
-    h.starts_with("fe80:") || h.starts_with("fc") || h.starts_with("fd")
 }
 
 /// `GET /` — root info (version, spec, links).
@@ -9245,66 +9127,6 @@ mod tests {
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(v["error"]["message"].as_str().unwrap().contains("RT-03"));
-    }
-
-    // ── /v1/probe SSRF guard unit tests ──────────────────────────────────────
-
-    #[test]
-    fn private_host_blocks_loopback() {
-        assert!(is_private_host("127.0.0.1"));
-        assert!(is_private_host("127.0.0.10"));
-        assert!(is_private_host("::1"));
-    }
-
-    #[test]
-    fn private_host_blocks_rfc1918() {
-        assert!(is_private_host("10.0.0.1"));
-        assert!(is_private_host("10.255.255.255"));
-        assert!(is_private_host("192.168.1.1"));
-        assert!(is_private_host("172.16.0.1"));
-        assert!(is_private_host("172.31.255.255"));
-        assert!(!is_private_host("172.15.0.1")); // just outside range
-        assert!(!is_private_host("172.32.0.1")); // just outside range
-    }
-
-    #[test]
-    fn private_host_allows_public_ips() {
-        assert!(!is_private_host("1.2.3.4"));
-        assert!(!is_private_host("8.8.8.8"));
-        assert!(!is_private_host("2606:4700::6810:84e5")); // Cloudflare
-    }
-
-    #[tokio::test]
-    async fn probe_loopback_is_422() {
-        // DIR-PROBE-01: 127.0.0.1 → 422 private_address
-        let resp = app(test_state())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/probe?host=127.0.0.1&port=9484")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 422);
-        let b = resp.into_body().collect().await.unwrap().to_bytes();
-        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        assert_eq!(v["error"], "private_address");
-    }
-
-    #[tokio::test]
-    async fn probe_rfc1918_is_422() {
-        // DIR-PROBE-02: 10.0.0.1 → 422 private_address
-        let resp = app(test_state())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/probe?host=10.0.0.1&port=9484")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 422);
     }
 
     // ── get_client_ip unit tests ──────────────────────────────────────────────
