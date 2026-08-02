@@ -10,6 +10,7 @@ mod auth;
 mod background;
 mod behavior_contract;
 mod cli;
+mod config;
 mod db;
 mod delegation;
 mod deployment_provenance;
@@ -51,6 +52,7 @@ use clap::Parser;
 use cli::Cli;
 #[cfg(test)]
 use cli::Command;
+use config::DEFAULT_DIRECTORY_DID;
 #[cfg(test)]
 use repo::InMemoryRepo;
 use repo::{
@@ -58,8 +60,10 @@ use repo::{
     OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
 };
 use serde::Deserialize;
-use state::{new_register_rate, AppState, DEFAULT_DIRECTORY_DID};
-use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
+use state::{new_register_rate, AppState};
+#[cfg(test)]
+use validate::Env;
+use validate::{endpoint_routable, is_declared_reachable, validate_intent};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
 const SDK_BASELINE_VERSION: &str = "0.7.68";
@@ -5643,12 +5647,7 @@ async fn main() {
     }
     START_TIME.set(Instant::now()).ok();
     let addr = "0.0.0.0:8090";
-    let env = match std::env::var("APP_ENV").as_deref() {
-        Ok("local") => Env::Local,
-        Ok("testing") => Env::Testing,
-        Ok("staging") => Env::Staging,
-        _ => Env::Production,
-    };
+    let env = config::environment();
     let runtime = runtime::initialize_repository(env, VERSION).await;
     let repo = runtime.repo;
 
@@ -5671,39 +5670,12 @@ async fn main() {
     // Capture the seed URL first: it both drives the sync loop and the write-gate
     // (DIR-FED-18) so the replica 307-redirects writes to the seed.
     let replica_config = replica::ReplicaConfig::from_env();
-    let (directory_did, directory_service_endpoint) = match replica_config.as_ref() {
-        Some(cfg) => {
-            let Some(did) = cfg
-                .replica_did
-                .as_ref()
-                .filter(|did| did.starts_with("did:web:"))
-            else {
-                eprintln!("FATAL: replica mode requires a valid IICP_REPLICA_DID");
-                std::process::exit(1);
-            };
-            let Some(endpoint) = cfg
-                .replica_endpoint
-                .as_ref()
-                .filter(|url| url.starts_with("https://"))
-            else {
-                eprintln!("FATAL: replica mode requires an HTTPS IICP_REPLICA_ENDPOINT");
-                std::process::exit(1);
-            };
-            if std::env::var("IICP_DIRECTORY_DID")
-                .ok()
-                .is_some_and(|served| served != *did)
-            {
-                eprintln!("FATAL: IICP_DIRECTORY_DID must equal IICP_REPLICA_DID in replica mode");
-                std::process::exit(1);
-            }
-            (did.clone(), endpoint.trim_end_matches('/').to_string())
+    let directory_identity = match config::directory_identity(replica_config.as_ref()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
         }
-        None => (
-            std::env::var("IICP_DIRECTORY_DID")
-                .unwrap_or_else(|_| DEFAULT_DIRECTORY_DID.to_string()),
-            std::env::var("IICP_DIRECTORY_ENDPOINT")
-                .unwrap_or_else(|_| "https://iicp.network/v1".to_string()),
-        ),
     };
     let replica_seed_url: Option<String> = match replica_config {
         Some(cfg) => {
@@ -5720,42 +5692,23 @@ async fn main() {
 
     // #442: load this directory's Ed25519 signing key (libsodium 128-hex). When set, the
     // register/deregister write paths emit signed events onto /v1/events (become a seed).
-    let signing_key = std::env::var("IICP_GENESIS_ED25519_SECRET_KEY")
-        .ok()
-        .filter(|key| key.len() == 128 && hex::decode(key).is_ok());
-    if env == Env::Production && signing_key.is_none() {
-        eprintln!(
-            "FATAL: IICP_GENESIS_ED25519_SECRET_KEY must be a valid 128-hex Ed25519 secret in production"
-        );
-        std::process::exit(1);
-    }
+    let signing_key = match config::signing_key(env) {
+        Ok(key) => key,
+        Err(error) => {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
+        }
+    };
     let state = AppState {
         repo,
         env,
         signing_key,
-        directory_did,
-        directory_service_endpoint,
+        directory_did: directory_identity.did,
+        directory_service_endpoint: directory_identity.service_endpoint,
         register_rate: new_register_rate(),
-        strict_e050_secured: std::env::var("IICP_E050_STRICT_SECURED").is_ok_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        }),
-        allow_insecure_tls: env != Env::Production
-            && std::env::var("IICP_DEV_ALLOW_INSECURE_TLS").is_ok_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            }),
-        skip_liveness_check: matches!(env, Env::Local | Env::Testing)
-            && std::env::var("IICP_SKIP_LIVENESS_CHECK").is_ok_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            }),
+        strict_e050_secured: config::strict_e050_secured(),
+        allow_insecure_tls: config::allow_insecure_tls(env),
+        skip_liveness_check: config::skip_liveness_check(env),
     };
     let router = match replica_seed_url {
         Some(seed) => app(state).layer(middleware::from_fn_with_state(seed, replica_write_gate)),
