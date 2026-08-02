@@ -9,16 +9,17 @@ use axum::{
     Json, Router,
 };
 
+use crate::observability::{health, stats};
 use crate::{
     audit_report, badge_svg, badges_list, bootstrap, compliance_attestation, conformance_submit,
     conformance_verify, consumer_token_issue, credits_award, credits_balance, credits_quote,
     credits_summary, credits_transactions, deployment_record, deregister, did_document,
-    directory_key, discover, dispatch_ticket_issue, events, health, heartbeat, iicp_replicas,
-    leaderboard, me, metrics, node_detail, operator_acceptance, operator_challenge,
-    operator_dsr_anonymize, operator_dsr_export, operator_dsr_restrict, operator_key_revoke,
-    operator_key_rotate, operator_rename, peers, probe_node, register, registry_intents,
-    registry_node_detail, registry_nodes, registry_stats, relay_ticket_issue, replicas_deregister,
-    replicas_register, root_info, snapshot, stats, telemetry_probe, telemetry_proxy, AppState,
+    directory_key, discover, dispatch_ticket_issue, events, heartbeat, iicp_replicas, leaderboard,
+    me, metrics, node_detail, operator_acceptance, operator_challenge, operator_dsr_anonymize,
+    operator_dsr_export, operator_dsr_restrict, operator_key_revoke, operator_key_rotate,
+    operator_rename, peers, probe_node, register, registry_intents, registry_node_detail,
+    registry_nodes, registry_stats, relay_ticket_issue, replicas_deregister, replicas_register,
+    root_info, snapshot, telemetry_probe, telemetry_proxy, AppState,
 };
 
 pub(crate) fn app(state: AppState) -> Router {
