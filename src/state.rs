@@ -6,9 +6,6 @@ use std::sync::{Arc, Mutex};
 use crate::repo::NodeRepository;
 use crate::validate::Env;
 
-/// Default Genesis identity used outside replica mode.
-pub(crate) const DEFAULT_DIRECTORY_DID: &str = "did:web:iicp.network";
-
 pub(crate) type RegisterRateMap = Arc<Mutex<HashMap<String, (u32, u64)>>>;
 
 pub(crate) fn new_register_rate() -> RegisterRateMap {
