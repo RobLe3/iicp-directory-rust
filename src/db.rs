@@ -441,6 +441,12 @@ struct NodeRow {
     #[sqlx(default)]
     sdk_language: Option<String>,
     #[sqlx(default)]
+    implementation_name: Option<String>,
+    #[sqlx(default)]
+    implementation_version: Option<String>,
+    #[sqlx(default)]
+    sdk_compatibility_version: Option<String>,
+    #[sqlx(default)]
     sdk_version: Option<String>,
     #[sqlx(default)]
     supported_receipt_profiles: Option<String>,
@@ -537,7 +543,13 @@ impl From<NodeRow> for Node {
             // #385 — relay_capable now persisted (PHP discover emits it; NodeScorer:221).
             relay_capable: Some(r.relay_capable),
             sdk_language: r.sdk_language,
-            sdk_version: r.sdk_version,
+            implementation_name: r.implementation_name,
+            implementation_version: r.implementation_version,
+            sdk_compatibility_version: r
+                .sdk_compatibility_version
+                .clone()
+                .or_else(|| r.sdk_version.clone()),
+            sdk_version: r.sdk_compatibility_version.or(r.sdk_version),
             consumer_cosignature_ready: r
                 .supported_receipt_profiles
                 .as_deref()
@@ -832,7 +844,7 @@ async fn mysql_dsr_node_rows(
 ) -> Result<Vec<serde_json::Value>, OperatorSelfServiceError> {
     let mut rows = mysql_dsr_node_table_rows(
         pool,
-        "SELECT CAST(JSON_OBJECT('id',id,'endpoint',endpoint,'region',region,'status',status,'available',available,'public_listing',public_listing,'operator_url',operator_url,'operator_contact',operator_contact,'operator_verified',operator_verified,'operator_trust_tier',operator_trust_tier,'observed_source_ip',observed_source_ip,'last_seen',IF(last_seen IS NULL,NULL,DATE_FORMAT(last_seen,'%Y-%m-%dT%H:%i:%s+00:00')),'dormant_since',IF(dormant_since IS NULL,NULL,DATE_FORMAT(dormant_since,'%Y-%m-%dT%H:%i:%s+00:00')),'policy_manifest',policy_manifest,'sdk_language',sdk_language,'sdk_version',sdk_version,'secret_fields_present',JSON_OBJECT('node_token_hash',node_token_hash IS NOT NULL,'proxy_token_hash',proxy_token_hash IS NOT NULL,'node_hmac_key',node_hmac_key IS NOT NULL)) AS CHAR) AS row_json FROM nodes",
+        "SELECT CAST(JSON_OBJECT('id',id,'endpoint',endpoint,'region',region,'status',status,'available',available,'public_listing',public_listing,'operator_url',operator_url,'operator_contact',operator_contact,'operator_verified',operator_verified,'operator_trust_tier',operator_trust_tier,'observed_source_ip',observed_source_ip,'last_seen',IF(last_seen IS NULL,NULL,DATE_FORMAT(last_seen,'%Y-%m-%dT%H:%i:%s+00:00')),'dormant_since',IF(dormant_since IS NULL,NULL,DATE_FORMAT(dormant_since,'%Y-%m-%dT%H:%i:%s+00:00')),'policy_manifest',policy_manifest,'sdk_language',sdk_language,'implementation_name',implementation_name,'implementation_version',implementation_version,'sdk_compatibility_version',COALESCE(sdk_compatibility_version,sdk_version),'sdk_version',COALESCE(sdk_compatibility_version,sdk_version),'secret_fields_present',JSON_OBJECT('node_token_hash',node_token_hash IS NOT NULL,'proxy_token_hash',proxy_token_hash IS NOT NULL,'node_hmac_key',node_hmac_key IS NOT NULL)) AS CHAR) AS row_json FROM nodes",
         "id",
         &subject.node_ids,
         "id",
@@ -1262,7 +1274,7 @@ impl NodeRepository for MySqlRepo {
                       n.avg_latency_ms, n.exposure_mode, n.transport_endpoint,
                       n.credit_cost_multiplier, n.pricing_model, n.attested, n.tasks_failed,
                       n.public_reachable, n.relay_capable, n.backend,
-                      n.sdk_language, n.sdk_version,
+                      n.sdk_language, n.implementation_name, n.implementation_version, n.sdk_compatibility_version, n.sdk_version,
                       CAST(n.supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
                       CAST(n.health_models AS CHAR) AS health_models,
                       CAST(c.models AS CHAR) AS capability_models,
@@ -1468,7 +1480,7 @@ impl NodeRepository for MySqlRepo {
                       exposure_mode, transport_endpoint,
                       CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
                       pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, sdk_language, sdk_version, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, CAST(policy_manifest AS CHAR) AS policy_manifest
+                      public_reachable, relay_capable, sdk_language, implementation_name, implementation_version, sdk_compatibility_version, sdk_version, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles, CAST(policy_manifest AS CHAR) AS policy_manifest
                FROM nodes
                WHERE available = 1
                  AND (last_seen IS NULL OR last_seen >= NOW() - INTERVAL 90 SECOND)

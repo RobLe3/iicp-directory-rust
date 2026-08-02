@@ -490,6 +490,9 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         transport_method: None,
         relay_capable: None,
         sdk_language: None,
+        implementation_name: None,
+        implementation_version: None,
+        sdk_compatibility_version: None,
         sdk_version: None,
         consumer_cosignature_ready: payload
             .get("supported_receipt_profiles")

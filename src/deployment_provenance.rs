@@ -35,7 +35,7 @@ impl DeploymentConfig {
             build_digest: required("IICP_BUILD_ID")?,
             image_digest: digest_env("IICP_IMAGE_DIGEST"),
             sbom_digest: digest_env("IICP_SBOM_DIGEST"),
-            openapi_version: env_default("IICP_OPENAPI_VERSION", "1.6.0"),
+            openapi_version: env_default("IICP_OPENAPI_VERSION", "1.7.0"),
             protocol_min: env_default("IICP_PROTOCOL_MIN", "1.9.0"),
             protocol_max: env_default("IICP_PROTOCOL_MAX", "1.9.0"),
             deployed_at: required("IICP_DEPLOYED_AT")?,

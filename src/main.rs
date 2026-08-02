@@ -718,6 +718,9 @@ fn public_discover_node(value: serde_json::Value) -> serde_json::Value {
         "response_encryption_ready",
         "privacy_routing_status",
         "sdk_language",
+        "implementation_name",
+        "implementation_version",
+        "sdk_compatibility_version",
         "sdk_version",
         "consumer_cosignature_ready",
         "sdk_status",
@@ -1116,7 +1119,7 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
         }),
     );
 
-    let sdk_status = sdk_status(n.sdk_version.as_deref());
+    let sdk_status = sdk_status(n.effective_sdk_compatibility_version());
     obj.insert("sdk_status".into(), serde_json::json!(sdk_status));
     obj.insert(
         "sdk_baseline_version".into(),
@@ -1126,7 +1129,7 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
         "upgrade_required".into(),
         serde_json::json!(sdk_status != "current"),
     );
-    let sdk_relation = match n.sdk_version.as_deref() {
+    let sdk_relation = match n.effective_sdk_compatibility_version() {
         None => "unknown",
         Some(version) if version_parts(version) == version_parts(SDK_LATEST_KNOWN_VERSION) => {
             "latest_known"
@@ -1148,7 +1151,7 @@ fn live_node_value(n: &types::Node) -> serde_json::Value {
         serde_json::json!({
             "enabled": serde_json::Value::Null,
             "interval_s": serde_json::Value::Null,
-            "latest_seen": n.sdk_version.clone(),
+            "latest_seen": n.effective_sdk_compatibility_version(),
             "last_checked_at": serde_json::Value::Null,
             "error_class": serde_json::Value::Null,
             "evidence": "unknown"
@@ -1515,7 +1518,13 @@ struct RegisterRequest {
     /// SDK implementation language (informational, Phase 5).
     #[serde(default)]
     sdk_language: Option<String>,
-    /// SDK version string (informational, Phase 5).
+    #[serde(default)]
+    implementation_name: Option<String>,
+    #[serde(default)]
+    implementation_version: Option<String>,
+    #[serde(default)]
+    sdk_compatibility_version: Option<String>,
+    /// Legacy SDK compatibility alias.
     #[serde(default)]
     sdk_version: Option<String>,
     /// Pre-normative receipt profiles. Unknown values are rejected.
@@ -2451,7 +2460,61 @@ fn validate_registration_shape(
             ),
         ));
     }
+    if request
+        .implementation_name
+        .as_deref()
+        .is_some_and(|value| !valid_implementation_name(value))
+        || request
+            .implementation_version
+            .as_deref()
+            .is_some_and(|value| !valid_version_axis(value))
+        || request
+            .sdk_compatibility_version
+            .as_deref()
+            .is_some_and(|value| !valid_version_axis(value))
+        || request
+            .sdk_version
+            .as_deref()
+            .is_some_and(|value| !valid_version_axis(value))
+    {
+        return Some(reject(
+            "validation_error",
+            "invalid implementation metadata",
+        ));
+    }
+    if matches!(
+        (
+            request.sdk_compatibility_version.as_deref(),
+            request.sdk_version.as_deref(),
+        ),
+        (Some(preferred), Some(legacy)) if preferred != legacy
+    ) {
+        return Some(reject(
+            "validation_error",
+            "sdk_compatibility_version must match sdk_version when both are supplied",
+        ));
+    }
     validate_registration_profiles_and_exposure(request)
+}
+
+fn valid_implementation_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'@')
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'@' | b'+' | b'-')
+        })
+}
+
+fn valid_version_axis(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
 }
 
 fn validate_registration_profiles_and_exposure(
@@ -2885,7 +2948,16 @@ async fn register(
         transport_method: req.transport_method.clone(),
         relay_capable: req.relay_capable,
         sdk_language: req.sdk_language.clone(),
-        sdk_version: req.sdk_version.clone(),
+        implementation_name: req.implementation_name.clone(),
+        implementation_version: req.implementation_version.clone(),
+        sdk_compatibility_version: req
+            .sdk_compatibility_version
+            .clone()
+            .or_else(|| req.sdk_version.clone()),
+        sdk_version: req
+            .sdk_compatibility_version
+            .clone()
+            .or_else(|| req.sdk_version.clone()),
         consumer_cosignature_ready: req
             .supported_receipt_profiles
             .iter()
@@ -5036,8 +5108,7 @@ fn sdk_adoption_json(nodes: &[crate::types::Node]) -> serde_json::Value {
             .unwrap_or("unknown")
             .to_string();
         let version = n
-            .sdk_version
-            .as_deref()
+            .effective_sdk_compatibility_version()
             .filter(|v| !v.is_empty())
             .unwrap_or("unknown")
             .to_string();
@@ -5972,6 +6043,9 @@ mod tests {
                 transport_method: None,
                 relay_capable: None,
                 sdk_language: None,
+                implementation_name: None,
+                implementation_version: None,
+                sdk_compatibility_version: None,
                 sdk_version: None,
                 consumer_cosignature_ready: false,
                 backend: None,
@@ -7225,7 +7299,10 @@ mod tests {
                                "quantization": "q4_k_m", "inference_engine": "llama.cpp"}],
             "relay_capable": true,
             "sdk_language": "python",
-            "sdk_version": "0.5.2",
+            "implementation_name": "iicp-web-node",
+            "implementation_version": "0.2.2",
+            "sdk_compatibility_version": "0.7.101",
+            "sdk_version": "0.7.101",
             "backend": "meshllm",
             "supported_receipt_profiles": ["consumer_cosignature_v1"],
             "nat_type": "full_cone",
@@ -7281,6 +7358,10 @@ mod tests {
             .expect("registered node must appear in discover");
         assert_eq!(node["relay_capable"], true);
         assert_eq!(node["sdk_language"], "python");
+        assert_eq!(node["implementation_name"], "iicp-web-node");
+        assert_eq!(node["implementation_version"], "0.2.2");
+        assert_eq!(node["sdk_compatibility_version"], "0.7.101");
+        assert_eq!(node["sdk_version"], "0.7.101");
         assert_eq!(node["backend"], "meshllm");
         assert_eq!(node["consumer_cosignature_ready"], true);
         assert!(node.get("supported_receipt_profiles").is_none());
@@ -7289,6 +7370,30 @@ mod tests {
         assert_eq!(node["quantization"][0], "q4_k_m");
         assert_eq!(node["inference_engine"][0], "llama.cpp");
         assert_eq!(node["address_family"], "ipv4");
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_conflicting_sdk_version_axes() {
+        let body = serde_json::json!({
+            "endpoint": "https://1.1.1.1",
+            "region": "eu-central",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["llama3"]}],
+            "sdk_compatibility_version": "0.7.101",
+            "sdk_version": "0.7.100"
+        });
+        let response = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/register")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("app-env", "local")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// Signs a fresh operator→node delegation for `node_id` (test key seed 0x09*32).
@@ -10072,6 +10177,9 @@ mod tests {
                 transport_method: None,
                 relay_capable: None,
                 sdk_language: None,
+                implementation_name: None,
+                implementation_version: None,
+                sdk_compatibility_version: None,
                 sdk_version: None,
                 consumer_cosignature_ready: false,
                 backend: None,
@@ -10193,5 +10301,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn shared_implementation_metadata_fixture_matches_validation_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../parity/directory-implementation-metadata-v1.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let input = &case["input"];
+            let preferred = input["sdk_compatibility_version"].as_str();
+            let legacy = input["sdk_version"].as_str();
+            let grammar_ok = input["implementation_name"]
+                .as_str()
+                .is_none_or(valid_implementation_name)
+                && input["implementation_version"]
+                    .as_str()
+                    .is_none_or(valid_version_axis)
+                && preferred.is_none_or(valid_version_axis)
+                && legacy.is_none_or(valid_version_axis);
+            let values_agree = !matches!((preferred, legacy), (Some(a), Some(b)) if a != b);
+            assert_eq!(
+                grammar_ok && values_agree,
+                case["accepted"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+            if case["accepted"] == true {
+                assert_eq!(
+                    preferred.or(legacy),
+                    case["effective_sdk_compatibility_version"].as_str()
+                );
+            }
+        }
     }
 }

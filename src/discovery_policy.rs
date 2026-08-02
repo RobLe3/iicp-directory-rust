@@ -69,7 +69,7 @@ pub(crate) fn select_and_rank(
                     reputation: Some(node.reputation_score),
                     models: node.health_models.as_deref().unwrap_or(&node.models),
                     pricing: node.routing_policy.pricing_credits_per_1000,
-                    sdk_current: sdk_current(node.sdk_version.as_deref()),
+                    sdk_current: sdk_current(node.effective_sdk_compatibility_version()),
                     cx_key: node.public_key.is_some(),
                 },
                 request.region,
