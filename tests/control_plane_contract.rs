@@ -25,6 +25,7 @@ fn rust_source_consumes_current_control_plane_contract() {
     assert_eq!(contract.contract_version, "v1.10.76");
     let source = [
         include_str!("../src/main.rs"),
+        include_str!("../src/router.rs"),
         include_str!("../src/repo.rs"),
         include_str!("../src/db.rs"),
         include_str!("../src/policy_manifest.rs"),
