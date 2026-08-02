@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added separate provider implementation name/version and SDK compatibility
+  version axes, with legacy alias support and conflicting dual values rejected.
+- Advanced deployment compatibility metadata to OpenAPI 1.7.0 while preserving
+  the operator-preview and Genesis cutover boundaries.
+
 ## 0.1.7 — 2026-08-01
 
 - Advanced shared discovery release-currency evidence to SDK `0.7.101`.

@@ -442,7 +442,7 @@ pub async fn e050_readiness(
     strict_mode_enabled: bool,
 ) -> Result<E050ReadinessReport, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT sdk_version, operator_pubkey, cx_public_key FROM nodes WHERE available = 1 AND status = 'active' AND last_seen >= NOW() - INTERVAL 90 SECOND",
+        "SELECT COALESCE(sdk_compatibility_version, sdk_version) AS sdk_version, operator_pubkey, cx_public_key FROM nodes WHERE available = 1 AND status = 'active' AND last_seen >= NOW() - INTERVAL 90 SECOND",
     )
     .fetch_all(pool)
     .await?;

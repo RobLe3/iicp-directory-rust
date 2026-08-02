@@ -67,7 +67,16 @@ pub struct Node {
     /// SDK implementation language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdk_language: Option<String>,
-    /// SDK version string.
+    /// Concrete provider runtime or product name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_name: Option<String>,
+    /// Concrete provider runtime or product version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_version: Option<String>,
+    /// Preferred SDK/wire compatibility version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_compatibility_version: Option<String>,
+    /// Legacy compatibility alias retained during migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdk_version: Option<String>,
     /// Public-safe adoption signal derived from a validated registration list.
@@ -160,6 +169,14 @@ pub struct Node {
     /// summaries are projected separately by the HTTP layer.
     #[serde(skip, default)]
     pub routing_policy: RoutingPolicyState,
+}
+
+impl Node {
+    pub fn effective_sdk_compatibility_version(&self) -> Option<&str> {
+        self.sdk_compatibility_version
+            .as_deref()
+            .or(self.sdk_version.as_deref())
+    }
 }
 
 #[derive(Debug, Clone)]

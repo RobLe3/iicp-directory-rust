@@ -42,9 +42,10 @@ async fn upsert_node(
              (id, endpoint, region, available, relay_capable, node_token_hash, node_hmac_key,
               proxy_token_hash, max_concurrent, tokens_per_min, reputation_score, status,
               operator_pubkey, operator_verified, operator_trust_tier, backend,
+              sdk_language, implementation_name, implementation_version, sdk_compatibility_version, sdk_version,
               supported_receipt_profiles, public_listing, operator_url, policy_manifest,
               credit_cost_multiplier, pricing_model)
-           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE
              endpoint = VALUES(endpoint), region = VALUES(region), available = 1,
              relay_capable = VALUES(relay_capable), status = 'active',
@@ -55,6 +56,11 @@ async fn upsert_node(
              operator_verified = VALUES(operator_verified),
              operator_trust_tier = VALUES(operator_trust_tier),
              backend = VALUES(backend),
+             sdk_language = VALUES(sdk_language),
+             implementation_name = VALUES(implementation_name),
+             implementation_version = VALUES(implementation_version),
+             sdk_compatibility_version = VALUES(sdk_compatibility_version),
+             sdk_version = VALUES(sdk_version),
              supported_receipt_profiles = VALUES(supported_receipt_profiles),
              public_listing = VALUES(public_listing),
              operator_url = VALUES(operator_url),
@@ -76,6 +82,11 @@ async fn upsert_node(
     .bind(rec.node.operator_verified)
     .bind(&rec.node.operator_trust_tier)
     .bind(&rec.node.backend)
+    .bind(&rec.node.sdk_language)
+    .bind(&rec.node.implementation_name)
+    .bind(&rec.node.implementation_version)
+    .bind(&rec.node.sdk_compatibility_version)
+    .bind(&rec.node.sdk_version)
     .bind(
         rec.node
             .consumer_cosignature_ready

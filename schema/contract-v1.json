@@ -1457,6 +1457,24 @@
           "extra": "",
           "nullable": false
         },
+        "implementation_name": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "implementation_version": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "sdk_compatibility_version": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
         "sdk_language": {
           "column_type": "varchar(32)",
           "default": null,
