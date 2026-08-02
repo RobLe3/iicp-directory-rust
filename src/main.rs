@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! IICP directory — Rust reference implementation (read-path foundation).
+//! IICP directory — Rust operator-preview implementation.
 //!
-//! Phase 6 / L6.1. This is the start of the Rust directory that will eventually
-//! replace the PHP reference implementation (see README.md for the migration plan).
-//! It currently serves the read path (`/health`, `/v1/stats`) against the iicp-dir
-//! v0.9.0 wire contract. Discovery, registration, and federation land in later
-//! milestones; federation is gated on ADR-013 advancing past Vision.
+//! This binary serves the shared directory contract, including registration,
+//! discovery, operational, policy and federation-preview surfaces. PHP remains
+//! the deployed Genesis authority until the documented parity, shadow-operation,
+//! migration and rollback gates pass.
 
 mod auth;
 mod background;
 mod behavior_contract;
+mod cli;
 mod db;
 mod delegation;
 mod deployment_provenance;
@@ -45,7 +45,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::Parser;
+use cli::{Cli, Command};
 use repo::{
     AuditResult, ConformanceBadge, CreditError, DiscoverQuery, InMemoryRepo, IntentSummary,
     NodeRepository, OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
@@ -57,71 +58,6 @@ use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
 const SDK_BASELINE_VERSION: &str = "0.7.68";
 const SDK_LATEST_KNOWN_VERSION: &str = "0.7.101";
-
-#[derive(Debug, Parser)]
-#[command(name = "iicp-directory-rs", version, about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Report metadata-only database maintenance status.
-    DbMaintenanceStatus {
-        #[command(flatten)]
-        retention: RetentionArgs,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Count expired telemetry by default; delete only with explicit --apply.
-    TelemetryPrune {
-        #[command(flatten)]
-        retention: RetentionArgs,
-        #[arg(long, default_value_t = maintenance::DEFAULT_BATCH_SIZE)]
-        batch: u32,
-        #[arg(long, default_value_t = maintenance::DEFAULT_MAX_BATCHES)]
-        max_batches: u32,
-        #[arg(long, conflicts_with = "apply")]
-        dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        apply: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Report aggregate strict-E050 readiness without mutating registrations.
-    E050Readiness {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Default, Args)]
-struct RetentionArgs {
-    #[arg(long)]
-    probe_days: Option<u32>,
-    #[arg(long)]
-    aggregate_days: Option<u32>,
-    #[arg(long)]
-    proxy_days: Option<u32>,
-    #[arg(long)]
-    dispatch_days: Option<u32>,
-}
-
-impl RetentionArgs {
-    fn policy(&self) -> maintenance::RetentionPolicy {
-        let mut policy = maintenance::RetentionPolicy::from_env();
-        policy.probe_days = positive_override(self.probe_days, policy.probe_days);
-        policy.aggregate_days = positive_override(self.aggregate_days, policy.aggregate_days);
-        policy.proxy_days = positive_override(self.proxy_days, policy.proxy_days);
-        policy.dispatch_days = positive_override(self.dispatch_days, policy.dispatch_days);
-        policy
-    }
-}
-
-fn positive_override(value: Option<u32>, default: u32) -> u32 {
-    value.filter(|value| *value > 0).unwrap_or(default)
-}
 
 const OPERATOR_CHALLENGE_TTL_SECS: u64 = 300;
 const OPERATOR_TS_WINDOW_SECS: i64 = 300;
