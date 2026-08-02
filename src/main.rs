@@ -27,6 +27,7 @@ mod registration_store;
 mod replica;
 mod repo;
 mod reputation;
+mod runtime;
 mod schema;
 mod types;
 mod validate;
@@ -46,13 +47,16 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::Cli;
+#[cfg(test)]
+use cli::Command;
+#[cfg(test)]
+use repo::InMemoryRepo;
 use repo::{
-    AuditResult, ConformanceBadge, CreditError, DiscoverQuery, InMemoryRepo, IntentSummary,
-    NodeRepository, OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
+    AuditResult, ConformanceBadge, CreditError, DiscoverQuery, IntentSummary, NodeRepository,
+    OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
 };
 use serde::Deserialize;
-use sqlx::{MySql, Pool};
 use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
@@ -5659,132 +5663,11 @@ async fn deregister(
     }
 }
 
-struct RepositoryRuntime {
-    repo: Arc<dyn NodeRepository>,
-    mysql_pool: Option<Pool<MySql>>,
-}
-
-async fn initialize_repository(env: Env) -> RepositoryRuntime {
-    // Wire DATABASE_URL → MySqlRepo when present. A configured database is an
-    // explicit persistence contract: connection or schema failures are fatal,
-    // never a silent downgrade to ephemeral memory.
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        match db::init_pool(&url).await {
-            Ok(pool) => {
-                match schema::ensure_schema(&pool).await {
-                    Ok(status) => {
-                        println!("iicp-directory-rs {VERSION}: MySQL schema status={status}")
-                    }
-                    Err(error) => {
-                        eprintln!("FATAL: MySQL schema verification failed: {error}");
-                        std::process::exit(1);
-                    }
-                }
-                println!("iicp-directory-rs {VERSION}: MySQL pool connected");
-                RepositoryRuntime {
-                    repo: Arc::new(db::MySqlRepo::new(pool.clone())),
-                    mysql_pool: Some(pool),
-                }
-            }
-            Err(e) => {
-                eprintln!("FATAL: configured MySQL connection failed: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else if env != Env::Production
-        && std::env::var("IICP_ALLOW_IN_MEMORY").is_ok_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-    {
-        println!("iicp-directory-rs {VERSION}: no DATABASE_URL; using InMemoryRepo");
-        RepositoryRuntime {
-            repo: Arc::new(InMemoryRepo::default()),
-            mysql_pool: None,
-        }
-    } else {
-        eprintln!(
-            "FATAL: DATABASE_URL is required; ephemeral memory requires non-production APP_ENV and IICP_ALLOW_IN_MEMORY=true"
-        );
-        std::process::exit(1);
-    }
-}
-
-async fn verified_operational_pool() -> Result<Pool<MySql>, String> {
-    let url = std::env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL is required for operational commands".to_string())?;
-    let pool = db::init_pool(&url)
-        .await
-        .map_err(|error| format!("configured MySQL connection failed: {error}"))?;
-    schema::verify_existing_schema(&pool)
-        .await
-        .map_err(|error| format!("MySQL schema verification failed: {error}"))?;
-    Ok(pool)
-}
-
-async fn run_operational_command(command: Command) -> Result<(), String> {
-    let pool = verified_operational_pool().await?;
-    let (value, json_requested) = match command {
-        Command::DbMaintenanceStatus { retention, json } => (
-            serde_json::to_value(
-                maintenance::maintenance_status(&pool, retention.policy())
-                    .await
-                    .map_err(|error| format!("maintenance status failed: {error}"))?,
-            )
-            .map_err(|error| error.to_string())?,
-            json,
-        ),
-        Command::TelemetryPrune {
-            retention,
-            batch,
-            max_batches,
-            dry_run: _,
-            apply,
-            json,
-        } => (
-            serde_json::to_value(
-                maintenance::prune_telemetry(&pool, retention.policy(), batch, max_batches, apply)
-                    .await
-                    .map_err(|error| format!("telemetry prune failed: {error}"))?,
-            )
-            .map_err(|error| error.to_string())?,
-            json,
-        ),
-        Command::E050Readiness { json } => (
-            serde_json::to_value(
-                maintenance::e050_readiness(
-                    &pool,
-                    std::env::var("IICP_E050_STRICT_SECURED").is_ok_and(|value| {
-                        matches!(
-                            value.to_ascii_lowercase().as_str(),
-                            "1" | "true" | "yes" | "on"
-                        )
-                    }),
-                )
-                .await
-                .map_err(|error| format!("E050 readiness failed: {error}"))?,
-            )
-            .map_err(|error| error.to_string())?,
-            json,
-        ),
-    };
-    if !json_requested {
-        eprintln!("content-free operational report (use --json for machine-readable mode)");
-    }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
-    );
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     if let Some(command) = cli.command {
-        if let Err(error) = run_operational_command(command).await {
+        if let Err(error) = runtime::run_operational_command(command).await {
             eprintln!("FATAL: {error}");
             std::process::exit(1);
         }
@@ -5798,7 +5681,7 @@ async fn main() {
         Ok("staging") => Env::Staging,
         _ => Env::Production,
     };
-    let runtime = initialize_repository(env).await;
+    let runtime = runtime::initialize_repository(env, VERSION).await;
     let repo = runtime.repo;
 
     // Spawn background maintenance tasks before starting the HTTP server.
