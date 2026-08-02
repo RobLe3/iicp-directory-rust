@@ -29,6 +29,7 @@ mod repo;
 mod reputation;
 mod runtime;
 mod schema;
+mod state;
 mod types;
 mod validate;
 
@@ -53,10 +54,11 @@ use cli::Command;
 #[cfg(test)]
 use repo::InMemoryRepo;
 use repo::{
-    AuditResult, ConformanceBadge, CreditError, DiscoverQuery, IntentSummary, NodeRepository,
+    AuditResult, ConformanceBadge, CreditError, DiscoverQuery, IntentSummary,
     OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
 };
 use serde::Deserialize;
+use state::{new_register_rate, AppState, DEFAULT_DIRECTORY_DID};
 use validate::{endpoint_routable, is_declared_reachable, validate_intent, Env};
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-rs");
@@ -77,9 +79,6 @@ const PREVIOUS_PROFILE_FIXTURE_SHA256: &str =
 /// lived and contain no task content, credentials or private key material.
 static OPERATOR_CHALLENGES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
     std::sync::OnceLock::new();
-
-/// This directory's DID (single source for /.well-known/did.json + signed-event signer_did).
-const DEFAULT_DIRECTORY_DID: &str = "did:web:iicp.network";
 
 /// Derive `address_family` from an endpoint URL (PHP NodeScorer::detectAddressFamily parity).
 /// Returns "ipv4" | "ipv6" | "hostname" | "unknown".
@@ -156,31 +155,6 @@ const EXPOSURE_MODES: [&str; 8] = [
 /// Process start instant — backs `server.uptime_seconds` in `/v1/stats` (PHP parity).
 /// Set once in `main`; unset in tests (uptime reports 0).
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
-#[derive(Clone)]
-struct AppState {
-    repo: Arc<dyn NodeRepository>,
-    env: Env,
-    /// #442: this directory's Ed25519 signing key (libsodium 64-byte / 128-hex), from
-    /// IICP_GENESIS_ED25519_SECRET_KEY. `None` → events emit unsigned (PHP parity: when no
-    /// key is configured, NodeEventLogger::sign returns null).
-    signing_key: Option<String>,
-    /// Served identity and public service endpoint. Replica mode binds this DID
-    /// to IICP_REPLICA_DID instead of impersonating the Genesis Seed.
-    directory_did: String,
-    directory_service_endpoint: String,
-    /// IICP-E034 registration rate-limit counter, per source IP (W-033 PHP parity).
-    register_rate: RegisterRateMap,
-    /// Adoption-gated E050 E′ hardening. False preserves the migration-safe
-    /// dead-endpoint fallback; production must not enable this before #534.
-    strict_e050_secured: bool,
-    /// Registration/lifecycle probes verify TLS identity by default. The
-    /// insecure mode is accepted only by an explicit non-production testbed.
-    allow_insecure_tls: bool,
-    /// Tests may disable live dial-back. Production defaults to probing every
-    /// registration that lacks a concrete topology declaration.
-    skip_liveness_check: bool,
-}
 
 /// Emit + sign a federated event onto this directory's log if a signing key is configured
 /// (#442). No-op when unsigned. Keeps the write-path handlers a single call (complexity-flat).
@@ -2285,12 +2259,6 @@ const REGISTER_RATE_TTL_MS: u64 = 60_000;
 
 /// Per-instance per-IP registration counter (held in AppState, not a global, so tests and
 /// multiple instances don't share state). Per-instance is the unit, like PHP's per-instance Cache.
-type RegisterRateMap = Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, u64)>>>;
-
-fn new_register_rate() -> RegisterRateMap {
-    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
 /// Pure window step for the registration rate limit (so the limit/TTL rule is unit-tested,
 /// #404; the handler holds the map under a Mutex). Returns the new `(count, window_start_ms)`:
 /// within the live window → increment in place; expired/new → reset to `(1, now_ms)`.
