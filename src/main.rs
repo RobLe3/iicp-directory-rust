@@ -27,6 +27,7 @@ mod probe;
 mod recognition;
 mod registration;
 mod registration_store;
+mod registry;
 mod replica;
 mod repo;
 mod reputation;
@@ -58,8 +59,8 @@ use observability::sdk_adoption_json;
 #[cfg(test)]
 use repo::InMemoryRepo;
 use repo::{
-    AuditResult, ConformanceBadge, CreditError, DiscoverQuery, IntentSummary,
-    OperatorSelfServiceError, ProbeResult, ProxyObservation, RegistryStats,
+    AuditResult, ConformanceBadge, CreditError, DiscoverQuery, OperatorSelfServiceError,
+    ProbeResult, ProxyObservation,
 };
 use router::{app, replica_write_gate};
 use serde::Deserialize;
@@ -131,7 +132,7 @@ fn detect_address_family(endpoint: &str, transport: Option<&str>) -> String {
 /// PHP NodeScorer::transportMethods parity). Privacy-preserving: protocol tokens
 /// only, never the host. `https://`/`http://` endpoint → "https"/"http";
 /// `iicp://`/`iicpsec://` transport_endpoint → "iicp-native".
-fn transport_methods(endpoint: &str, transport: Option<&str>) -> Vec<String> {
+pub(crate) fn transport_methods(endpoint: &str, transport: Option<&str>) -> Vec<String> {
     let scheme = |u: &str| u.split("://").next().unwrap_or("").to_ascii_lowercase();
     let mut out = Vec::new();
     let ep_scheme = scheme(endpoint);
@@ -1378,14 +1379,17 @@ fn public_operator_fingerprint(operator_pubkey: &str) -> String {
 /// #463 — resolve a node's public operator handle (display_name) by its operator_pubkey.
 /// Returns None when the node has no bound operator or no name set. The operator_pubkey is
 /// directory-private — callers serve only the returned display_name, never the key.
-async fn operator_display_name_for(st: &AppState, operator_pubkey: Option<&str>) -> Option<String> {
+pub(crate) async fn operator_display_name_for(
+    st: &AppState,
+    operator_pubkey: Option<&str>,
+) -> Option<String> {
     match operator_pubkey {
         Some(p) => st.repo.operator_display_name(p).await,
         None => None,
     }
 }
 
-fn operator_fingerprint_for(operator_pubkey: Option<&str>) -> Option<String> {
+pub(crate) fn operator_fingerprint_for(operator_pubkey: Option<&str>) -> Option<String> {
     operator_pubkey
         .filter(|p| !p.is_empty())
         .map(public_operator_fingerprint)
@@ -3345,11 +3349,19 @@ async fn credits_award(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct LedgerPageParams {
+    #[serde(default)]
+    page: Option<u64>,
+    #[serde(default)]
+    per_page: Option<usize>,
+}
+
 /// `GET /v1/credits/transactions` (iicp-dir §6.3). Paginated ledger history.
 async fn credits_transactions(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
-    Query(p): Query<RegistryNodesParams>,
+    Query(p): Query<LedgerPageParams>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let token = match bearer_token(&headers) {
         Some(t) => t,
@@ -3469,168 +3481,6 @@ async fn audit_report(
         _ => StatusCode::ACCEPTED, // 202 — accepted (applied or no-op)
     };
     (status, Json(serde_json::json!({ "accepted": applied })))
-}
-
-// ── registry (iicp-dir §3.10a / §3.10b) ─────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct RegistryNodesParams {
-    #[serde(default)]
-    page: Option<u64>,
-    #[serde(default)]
-    per_page: Option<usize>,
-}
-
-/// WQ-058 / ADR-017 REG-01 — public-listing exposure rule: `operator_url` is served only
-/// when the operator opted into the public listing (`public_listing=true`); otherwise null,
-/// respecting the opt-out. Pure so the rule is unit-tested in-process.
-fn listing_exposure(public_listing: bool, operator_url: &Option<String>) -> serde_json::Value {
-    if public_listing {
-        serde_json::json!(operator_url)
-    } else {
-        serde_json::Value::Null
-    }
-}
-
-/// `GET /v1/registry/nodes` (ADR-017, iicp-dir §3.10a). Public node listing.
-/// Returns node identities and reputation tiers without exposing endpoints or tokens.
-async fn registry_nodes(
-    State(st): State<AppState>,
-    Query(p): Query<RegistryNodesParams>,
-) -> Json<serde_json::Value> {
-    let per_page = p.per_page.unwrap_or(20).min(100);
-    let page = p.page.unwrap_or(1).max(1);
-    let offset = (page - 1) * per_page as u64;
-    let raw_nodes = st.repo.list_public(offset, per_page).await;
-    let total = raw_nodes.len() as u32;
-    // PHP registry anonymizes UUID node_ids to 8-char prefix; custom names shown in full.
-    let nodes: Vec<serde_json::Value> = raw_nodes
-        .into_iter()
-        .map(|n| {
-            let is_uuid = uuid::Uuid::parse_str(&n.node_id).is_ok();
-            let prefix = if is_uuid {
-                n.node_id[..8.min(n.node_id.len())].to_string()
-            } else {
-                n.node_id.clone()
-            };
-            serde_json::json!({
-                "node_id_prefix": prefix,
-                "region": n.region,
-                "reputation_score": (n.reputation_score * 1000.0).round() / 1000.0,
-                "reputation_tier": n.reputation_tier,
-                // PHP RegistryController::nodes includes the served models so the public
-                // /nodes listing shows what each node serves (parity, #385).
-                "models": n.models,
-                "probation": n.completed_tasks_count < 100,
-                "last_seen": serde_json::Value::Null,
-                // WQ-058 / ADR-017 REG-01 — public-listing opt-in. operator_url is exposed
-                // ONLY when the operator opted in (public_listing=true), else null.
-                "public_listing": n.public_listing,
-                "operator_url": listing_exposure(n.public_listing, &n.operator_url),
-            })
-        })
-        .collect();
-    Json(serde_json::json!({ "total": total, "page": page, "limit": per_page, "nodes": nodes }))
-}
-
-/// `GET /v1/registry/stats` (iicp-dir §3.10b). Aggregate directory statistics.
-async fn registry_stats(State(st): State<AppState>) -> Json<RegistryStats> {
-    Json(st.repo.registry_stats().await)
-}
-
-/// `GET /v1/registry/nodes/:id` — public node detail (ADR-017: no private fields).
-/// Path param: 8-char UUID prefix or full custom node name (PHP parity).
-async fn registry_node_detail(
-    State(st): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    // PHP RegistryController::show validation parity — prefix is a UUID 8-hex prefix or a
-    // custom node name: ^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,35}$ (manual check; no regex dep).
-    let valid = (1..=36).contains(&id.len())
-        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'));
-    if !valid {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "REGISTRY-INVALID-PREFIX",
-                "message": "Prefix must be alphanumeric (max 36 chars)."
-            })),
-        );
-    }
-    match st.repo.node_by_prefix(&id).await {
-        Some(n) => {
-            // PHP uses node_id_prefix for UUID nodes (anonymize full UUID).
-            let is_uuid = uuid::Uuid::parse_str(&n.node_id).is_ok();
-            let prefix = if is_uuid {
-                n.node_id[..8.min(n.node_id.len())].to_string()
-            } else {
-                n.node_id.clone()
-            };
-            // ADR-044 per-node health vector (PHP RegistryController `health` field).
-            // #385 Phase-B: reputation + latency + success + reachability are all real
-            // signals now — reachability from public_reachable/relay_capable per PHP
-            // reachabilityScore fallback. The node came from the active-set query, so
-            // liveness is 1.0.
-            let signals = health::HealthSignals {
-                reachability: n.reachability_signal,
-                latency_ms: n.latency_estimate_ms.map(|ms| ms as f64),
-            };
-            let nh = health::score_node(&signals);
-            let comp = health::components_of(&signals);
-            let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
-            // #463 — public operator handle (who hosts this node), resolved by operator_pubkey.
-            // operator_pubkey itself is directory-private and NEVER included in the response.
-            let operator_display_name =
-                operator_display_name_for(&st, n.operator_pubkey.as_deref()).await;
-            let operator_fingerprint = operator_fingerprint_for(n.operator_pubkey.as_deref());
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "node_id_prefix": prefix,
-                    "region": n.region,
-                    "reputation_score": (n.reputation_score * 1000.0).round() / 1000.0,
-                    "reputation_tier": n.reputation_tier,
-                    // #397 — transport protocols the node speaks (PHP parity).
-                    "transport": transport_methods(&n.endpoint, n.transport_endpoint.as_deref()),
-                    "health": {
-                        "score": nh.score,
-                        "label": nh.label,
-                        // observed=false: no independent proxy-observed signal yet (#385).
-                        "observed": false,
-                        "components": {
-                            "liveness": 1.0,
-                            "reachability": r3(comp.reachability),
-                            "latency": r3(comp.latency),
-                        },
-                        "evaluated_at": chrono::Utc::now().to_rfc3339(),
-                    },
-                    "probation": n.completed_tasks_count < 100,
-                    "completed_tasks": n.completed_tasks_count,
-                    "observed_latency_ms": n.latency_estimate_ms,
-                    "exposure_mode": n.exposure_mode,
-                    "operator_display_name": operator_display_name,
-                    "operator_fingerprint": operator_fingerprint,
-                    "last_seen": serde_json::Value::Null,
-                })),
-            )
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(
-                serde_json::json!({ "error": "REGISTRY-NODE-NOT-FOUND", "message": "No active node found for this prefix." }),
-            ),
-        ),
-    }
-}
-
-/// `GET /v1/registry/intents` — distinct intents with active node counts.
-async fn registry_intents(State(st): State<AppState>) -> Json<serde_json::Value> {
-    // PHP returns {intents: [{urn, node_count}]} — no count field.
-    let intents: Vec<IntentSummary> = st.repo.list_intents().await;
-    Json(serde_json::json!({ "intents": intents }))
 }
 
 /// `GET /.well-known/did.json` — DID document for `did:web:iicp.network` (iicp-dir §3.11).
@@ -7488,25 +7338,6 @@ mod tests {
 
     // WQ-057 — GET /v1/credits/quote (PHP parity): authenticated pre-flight; the estimate
     // math is the pure compute_quote, the candidate scoping is quote_multipliers.
-    #[test]
-    fn listing_exposure_serves_operator_url_only_when_opted_in() {
-        // WQ-058 #404 (ADR-017 REG-01): respect the opt-out — operator_url is served only
-        // when public_listing=true. Fails if the registry leaks an opted-out operator's URL.
-        let url = Some("https://op.example".to_string());
-        assert_eq!(
-            super::listing_exposure(true, &url),
-            serde_json::json!("https://op.example")
-        );
-        assert_eq!(
-            super::listing_exposure(false, &url),
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            super::listing_exposure(true, &None),
-            serde_json::Value::Null
-        );
-    }
-
     #[test]
     fn credits_quote_compute_empty_uses_base_rate() {
         // WQ-057 #404: no candidates → base rate (×1.0), 0 nodes quoted.
