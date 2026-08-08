@@ -1334,6 +1334,7 @@ impl NodeRepository for MySqlRepo {
         delta: f64,
         health_models: Option<Vec<String>>,
     ) -> Option<f64> {
+        let mut tx = self.pool.begin().await.ok()?;
         // RT-01b (#381): fetch velocity window alongside score.
         // Laravel stores rep_hourly_gain as DECIMAL(8,4).  sqlx does not decode a
         // MySQL DECIMAL directly into f32/f64, so cast it explicitly.  Without the
@@ -1341,10 +1342,10 @@ impl NodeRepository for MySqlRepo {
         // returns IICP-E003 even though token verification succeeded.
         let row: Option<(f64, f64, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
             "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), rep_hourly_window_start \
-             FROM nodes WHERE id = ?",
+             FROM nodes WHERE id = ? FOR UPDATE",
         )
         .bind(node_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .ok()
         .flatten();
@@ -1381,7 +1382,7 @@ impl NodeRepository for MySqlRepo {
             .as_ref()
             .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".to_string()));
 
-        let _ = sqlx::query(
+        let update = sqlx::query(
             "UPDATE nodes SET `load` = ?, available = ?, active_jobs = ?, \
              reputation_score = ?, tasks_total = tasks_total + ?, \
              tasks_failed = tasks_failed + ?, \
@@ -1400,8 +1401,13 @@ impl NodeRepository for MySqlRepo {
         .bind(reset_window as i32)
         .bind(health_models_json)
         .bind(node_id)
-        .execute(&self.pool)
-        .await;
+        .execute(&mut *tx)
+        .await
+        .ok()?;
+
+        if update.rows_affected() != 1 || tx.commit().await.is_err() {
+            return None;
+        }
 
         Some(new_score)
     }
@@ -3960,6 +3966,102 @@ mod tests {
             head.1.as_deref(),
             events.last().and_then(|event| event.sig.as_deref())
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn concurrent_heartbeats_share_one_persisted_reputation_budget() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
+              reputation_score, rep_hourly_gain) \
+             VALUES ('reputation-concurrency', 'https://example.invalid/v1', 'test', 'x', 1, 1, 0.5, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed node");
+
+        let repo = Arc::new(MySqlRepo::new(pool.clone()));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.heartbeat("reputation-concurrency", 0.1, true, 0, 10, 0, 0.10, None)
+                    .await
+                    .expect("heartbeat must persist")
+            }));
+        }
+        for task in tasks {
+            task.await.expect("heartbeat task must join");
+        }
+
+        let (score, gain, tasks_total): (f64, f64, i64) = sqlx::query_as(
+            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), \
+                    CAST(tasks_total AS SIGNED) FROM nodes WHERE id = 'reputation-concurrency'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read reputation state");
+        assert!((score - 0.70).abs() < 0.0001);
+        assert!((gain - 0.20).abs() < 0.0001);
+        assert_eq!(tasks_total, 40);
+
+        // 3599 seconds remains in the same saturated window.
+        sqlx::query(
+            "UPDATE nodes SET rep_hourly_window_start = NOW() - INTERVAL 3599 SECOND \
+             WHERE id = 'reputation-concurrency'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set in-window boundary");
+        repo.heartbeat("reputation-concurrency", 0.1, true, 0, 0, 0, 0.10, None)
+            .await
+            .expect("in-window heartbeat");
+        let score: f64 = sqlx::query_scalar(
+            "SELECT CAST(reputation_score AS DOUBLE) FROM nodes WHERE id = 'reputation-concurrency'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read in-window score");
+        assert!((score - 0.70).abs() < 0.0001);
+
+        // Exactly 3600 seconds starts a new window. A new repository instance
+        // then proves that the persisted budget survives process-level reload.
+        sqlx::query(
+            "UPDATE nodes SET rep_hourly_window_start = NOW() - INTERVAL 3600 SECOND \
+             WHERE id = 'reputation-concurrency'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set expired boundary");
+        repo.heartbeat("reputation-concurrency", 0.1, true, 0, 0, 0, 0.10, None)
+            .await
+            .expect("new-window heartbeat");
+        let restarted = MySqlRepo::new(pool.clone());
+        restarted
+            .heartbeat("reputation-concurrency", 0.1, true, 0, 0, 0, 0.10, None)
+            .await
+            .expect("reloaded heartbeat");
+        restarted
+            .heartbeat("reputation-concurrency", 0.1, true, 0, 0, 1, -0.05, None)
+            .await
+            .expect("negative heartbeat");
+
+        let (score, gain): (f64, f64) = sqlx::query_as(
+            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE) \
+             FROM nodes WHERE id = 'reputation-concurrency'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read final reputation state");
+        assert!((score - 0.85).abs() < 0.0001);
+        assert!((gain - 0.20).abs() < 0.0001);
     }
 
     #[tokio::test]

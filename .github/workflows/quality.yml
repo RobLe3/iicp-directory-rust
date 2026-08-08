@@ -40,6 +40,10 @@ jobs:
           cargo test --locked
           concurrent_signed_event_appends_are_gap_free_and_chain_correct
           -- --ignored
+      - run: >-
+          cargo test --locked
+          concurrent_heartbeats_share_one_persisted_reputation_budget
+          -- --ignored
 
   credit-ledger-concurrency:
     runs-on: ubuntu-latest
