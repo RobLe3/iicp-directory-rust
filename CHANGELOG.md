@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Prepares the corrective `0.1.10` source line without publishing it. It repairs
+  the nested replica-lifecycle fixture digest and makes compatibility validation
+  recursively verify every fixture named by a parity contract.
+- Rejects missing, malformed, substituted and mismatched nested fixture digests.
+  The immutable `v0.1.9` tag and assets remain unchanged.
+
+
 ## 0.1.9 — 2026-08-08
 
 - Serialized reputation score, task-counter and hourly positive-gain updates
