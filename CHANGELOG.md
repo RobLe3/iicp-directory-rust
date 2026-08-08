@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.1.9 — 2026-08-08
+
+- Serialized reputation score, task-counter and hourly positive-gain updates
+  in one database transaction, with bounded retries for transient MySQL
+  deadlocks and lock timeouts.
+- Added real-MySQL evidence that concurrent heartbeats share the persisted
+  `+0.20` hourly gain budget across process and repository reloads.
+- Corrected MySQL timestamp decoding for the locked hourly-window state.
+- Preserved the operator-preview boundary and existing HTTP, OpenAPI and
+  database-schema contracts.
+
 ## 0.1.8 — 2026-08-02
 
 - Added separate provider implementation name/version and SDK compatibility
