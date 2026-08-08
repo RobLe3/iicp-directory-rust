@@ -58,14 +58,16 @@ def verify_nested_fixtures(root: Path, manifest_path: Path, payload: Any, seen: 
         verify_nested_fixtures(root, child, child_payload, seen)
 
 
-def verify(root: Path = ROOT) -> str:
+def verify(root: Path = ROOT, manifest_name: str | None = None) -> str:
     cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
-    version_line = next(line for line in cargo.splitlines() if line.startswith("version = "))
-    version = version_line.split('"', 2)[1]
-    manifest_path = root / "compatibility" / f"v{version}.json"
+    source_version = next(line for line in cargo.splitlines() if line.startswith("version = ")).split('"', 2)[1]
+    manifest_path = root / "compatibility" / (manifest_name or f"v{source_version}.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    version = manifest.get("implementation", {}).get("version")
     if manifest["implementation"] != {"flavor": "rust", "version": version, "status": "operator_preview"}:
         raise ValueError("release compatibility implementation identity mismatch")
+    if manifest_name is None and version != source_version:
+        raise ValueError("default compatibility manifest must match the Cargo source version")
     for name, contract in manifest["contracts"].items():
         if not isinstance(contract, dict) or not isinstance(contract.get("path"), str) or not isinstance(contract.get("sha256"), str):
             raise ValueError(f"{name} contract entry is malformed")
@@ -88,8 +90,12 @@ def verify(root: Path = ROOT) -> str:
 
 
 def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Verify Rust release compatibility artifacts")
+    parser.add_argument("--manifest", help="candidate manifest name under compatibility/ (for example v0.1.10.json)")
+    args = parser.parse_args()
     try:
-        print(verify())
+        print(verify(manifest_name=args.manifest))
     except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(str(exc)) from exc
     return 0

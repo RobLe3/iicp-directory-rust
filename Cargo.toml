@@ -1,6 +1,6 @@
 [package]
 name = "iicp-directory-rs"
-version = "0.1.10"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
