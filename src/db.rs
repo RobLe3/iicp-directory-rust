@@ -634,6 +634,84 @@ impl MySqlRepo {
     pub fn new(pool: Pool<MySql>) -> Self {
         Self { pool }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn heartbeat_once(
+        &self,
+        node_id: &str,
+        load: f64,
+        available: bool,
+        active_jobs: u32,
+        tasks_delta: u32,
+        tasks_failed_delta: u32,
+        delta: f64,
+        health_models: Option<&[String]>,
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // RT-01b (#381): fetch velocity window alongside score. Laravel stores
+        // rep_hourly_gain as DECIMAL(8,4), so cast it for sqlx decoding.
+        let row: Option<(f64, f64, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
+            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), rep_hourly_window_start \
+             FROM nodes WHERE id = ? FOR UPDATE",
+        )
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((old_score, hourly_gain, window_start)) = row else {
+            return Ok(None);
+        };
+
+        const MAX_HOURLY_GAIN: f64 = 0.20;
+        let (effective_delta, new_hourly_gain, reset_window) = if delta > 0.0 {
+            let window_expired = window_start
+                .map(|ws| {
+                    let now = chrono::Utc::now().naive_utc();
+                    (now - ws).num_seconds() >= 3600
+                })
+                .unwrap_or(true);
+            let current_gain = if window_expired { 0.0 } else { hourly_gain };
+            let capped = delta.min((MAX_HOURLY_GAIN - current_gain).max(0.0));
+            (
+                capped,
+                current_gain + capped,
+                window_expired || window_start.is_none(),
+            )
+        } else {
+            (delta, hourly_gain, false)
+        };
+        let new_score = reputation::apply_delta(old_score, effective_delta);
+        let health_models_json = health_models
+            .map(|models| serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string()));
+
+        let update = sqlx::query(
+            "UPDATE nodes SET `load` = ?, available = ?, active_jobs = ?, \
+             reputation_score = ?, tasks_total = tasks_total + ?, \
+             tasks_failed = tasks_failed + ?, \
+             rep_hourly_gain = ?, \
+             rep_hourly_window_start = CASE WHEN ? = 1 THEN NOW() ELSE rep_hourly_window_start END, \
+             health_models = COALESCE(?, health_models), \
+             status = 'active', last_seen = NOW() WHERE id = ?",
+        )
+        .bind(load as f32)
+        .bind(available)
+        .bind(active_jobs)
+        .bind(new_score as f32)
+        .bind(tasks_delta)
+        .bind(tasks_failed_delta)
+        .bind(new_hourly_gain as f32)
+        .bind(reset_window as i32)
+        .bind(health_models_json)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if update.rows_affected() != 1 {
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some(new_score))
+    }
 }
 
 /// Initialise a connection pool from `DATABASE_URL`. Schema bootstrap and
@@ -1334,82 +1412,29 @@ impl NodeRepository for MySqlRepo {
         delta: f64,
         health_models: Option<Vec<String>>,
     ) -> Option<f64> {
-        let mut tx = self.pool.begin().await.ok()?;
-        // RT-01b (#381): fetch velocity window alongside score.
-        // Laravel stores rep_hourly_gain as DECIMAL(8,4).  sqlx does not decode a
-        // MySQL DECIMAL directly into f32/f64, so cast it explicitly.  Without the
-        // cast a persisted node is incorrectly treated as unknown and heartbeat
-        // returns IICP-E003 even though token verification succeeded.
-        let row: Option<(f64, f64, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
-            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), rep_hourly_window_start \
-             FROM nodes WHERE id = ? FOR UPDATE",
-        )
-        .bind(node_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .ok()
-        .flatten();
-
-        let (old_score, hourly_gain, window_start) = row?;
-
-        // RT-01b: compute effective delta with hourly velocity ceiling (0.20/h/node)
-        const MAX_HOURLY_GAIN: f64 = 0.20;
-        let (effective_delta, new_hourly_gain, reset_window) = if delta > 0.0 {
-            let window_expired = window_start
-                .map(|ws| {
-                    let now = chrono::Utc::now().naive_utc();
-                    (now - ws).num_seconds() >= 3600
-                })
-                .unwrap_or(true);
-
-            let current_gain = if window_expired { 0.0f64 } else { hourly_gain };
-
-            let remaining = (MAX_HOURLY_GAIN - current_gain).max(0.0);
-            let capped = delta.min(remaining);
-            (
-                capped,
-                current_gain + capped,
-                window_expired || window_start.is_none(),
-            )
-        } else {
-            (delta, hourly_gain, false)
-        };
-
-        let new_score = reputation::apply_delta(old_score, effective_delta);
-
-        // #494 — encode health_models as JSON when the SDK reported a live list.
-        let health_models_json: Option<String> = health_models
-            .as_ref()
-            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".to_string()));
-
-        let update = sqlx::query(
-            "UPDATE nodes SET `load` = ?, available = ?, active_jobs = ?, \
-             reputation_score = ?, tasks_total = tasks_total + ?, \
-             tasks_failed = tasks_failed + ?, \
-             rep_hourly_gain = ?, \
-             rep_hourly_window_start = CASE WHEN ? = 1 THEN NOW() ELSE rep_hourly_window_start END, \
-             health_models = COALESCE(?, health_models), \
-             status = 'active', last_seen = NOW() WHERE id = ?",
-        )
-        .bind(load as f32)
-        .bind(available)
-        .bind(active_jobs)
-        .bind(new_score as f32)
-        .bind(tasks_delta)
-        .bind(tasks_failed_delta)
-        .bind(new_hourly_gain as f32)
-        .bind(reset_window as i32)
-        .bind(health_models_json)
-        .bind(node_id)
-        .execute(&mut *tx)
-        .await
-        .ok()?;
-
-        if update.rows_affected() != 1 || tx.commit().await.is_err() {
-            return None;
+        for attempt in 0..3 {
+            match self
+                .heartbeat_once(
+                    node_id,
+                    load,
+                    available,
+                    active_jobs,
+                    tasks_delta,
+                    tasks_failed_delta,
+                    delta,
+                    health_models.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => return result,
+                Err(error) if attempt < 2 && is_transient_transaction_error(&error) => continue,
+                Err(error) => {
+                    eprintln!("heartbeat transaction failed: {error}");
+                    return None;
+                }
+            }
         }
-
-        Some(new_score)
+        None
     }
 
     /// Fetch a single node by id for the node-detail endpoint (iicp-dir §3.4.x).
