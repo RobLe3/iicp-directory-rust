@@ -651,7 +651,8 @@ impl MySqlRepo {
         // RT-01b (#381): fetch velocity window alongside score. Laravel stores
         // rep_hourly_gain as DECIMAL(8,4), so cast it for sqlx decoding.
         let row: Option<(f64, f64, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
-            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), rep_hourly_window_start \
+            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), \
+                    CAST(rep_hourly_window_start AS DATETIME) \
              FROM nodes WHERE id = ? FOR UPDATE",
         )
         .bind(node_id)
