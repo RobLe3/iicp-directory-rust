@@ -44,6 +44,10 @@ jobs:
           cargo test --locked
           concurrent_heartbeats_share_one_persisted_reputation_budget
           -- --ignored
+      - run: >-
+          cargo test --locked
+          identical_saturated_heartbeats_are_persisted_noops_not_unknown_nodes
+          -- --ignored
 
   credit-ledger-concurrency:
     runs-on: ubuntu-latest

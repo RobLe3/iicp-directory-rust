@@ -685,7 +685,11 @@ impl MySqlRepo {
         let health_models_json = health_models
             .map(|models| serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string()));
 
-        let update = sqlx::query(
+        // The locked SELECT above establishes existence. MySQL reports zero
+        // affected rows when an otherwise successful heartbeat writes exactly
+        // the stored values (including a same-second `NOW()`), so row count is
+        // not an existence or commit signal here.
+        sqlx::query(
             "UPDATE nodes SET `load` = ?, available = ?, active_jobs = ?, \
              reputation_score = ?, tasks_total = tasks_total + ?, \
              tasks_failed = tasks_failed + ?, \
@@ -707,9 +711,6 @@ impl MySqlRepo {
         .execute(&mut *tx)
         .await?;
 
-        if update.rows_affected() != 1 {
-            return Ok(None);
-        }
         tx.commit().await?;
         Ok(Some(new_score))
     }
@@ -4088,6 +4089,52 @@ mod tests {
         .expect("read final reputation state");
         assert!((score - 0.85).abs() < 0.0001);
         assert!((gain - 0.20).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn identical_saturated_heartbeats_are_persisted_noops_not_unknown_nodes() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        // One connection keeps MySQL's session timestamp fixed for both calls,
+        // forcing the exact same `NOW()` value that triggered the regression.
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
+              reputation_score, rep_hourly_gain, rep_hourly_window_start, status, last_seen) \
+             VALUES ('heartbeat-noop', 'https://example.invalid/v1', 'test', 'x', 1, 1, \
+                     0.70, 0.20, NOW(), 'active', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed saturated node");
+        sqlx::query("SET timestamp = UNIX_TIMESTAMP()")
+            .execute(&pool)
+            .await
+            .expect("freeze MySQL session timestamp");
+
+        let repo = MySqlRepo::new(pool.clone());
+        for _ in 0..2 {
+            let result = repo
+                .heartbeat("heartbeat-noop", 0.0, true, 0, 0, 0, 0.0, None)
+                .await;
+            assert_eq!(result, Some(0.70));
+        }
+        let score: f64 = sqlx::query_scalar(
+            "SELECT CAST(reputation_score AS DOUBLE) FROM nodes WHERE id = 'heartbeat-noop'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted no-op node");
+        assert!((score - 0.70).abs() < 0.0001);
     }
 
     #[tokio::test]
