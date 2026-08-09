@@ -44,15 +44,15 @@ fn signature_refusal(v: &Value) -> Option<Value> {
         );
     }
     if s("consumer_signature") != "valid" {
-        if s("consumer_signature") == "missing" && s("mode") == "optional" {
+        if s("consumer_signature") == "missing" && s("mode") == "legacy" {
             return Some(
-                json!({"action":"accept_legacy","reason":"consumer_signature_missing_optional","trust_weight":"0.0"}),
+                json!({"action":"accept_legacy","reason":"consumer_signature_missing_legacy","trust_weight":"0.0"}),
             );
         }
-        let reason = if s("consumer_signature") == "missing" {
-            "consumer_signature_required"
-        } else {
-            "consumer_signature_invalid"
+        let reason = match s("consumer_signature") {
+            "missing" => "consumer_signature_required",
+            "wrong_signer" => "consumer_signer_mismatch",
+            _ => "consumer_signature_invalid",
         };
         return Some(json!({"action":"reject","reason":reason,"trust_weight":"0.0"}));
     }
