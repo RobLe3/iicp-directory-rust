@@ -3814,12 +3814,34 @@ impl NodeRepository for MySqlRepo {
 mod tests {
     use super::{credit_ttl_idle, init_pool, median_outlier_weight, MySqlRepo};
     use crate::repo::NodeRepository;
+    use serde_json::Value;
     use sqlx::mysql::MySqlPoolOptions;
     use std::sync::Arc;
     use std::time::Duration;
 
     fn s(vals: &[f64]) -> Vec<(f64,)> {
         vals.iter().map(|&v| (v,)).collect()
+    }
+
+    fn reputation_hourly_velocity_fixture() -> Value {
+        serde_json::from_str(include_str!("../parity/reputation-hourly-velocity-v0.json"))
+            .expect("shared RT-01b fixture must be valid JSON")
+    }
+
+    fn fixture_f64(fixture: &Value, path: &[&str]) -> f64 {
+        let mut value = fixture;
+        for key in path {
+            value = &value[*key];
+        }
+        value.as_f64().expect("fixture numeric field")
+    }
+
+    fn fixture_i64(fixture: &Value, path: &[&str]) -> i64 {
+        let mut value = fixture;
+        for key in path {
+            value = &value[*key];
+        }
+        value.as_i64().expect("fixture integer field")
     }
 
     // WQ-056 / billing §11.3 — the idle-determination rule the TTL sweep applies.
@@ -3998,6 +4020,36 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
     async fn concurrent_heartbeats_share_one_persisted_reputation_budget() {
+        let fixture = reputation_hourly_velocity_fixture();
+        let initial_reputation = fixture_f64(&fixture, &["inputs", "initial_reputation"]);
+        let positive_delta = fixture_f64(&fixture, &["inputs", "positive_delta_per_heartbeat"]);
+        let workers = fixture_i64(&fixture, &["inputs", "workers"]);
+        let tasks_success_per_worker = u32::try_from(fixture_i64(
+            &fixture,
+            &["inputs", "tasks_success_per_worker"],
+        ))
+        .expect("fixture tasks_success_per_worker fits u32");
+        let expected_concurrent_score = fixture_f64(&fixture, &["expected", "concurrent_score"]);
+        let expected_concurrent_gain =
+            fixture_f64(&fixture, &["expected", "concurrent_hourly_gain"]);
+        let expected_tasks_total = fixture_i64(&fixture, &["expected", "concurrent_tasks_total"]);
+        let same_window_age = fixture_i64(&fixture, &["expected", "same_window_age_seconds"]);
+        let same_window_score = fixture_f64(&fixture, &["expected", "same_window_score"]);
+        let next_window_age = fixture_i64(&fixture, &["expected", "next_window_age_seconds"]);
+        let next_window_score = fixture_f64(
+            &fixture,
+            &["expected", "next_window_score_after_first_positive"],
+        );
+        let next_window_gain = fixture_f64(
+            &fixture,
+            &["expected", "next_window_hourly_gain_after_first_positive"],
+        );
+        let negative_delta = fixture_f64(&fixture, &["inputs", "negative_delta_after_reload"]);
+        let final_score = fixture_f64(
+            &fixture,
+            &["expected", "final_score_after_reload_and_negative"],
+        );
+        let final_gain = fixture_f64(&fixture, &["expected", "final_hourly_gain"]);
         let url = std::env::var("IICP_TEST_DATABASE_URL")
             .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
         let pool = init_pool(&url).await.expect("connect disposable database");
@@ -4008,20 +4060,30 @@ mod tests {
             "INSERT INTO nodes \
              (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
               reputation_score, rep_hourly_gain) \
-             VALUES ('reputation-concurrency', 'https://example.invalid/v1', 'test', 'x', 1, 1, 0.5, 0)",
+             VALUES ('reputation-concurrency', 'https://example.invalid/v1', 'test', 'x', 1, 1, ?, 0)",
         )
+        .bind(initial_reputation)
         .execute(&pool)
         .await
         .expect("seed node");
 
         let repo = Arc::new(MySqlRepo::new(pool.clone()));
         let mut tasks = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..workers {
             let repo = Arc::clone(&repo);
             tasks.push(tokio::spawn(async move {
-                repo.heartbeat("reputation-concurrency", 0.1, true, 0, 10, 0, 0.10, None)
-                    .await
-                    .expect("heartbeat must persist")
+                repo.heartbeat(
+                    "reputation-concurrency",
+                    0.1,
+                    true,
+                    0,
+                    tasks_success_per_worker,
+                    0,
+                    positive_delta,
+                    None,
+                )
+                .await
+                .expect("heartbeat must persist")
             }));
         }
         for task in tasks {
@@ -4035,48 +4097,95 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read reputation state");
-        assert!((score - 0.70).abs() < 0.0001);
-        assert!((gain - 0.20).abs() < 0.0001);
-        assert_eq!(tasks_total, 40);
+        assert!((score - expected_concurrent_score).abs() < 0.0001);
+        assert!((gain - expected_concurrent_gain).abs() < 0.0001);
+        assert_eq!(tasks_total, expected_tasks_total);
 
         // 3599 seconds remains in the same saturated window.
         sqlx::query(
-            "UPDATE nodes SET rep_hourly_window_start = NOW() - INTERVAL 3599 SECOND \
+            "UPDATE nodes SET rep_hourly_window_start = NOW() - INTERVAL ? SECOND \
              WHERE id = 'reputation-concurrency'",
         )
+        .bind(same_window_age)
         .execute(&pool)
         .await
         .expect("set in-window boundary");
-        repo.heartbeat("reputation-concurrency", 0.1, true, 0, 0, 0, 0.10, None)
-            .await
-            .expect("in-window heartbeat");
+        repo.heartbeat(
+            "reputation-concurrency",
+            0.1,
+            true,
+            0,
+            0,
+            0,
+            positive_delta,
+            None,
+        )
+        .await
+        .expect("in-window heartbeat");
         let score: f64 = sqlx::query_scalar(
             "SELECT CAST(reputation_score AS DOUBLE) FROM nodes WHERE id = 'reputation-concurrency'",
         )
         .fetch_one(&pool)
         .await
         .expect("read in-window score");
-        assert!((score - 0.70).abs() < 0.0001);
+        assert!((score - same_window_score).abs() < 0.0001);
 
         // Exactly 3600 seconds starts a new window. A new repository instance
         // then proves that the persisted budget survives process-level reload.
         sqlx::query(
-            "UPDATE nodes SET rep_hourly_window_start = NOW() - INTERVAL 3600 SECOND \
+            "UPDATE nodes SET rep_hourly_window_start = NOW() - INTERVAL ? SECOND \
              WHERE id = 'reputation-concurrency'",
         )
+        .bind(next_window_age)
         .execute(&pool)
         .await
         .expect("set expired boundary");
-        repo.heartbeat("reputation-concurrency", 0.1, true, 0, 0, 0, 0.10, None)
-            .await
-            .expect("new-window heartbeat");
+        repo.heartbeat(
+            "reputation-concurrency",
+            0.1,
+            true,
+            0,
+            0,
+            0,
+            positive_delta,
+            None,
+        )
+        .await
+        .expect("new-window heartbeat");
+        let (next_window_observed_score, next_window_observed_gain): (f64, f64) = sqlx::query_as(
+            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE) FROM nodes WHERE id = 'reputation-concurrency'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read new-window state");
+        assert!((next_window_observed_score - next_window_score).abs() < 0.0001);
+        assert!((next_window_observed_gain - next_window_gain).abs() < 0.0001);
+
         let restarted = MySqlRepo::new(pool.clone());
         restarted
-            .heartbeat("reputation-concurrency", 0.1, true, 0, 0, 0, 0.10, None)
+            .heartbeat(
+                "reputation-concurrency",
+                0.1,
+                true,
+                0,
+                0,
+                0,
+                positive_delta,
+                None,
+            )
             .await
             .expect("reloaded heartbeat");
         restarted
-            .heartbeat("reputation-concurrency", 0.1, true, 0, 0, 1, -0.05, None)
+            .heartbeat(
+                "reputation-concurrency",
+                0.1,
+                true,
+                0,
+                0,
+                1,
+                negative_delta,
+                None,
+            )
             .await
             .expect("negative heartbeat");
 
@@ -4087,8 +4196,8 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read final reputation state");
-        assert!((score - 0.85).abs() < 0.0001);
-        assert!((gain - 0.20).abs() < 0.0001);
+        assert!((score - final_score).abs() < 0.0001);
+        assert!((gain - final_gain).abs() < 0.0001);
     }
 
     #[tokio::test]
