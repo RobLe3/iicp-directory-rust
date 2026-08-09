@@ -40,6 +40,7 @@ mod router;
 mod runtime;
 mod schema;
 mod state;
+mod token_issuance;
 mod types;
 mod validate;
 
@@ -84,6 +85,7 @@ use repo::{AuditResult, ConformanceBadge, ProbeResult, ProxyObservation};
 use router::{app, replica_write_gate};
 use serde::Deserialize;
 use state::{new_register_rate, AppState};
+pub(crate) use token_issuance::{consumer_token_issue, relay_ticket_issue};
 pub(crate) use validate::validate_intent;
 #[cfg(test)]
 use validate::Env;
@@ -203,181 +205,6 @@ async fn audit_report(
         _ => StatusCode::ACCEPTED, // 202 — accepted (applied or no-op)
     };
     (status, Json(serde_json::json!({ "accepted": applied })))
-}
-
-#[derive(Debug, Deserialize)]
-struct ConsumerTokenRequest {
-    target_node_id: String,
-    intent: String,
-}
-
-/// `POST /api/v1/consumer-token` — node-token authenticated short-lived token
-/// authorising the caller to send one intent class to a target node.
-async fn consumer_token_issue(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<ConsumerTokenRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if req.target_node_id.trim().is_empty() || req.intent.trim().is_empty() {
-        return err_json(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "validation_error",
-            "target_node_id and intent are required",
-        );
-    }
-    let token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => {
-            return err_json(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing node_token",
-            )
-        }
-    };
-    let caller_node_id = match node_id_from_auth(&headers, &token) {
-        Some(id) => id,
-        None => {
-            return err_json(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "validation_error",
-                "X-Node-Id header required (or use JWT)",
-            )
-        }
-    };
-    if !st.repo.verify_node_token(&caller_node_id, &token).await {
-        return err_json(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "invalid node_token",
-        );
-    }
-    if st.repo.get(&req.target_node_id).await.is_none() {
-        return err_json(StatusCode::NOT_FOUND, "not_found", "Target node not found.");
-    }
-    let Some(secret) = st.signing_key.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "not_configured",
-                    "message": "Consumer token signing key not configured on this directory."
-                }
-            })),
-        );
-    };
-    let now = unix_now();
-    let exp = now + 300;
-    let payload = serde_json::json!({
-        "v": 1,
-        "iss": "https://iicp.network",
-        "sub": caller_node_id,
-        "aud": req.target_node_id,
-        "intent": req.intent,
-        "iat": now,
-        "exp": exp
-    });
-    let Some(issued) = sign_domain_token(secret, "iicp:consumer-token:v1\n", &payload) else {
-        return err_json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "not_configured",
-            "Consumer token signing key not configured on this directory.",
-        );
-    };
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "token": issued,
-            "expires_at": exp,
-            "caller_node_id": caller_node_id,
-            "target_node_id": req.target_node_id,
-            "intent": req.intent
-        })),
-    )
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayTicketRequest {
-    #[serde(default)]
-    relay_node_id: Option<String>,
-}
-
-/// `POST /api/v1/relay/ticket` — node-token authenticated relay-bind ticket.
-async fn relay_ticket_issue(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<RelayTicketRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => {
-            return err_json(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing node_token",
-            )
-        }
-    };
-    let worker_node_id = match node_id_from_auth(&headers, &token) {
-        Some(id) => id,
-        None => {
-            return err_json(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "validation_error",
-                "X-Node-Id header required (or use JWT)",
-            )
-        }
-    };
-    if !st.repo.verify_node_token(&worker_node_id, &token).await {
-        return err_json(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "invalid node_token",
-        );
-    }
-    let Some(secret) = st.signing_key.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "not_configured",
-                    "message": "Relay bind ticket signing key not configured on this directory."
-                }
-            })),
-        );
-    };
-    let relay_node_id = req
-        .relay_node_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "*".into());
-    let now = unix_now();
-    let exp = now + 120;
-    let payload = serde_json::json!({
-        "v": 1,
-        "typ": "relay-bind-ticket",
-        "iss": "https://iicp.network",
-        "sub": worker_node_id,
-        "aud": relay_node_id,
-        "iat": now,
-        "exp": exp
-    });
-    let Some(ticket) = sign_domain_token(secret, "iicp:relay-bind-ticket:v1\n", &payload) else {
-        return err_json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "not_configured",
-            "Relay bind ticket signing key not configured on this directory.",
-        );
-    };
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "ticket": ticket,
-            "expires_at": exp,
-            "worker_node_id": worker_node_id,
-            "relay_node_id": relay_node_id,
-            "algorithm": "ed25519"
-        })),
-    )
 }
 
 // ── peers (iicp-dir §3.5) ────────────────────────────────────────────────────
@@ -972,7 +799,7 @@ pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
 /// JWT path: decode the bearer token as HS256 → extract `sub` as node_id.
 /// Header path: read `X-Node-Id` header directly.
 /// Returns None if neither is present or the JWT is invalid.
-fn node_id_from_auth(headers: &axum::http::HeaderMap, token: &str) -> Option<String> {
+pub(crate) fn node_id_from_auth(headers: &axum::http::HeaderMap, token: &str) -> Option<String> {
     // Try JWT first — sub claim carries the node_id without a separate header.
     if let Some(node_id) = auth::verify_jwt(token) {
         return Some(node_id);
