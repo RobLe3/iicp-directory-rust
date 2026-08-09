@@ -4235,7 +4235,14 @@ mod tests {
             let result = repo
                 .heartbeat("heartbeat-noop", 0.0, true, 0, 0, 0, 0.0, None)
                 .await;
-            assert_eq!(result, Some(0.70));
+            // MySQL stores `FLOAT` as IEEE-754 single precision, so a persisted
+            // 0.70 is read back as its f32 representation rather than the exact
+            // f64 literal. This is a no-op-state assertion, not an exact binary
+            // representation assertion.
+            assert!(
+                result.is_some_and(|score| (score - 0.70).abs() < 0.0001),
+                "saturated heartbeat must preserve the stored reputation score: {result:?}"
+            );
         }
         let score: f64 = sqlx::query_scalar(
             "SELECT CAST(reputation_score AS DOUBLE) FROM nodes WHERE id = 'heartbeat-noop'",
