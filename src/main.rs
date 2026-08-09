@@ -26,6 +26,7 @@ mod maintenance;
 mod node_lifecycle;
 mod observability;
 mod operator;
+mod peer_access;
 mod policy;
 mod policy_manifest;
 mod probe;
@@ -77,6 +78,7 @@ pub(crate) use operator::{
     operator_fingerprint_for, operator_key_revoke, operator_key_rotate, operator_rename,
     public_operator_fingerprint,
 };
+pub(crate) use peer_access::{me, peers};
 #[cfg(test)]
 pub(crate) use repo::DiscoverQuery;
 #[cfg(test)]
@@ -205,131 +207,6 @@ async fn audit_report(
         _ => StatusCode::ACCEPTED, // 202 — accepted (applied or no-op)
     };
     (status, Json(serde_json::json!({ "accepted": applied })))
-}
-
-// ── peers (iicp-dir §3.5) ────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct PeersRequest {
-    #[serde(alias = "sender_id")]
-    node_id: String,
-    #[serde(default)]
-    known_peers: Vec<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// `POST /v1/peers` (iicp-dir §3.5 PEER_EXCHANGE). Requires bearer token.
-/// Returns a list of active peers the caller doesn't already know about.
-/// known_peers is capped at 20 entries (excess silently truncated, matching PHP behaviour).
-async fn peers(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-    request: Result<Json<PeersRequest>, JsonRejection>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(
-                    serde_json::json!({ "error": { "code": "unauthorized", "message": "missing node_token" } }),
-                ),
-            )
-        }
-    };
-    let Json(req) = match request {
-        Ok(request) => request,
-        Err(_) => return reject("validation_error", "invalid peer request"),
-    };
-    if !st.repo.verify_node_token(&req.node_id, &token).await {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(
-                serde_json::json!({ "error": { "code": "unauthorized", "message": "invalid node_token" } }),
-            ),
-        );
-    }
-    // Cap known_peers at 20 per spec (silently truncate excess).
-    let known: Vec<String> = req.known_peers.into_iter().take(20).collect();
-    let limit = req.limit.unwrap_or(10);
-    let found = st.repo.peers_excluding(&known, limit).await;
-    let count = found.len() as u32;
-    // PHP PeersController returns minimal peer data (node_id, endpoint, region, last_seen).
-    let peers: Vec<serde_json::Value> = found
-        .into_iter()
-        .map(|n| {
-            serde_json::json!({
-                "node_id": n.node_id,
-                "endpoint": n.endpoint,
-                "region": n.region,
-                "last_seen": serde_json::Value::Null,
-            })
-        })
-        .collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "peers": peers, "count": count })),
-    )
-}
-
-/// `GET /v1/me` (iicp-dir §3.8). Returns the authenticated node's own record.
-/// Auth: JWT bearer (sub=node_id) preferred; X-Node-Id header fallback when APP_KEY unset.
-async fn me(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(
-                    serde_json::json!({ "error": { "code": "unauthorized", "message": "missing node_token" } }),
-                ),
-            )
-        }
-    };
-    let node_id = match node_id_from_auth(&headers, &token) {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(
-                    serde_json::json!({ "error": { "code": "validation_error", "message": "X-Node-Id header required (or use JWT)" } }),
-                ),
-            )
-        }
-    };
-    if !st.repo.verify_node_token(&node_id, &token).await {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(
-                serde_json::json!({ "error": { "code": "unauthorized", "message": "invalid node_token" } }),
-            ),
-        );
-    }
-    match st.repo.get(&node_id).await {
-        Some(node) => {
-            // PHP MeController returns only {node_id, observed_source_ip, endpoint}
-            // (DIR-ADDR-08 — diagnostic "what does the directory see about me?").
-            let observed_ip = st.repo.get_observed_ip(&node_id).await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "node_id": node.node_id,
-                    "observed_source_ip": observed_ip,
-                    "endpoint": node.endpoint,
-                })),
-            )
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(
-                serde_json::json!({ "error": { "code": "IICP-E003", "message": "node not found" } }),
-            ),
-        ),
-    }
 }
 
 /// `GET /v1/metrics` — Prometheus text exposition (iicp-dir §3.9c).
