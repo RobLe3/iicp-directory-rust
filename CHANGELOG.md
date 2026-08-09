@@ -2,10 +2,15 @@
 
 ## Unreleased
 
+## 0.1.10 — 2026-08-09
+
 - Repairs the nested replica-lifecycle fixture digest and adds recursive release
   compatibility validation for every fixture named by a parity contract.
-- Adds a corrective `v0.1.10` compatibility candidate without changing the
-  current source/package version or the immutable `v0.1.9` tag and assets.
+- Accepts persisted no-op MySQL heartbeats after a locked node lookup instead
+  of returning a false not-found result.
+- Updates `event-listener` to the patched 5.4.2 line without adding a RustSec
+  exception.
+- Preserves operator-preview status and the immutable `v0.1.9` tag and assets.
 
 
 ## 0.1.9 — 2026-08-08
