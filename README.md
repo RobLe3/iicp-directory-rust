@@ -125,7 +125,11 @@ cd iicp-directory-rs
 ./scripts/check_quality.sh
 ```
 
-The route-alias and live-shape compatibility tests are in `src/main.rs` near the other HTTP integration tests. The local publication-quality lane also blocks on Clippy, RustSec and a 70% line-coverage floor; the first measured operator-preview baseline was 74.05%. This is an explicit ratchet, not a claim of PHP's higher coverage level.
+The route-alias and live-shape compatibility tests are isolated in
+`src/main_tests.rs`. The local publication-quality lane blocks on Clippy,
+RustSec and a 70% production line-coverage floor, combining ordinary and
+disposable-MySQL execution. This is an explicit ratchet, not a claim of PHP's
+higher coverage level.
 
 ## Relationship to PHP
 
