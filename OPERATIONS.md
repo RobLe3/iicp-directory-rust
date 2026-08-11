@@ -70,7 +70,7 @@ mutable checkout:
 
 ```bash
 export IICP_DEPLOYMENT_KIND=container
-export IICP_RELEASE_TAG=v0.1.4
+export IICP_RELEASE_TAG="${VERIFIED_RELEASE_TAG:?set a verified immutable release tag}"
 export IICP_SOURCE_COMMIT=<40-hex-release-commit>
 export IICP_BUILD_ID=sha256:<artifact-digest>
 export IICP_DEPLOYED_AT=<RFC3339-UTC-time>

@@ -121,7 +121,7 @@ uses only the explicit testing liveness bypass, removes the container and state
 afterward, and emits a content-free summary. It never contacts Genesis.
 
 ```bash
-cd iicp-directory-rs
+cd iicp-directory-rust
 ./scripts/check_quality.sh
 ```
 
