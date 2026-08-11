@@ -8,7 +8,7 @@ database change, PHP deprecation or cutover.
 
 The shadow must use its own MySQL database, database account, APP key, Ed25519
 signing identity, DID, replica registration and external port. Do not clone the
-Genesis database or reuse any Genesis secret. Start from the immutable `v0.1.9`
+Genesis database or reuse any Genesis secret. Start from the immutable `v0.1.10`
 release assets and verify their published checksums before installation.
 
 Copy `ops/shadow.env.example` to a location outside every repository, set mode

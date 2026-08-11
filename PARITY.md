@@ -1,11 +1,11 @@
-# iicp-directory-rs — PHP Feature Parity Checklist
+# iicp-directory-rust — PHP Feature Parity Checklist
 
-Last refreshed: **2026-08-01**. Rust `v0.1.7` pins the shared
-`contract-v1.10.85.json`, whose PHP runtime authority is `v1.10.85`. The
-normalized HTTP and behavior fixtures retain their earlier authority because
-this additive release introduces a separate content-free discovery-evidence
-fixture rather than rewriting those vectors. Older contracts remain immutable
-evidence; none authorizes a production cutover.
+Last refreshed: **2026-08-11**. Rust `v0.1.10` pins the shared
+`contract-v1.10.89.json`, whose PHP runtime authority is `v1.10.89`. The
+release advances atomic reputation-velocity and replica-lifecycle integrity
+evidence without rewriting the immutable HTTP and behavior fixtures that those
+contracts reference. Older contracts remain immutable evidence; none
+authorizes a production cutover.
 
 > **Status:** this Rust implementation is the second official directory
 > flavor and a reconciled parity baseline, not a cutover-ready production
@@ -175,7 +175,7 @@ suites.
 ## Current verification
 
 ```bash
-cd iicp-directory-rs
+cd iicp-directory-rust
 cargo fmt --check && cargo test --locked
 cd ..
 bash scripts/docker_rust_schema_reliability_gate.sh
