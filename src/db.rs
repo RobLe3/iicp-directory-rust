@@ -473,6 +473,8 @@ struct NodeRow {
     #[sqlx(default)]
     capability_models: Option<String>,
     #[sqlx(default)]
+    capability_supported_profiles: Option<String>,
+    #[sqlx(default)]
     backend_stability: Option<String>,
     #[sqlx(default)]
     pricing_credits_per_1000: Option<f64>,
@@ -533,6 +535,11 @@ impl From<NodeRow> for Node {
             cip_conformance_level: Some("CIP-None".to_string()),
             models: r
                 .capability_models
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default(),
+            supported_profiles: r
+                .capability_supported_profiles
                 .as_deref()
                 .and_then(|raw| serde_json::from_str(raw).ok())
                 .unwrap_or_default(),
@@ -622,6 +629,27 @@ impl From<NodeRow> for Node {
             },
         }
     }
+}
+
+async fn capability_profile_union(pool: &Pool<MySql>, node_id: &str) -> Vec<String> {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT CAST(supported_profiles AS CHAR) FROM capabilities WHERE node_id = ?",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut profiles: Vec<String> = rows
+        .into_iter()
+        .flat_map(|(raw,)| {
+            raw.as_deref()
+                .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                .unwrap_or_default()
+        })
+        .collect();
+    profiles.sort();
+    profiles.dedup();
+    profiles
 }
 
 // ── MySqlRepo ─────────────────────────────────────────────────────────────────
@@ -812,7 +840,7 @@ async fn mysql_dsr_export(
     let nodes = mysql_dsr_node_rows(pool, subject).await?;
     let capabilities = mysql_dsr_node_table_rows(
         pool,
-        "SELECT CAST(JSON_OBJECT('node_id',node_id,'intent',intent,'models',models,'max_tokens',max_tokens,'quantization',quantization,'inference_engine',inference_engine,'input_modalities',input_modalities) AS CHAR) AS row_json FROM capabilities",
+        "SELECT CAST(JSON_OBJECT('node_id',node_id,'intent',intent,'models',models,'max_tokens',max_tokens,'quantization',quantization,'inference_engine',inference_engine,'input_modalities',input_modalities,'supported_profiles',supported_profiles) AS CHAR) AS row_json FROM capabilities",
         "node_id",
         &subject.node_ids,
         "node_id, id",
@@ -1358,6 +1386,7 @@ impl NodeRepository for MySqlRepo {
                       CAST(n.supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
                       CAST(n.health_models AS CHAR) AS health_models,
                       CAST(c.models AS CHAR) AS capability_models,
+                      CAST(c.supported_profiles AS CHAR) AS capability_supported_profiles,
                       CAST(n.backend_stability AS CHAR) AS backend_stability,
                       CAST(n.pricing_credits_per_1000 AS DOUBLE) AS pricing_credits_per_1000,
                       CAST(n.cx_public_key AS CHAR) AS cx_public_key,
@@ -1458,7 +1487,9 @@ impl NodeRepository for MySqlRepo {
         .ok()
         .flatten();
 
-        row.map(Node::from)
+        let mut node = row.map(Node::from)?;
+        node.supported_profiles = capability_profile_union(&self.pool, &node.node_id).await;
+        Some(node)
     }
 
     async fn node_by_prefix(&self, prefix: &str) -> Option<Node> {
@@ -1487,7 +1518,9 @@ impl NodeRepository for MySqlRepo {
         .ok()
         .flatten();
 
-        row.map(Node::from)
+        let mut node = row.map(Node::from)?;
+        node.supported_profiles = capability_profile_union(&self.pool, &node.node_id).await;
+        Some(node)
     }
 
     /// Active nodes within the 90-second liveness window (iicp-dir §3.9b).
@@ -3442,23 +3475,43 @@ impl NodeRepository for MySqlRepo {
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
-        let caps: Vec<(String, String)> =
-            sqlx::query_as("SELECT node_id, intent FROM capabilities")
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_default();
+        let caps: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT node_id, intent, CAST(supported_profiles AS CHAR) FROM capabilities",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
         let mut intents: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        for (nid, intent) in caps {
-            intents.entry(nid).or_default().push(intent);
+        let mut capability_profiles = std::collections::HashMap::new();
+        for (nid, intent, profiles) in caps {
+            intents.entry(nid.clone()).or_default().push(intent.clone());
+            let parsed = profiles
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            capability_profiles.insert((nid, intent), parsed);
         }
         rows.into_iter()
             .map(|r| {
                 let node = Node::from(r);
                 let node_intents = intents.get(&node.node_id).cloned().unwrap_or_default();
+                let node_profiles = node_intents
+                    .iter()
+                    .map(|intent| {
+                        (
+                            intent.clone(),
+                            capability_profiles
+                                .get(&(node.node_id.clone(), intent.clone()))
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect();
                 NodeRecord {
                     node,
                     intents: node_intents,
+                    capability_profiles: node_profiles,
                     availability: vec![],
                     node_token: None,
                     node_hmac_key: None,

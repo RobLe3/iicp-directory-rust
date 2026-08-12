@@ -58,6 +58,7 @@ fn test_state() -> AppState {
             transport_endpoint: None,
             cip_conformance_level: Some("CIP-None".into()),
             models: vec![],
+            supported_profiles: vec![],
             pricing: None,
             nat_type: None,
             transport_method: None,
@@ -97,6 +98,7 @@ fn test_state() -> AppState {
             routing_policy: types::RoutingPolicyState::default(),
         },
         intents: vec![chat.into()],
+        capability_profiles: std::collections::HashMap::new(),
         availability: vec![],
         node_token: None,
         node_hmac_key: Some("test-hmac-key".into()),
@@ -1238,7 +1240,8 @@ async fn register_with_phase5_fields_round_trips_in_discover() {
         "endpoint": "https://1.1.1.1",
         "region": "eu-central",
         "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["llama3"],
-                           "quantization": "q4_k_m", "inference_engine": "llama.cpp"}],
+                           "quantization": "q4_k_m", "inference_engine": "llama.cpp",
+                           "supported_profiles": ["urn:iicp:profile:service-lifecycle:v1"]}],
         "relay_capable": true,
         "sdk_language": "python",
         "implementation_name": "iicp-web-node",
@@ -1311,6 +1314,10 @@ async fn register_with_phase5_fields_round_trips_in_discover() {
     assert_eq!(node["models"][0], "llama3");
     assert_eq!(node["quantization"][0], "q4_k_m");
     assert_eq!(node["inference_engine"][0], "llama.cpp");
+    assert_eq!(
+        node["supported_profiles"],
+        serde_json::json!(["urn:iicp:profile:service-lifecycle:v1"])
+    );
     assert_eq!(node["address_family"], "ipv4");
 }
 
@@ -1336,6 +1343,34 @@ async fn registration_rejects_conflicting_sdk_version_axes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn registration_rejects_malformed_or_oversized_capability_profiles() {
+    for profiles in [
+        serde_json::json!(["streaming"]),
+        serde_json::json!([
+            "urn:iicp:profile:service-lifecycle:v1",
+            "urn:iicp:profile:service-lifecycle:v1"
+        ]),
+        serde_json::Value::Array(
+            (0..17)
+                .map(|index| serde_json::json!(format!("urn:iicp:profile:test:{index}")))
+                .collect(),
+        ),
+    ] {
+        let response = app(test_state())
+            .oneshot(post_register(serde_json::json!({
+                "endpoint": "https://1.1.1.1",
+                "capabilities": [{
+                    "intent": "urn:iicp:intent:llm:chat:v1",
+                    "supported_profiles": profiles,
+                }],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 422);
+    }
 }
 
 /// Signs a fresh operator→node delegation for `node_id` (test key seed 0x09*32).
@@ -4029,6 +4064,7 @@ async fn discover_excludes_node_with_empty_health_models_unfiltered() {
             transport_endpoint: None,
             cip_conformance_level: Some("CIP-None".into()),
             models: vec!["qwen2.5:0.5b".into()],
+            supported_profiles: vec![],
             pricing: None,
             nat_type: None,
             transport_method: None,
@@ -4066,6 +4102,7 @@ async fn discover_excludes_node_with_empty_health_models_unfiltered() {
             routing_policy: types::RoutingPolicyState::default(),
         },
         intents: vec![chat.into()],
+        capability_profiles: std::collections::HashMap::new(),
         availability: vec![],
         node_token: None,
         node_hmac_key: Some("test-hmac-key".into()),
@@ -4122,6 +4159,7 @@ async fn discover_runtime_policy_applies_qos_boundary_and_php_ranking() {
             .map(|node| NodeRecord {
                 node,
                 intents: vec![chat.into()],
+                capability_profiles: std::collections::HashMap::new(),
                 availability: vec![],
                 node_token: None,
                 node_hmac_key: None,
