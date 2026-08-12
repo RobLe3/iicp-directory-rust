@@ -54,13 +54,19 @@ done
 start_service() {
   local image="$1" hardened="$2"
   SERVICE="$RUN-service"
-  local args=(run -d --name "$SERVICE" --network "$NET" -p 127.0.0.1::8090
+  port="$(python3 - <<'PY'
+import socket
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+)"
+  local args=(run -d --name "$SERVICE" --network "$NET" -p "127.0.0.1:${port}:8090"
     -e APP_ENV=local -e "DATABASE_URL=mysql://iicp:iicp@${DB}/iicp")
   if [[ "$hardened" = 1 ]]; then
     args+=(--read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=16m)
   fi
   docker "${args[@]}" "$image" >/dev/null
-  port="$(docker port "$SERVICE" 8090/tcp | sed 's/.*://')"
   deadline=$((SECONDS + 120))
   until curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
     if [[ "$SECONDS" -ge "$deadline" ]]; then

@@ -1,6 +1,9 @@
 # Multi-stage build for the Rust directory control plane (#385).
 # Used as a federation replica in docker-compose.federation.yml (#437/#436).
-FROM rust:slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder
+# Keep the builder on the same Debian generation as the runtime. The previous
+# moving `rust:slim` digest used a newer glibc and produced a binary that could
+# not start in the pinned Bookworm runtime image.
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 WORKDIR /build
 # The Laravel-derived schema baseline and compatibility contract are embedded
 # into the binary. Historical SQLx migrations remain source evidence but are

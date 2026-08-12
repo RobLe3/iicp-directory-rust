@@ -28,6 +28,10 @@ the PHP baseline without changing the wire contract.
 ## Immutability and support
 
 Tags and release artifacts are immutable. Corrections receive a new version.
+crates.io packages are published through the guarded local release lane in the
+`iicp.network` control repository. The lane requires a clean `origin/main`, a
+matching immutable tag, package verification, local quality evidence and a
+project-scoped token. Publishing a crate does not deploy it.
 Pre-1.0 releases may change Rust-specific operator interfaces, but documented
 HTTP and integrity behavior changes require shared-contract review.
 

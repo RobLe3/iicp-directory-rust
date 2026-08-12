@@ -1277,7 +1277,7 @@ async fn register_with_phase5_fields_round_trips_in_discover() {
                 .uri("/v1/heartbeat")
                 .method("POST")
                 .header("content-type", "application/json")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(axum::body::Body::from(hb.to_string()))
                 .unwrap(),
         )

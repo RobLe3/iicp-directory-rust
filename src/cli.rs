@@ -13,6 +13,28 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Read the private local runtime-health snapshot written by the running process.
+    Healthcheck {
+        /// Require readiness rather than local liveness.
+        #[arg(long)]
+        ready: bool,
+        /// Emit the versioned machine-readable snapshot.
+        #[arg(long)]
+        json: bool,
+        /// Override the local snapshot path.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Install, inspect, restart or remove the user-level systemd service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Check the authoritative crates.io package line without mutating this installation.
+    Update {
+        #[command(subcommand)]
+        action: UpdateAction,
+    },
     /// Report metadata-only database maintenance status.
     DbMaintenanceStatus {
         #[command(flatten)]
@@ -39,6 +61,46 @@ pub(crate) enum Command {
     E050Readiness {
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum UpdateAction {
+    /// Report whether a newer immutable crate release is available.
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ServiceAction {
+    /// Write, enable and optionally start the user service.
+    Install {
+        /// Absolute environment file containing the directory configuration.
+        #[arg(long)]
+        env_file: std::path::PathBuf,
+        /// Install and enable without starting the service now.
+        #[arg(long)]
+        no_start: bool,
+        /// Enable Type=notify; watchdog remains off unless --watchdog-sec is supplied.
+        #[arg(long)]
+        notify: bool,
+        /// Measured watchdog interval. Implies --notify and is never guessed.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(30..=3600))]
+        watchdog_sec: Option<u64>,
+        /// Print the unit and manager actions without changing the host.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print effective service-manager properties.
+    Status,
+    /// Restart the installed service.
+    Restart,
+    /// Disable and remove the generated service unit.
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

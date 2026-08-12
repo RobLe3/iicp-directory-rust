@@ -1,16 +1,39 @@
 [package]
 name = "iicp-directory-rs"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Pre-1.0 Rust operator preview of the IICP directory control plane."
 repository = "https://github.com/RobLe3/iicp-directory-rust"
+readme = "README.md"
+keywords = ["iicp", "directory", "agents", "discovery"]
+categories = ["network-programming", "web-programming"]
+include = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "LICENSE",
+  "README.md",
+  "OPERATIONS.md",
+  "PARITY.md",
+  "RELEASE_POLICY.md",
+  "SECURITY.md",
+  "src/**",
+  "schema/**",
+  "migrations/**",
+  "parity/**",
+  "compatibility/**",
+  "tests/**",
+  "examples/**",
+  "scripts/directory_self_update.sh",
+  "scripts/validate_runtime_health_arm.sh",
+  "scripts/validate_systemd_watchdog.sh",
+]
 
 [dependencies]
 base64 = "0.22"
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
@@ -36,6 +59,15 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ct-codecs = "1"
 serde_jcs = "0.2.0"
 clap = { version = "4", features = ["derive"] }
+semver = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = { version = "0.5", optional = true }
+
+[features]
+default = ["systemd-notify"]
+systemd-notify = ["dep:sd-notify"]
+runtime-health-fault-injection = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -57,7 +57,7 @@ PHP Genesis → dual supported flavors → Rust Genesis → PHP maintenance reti
 
 ## Requirements
 
-- Rust 1.86 or newer
+- Rust 1.88 or newer
 - MySQL 8 / MariaDB 11 for durable operation
 
 ## Run
@@ -80,7 +80,35 @@ export DATABASE_URL="mysql://user:pass@localhost/iicp_directory"
 cargo run
 ```
 
-Migrations are loaded from `migrations/` on startup.
+An empty database is bootstrapped from the embedded baseline schema. An
+existing database is verified and startup fails on incompatible state; the
+binary does not silently apply the incremental files under `migrations/`.
+Review and back up before any operator-managed migration.
+
+### User-level systemd service
+
+Install the service from the exact binary you intend to run. Keep the
+environment file outside the repository and readable only by its owner.
+
+```bash
+iicp-directory-rs service install --env-file /absolute/path/directory.env
+iicp-directory-rs service status
+```
+
+The default service uses `Restart=always`, but leaves the native systemd
+watchdog disabled. `--notify` enables readiness notification. A measured
+watchdog interval can be supplied separately with `--watchdog-sec`; the
+installer never guesses one. User lingering remains an explicit operator
+decision.
+
+The running process also writes a mode-0600 local health snapshot. Inspect
+local liveness without changing the existing `/iicp/health` wire behavior:
+
+```bash
+iicp-directory-rs healthcheck --json
+```
+
+See [`OPERATIONS.md`](OPERATIONS.md) for staged updates and rollback.
 
 For a durable installation, backup and recovery guidance, read
 [`OPERATIONS.md`](OPERATIONS.md). In-memory mode is for local evaluation only.
@@ -102,6 +130,7 @@ For a durable installation, backup and recovery guidance, read
 | `IICP_RELEASE_TAG`, `IICP_SOURCE_COMMIT`, `IICP_BUILD_ID`, `IICP_DEPLOYED_AT` | — | Immutable release inputs for `/.well-known/iicp-deployment.json`. |
 | `IICP_ROOT_KEY_ID` | — | DID verification-method ID for the configured signing key. |
 | `IICP_OPENAPI_VERSION`, `IICP_PROTOCOL_MIN`, `IICP_PROTOCOL_MAX` | `1.7.0`, `1.9.0`, `1.9.0` | Compatibility metadata in the signed deployment record. |
+| `IICP_RUNTIME_HEALTH_FILE` | platform runtime/state directory | Private local runtime-health snapshot used by the healthcheck and supervision adapters. |
 
 In production mode, `POST /v1/register` and `POST /api/v1/register` reject private/loopback endpoints. Use `APP_ENV=local` for local endpoint tests.
 The deployment-provenance endpoint returns 503 until every required release

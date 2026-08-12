@@ -391,7 +391,7 @@ fn median_outlier_weight(value: f64, sorted_sample: &[(f64,)]) -> f64 {
         return 1.0;
     }
     let n = sorted_sample.len();
-    let median = if n % 2 == 0 {
+    let median = if n.is_multiple_of(2) {
         (sorted_sample[n / 2 - 1].0 + sorted_sample[n / 2].0) / 2.0
     } else {
         sorted_sample[n / 2].0
@@ -3667,17 +3667,26 @@ impl NodeRepository for MySqlRepo {
     }
 
     async fn probe_aggregate_24h(&self) -> crate::repo::ProbeAggregate24h {
-        // Read most-recent value per metric for window='24h' from iicp_telemetry_aggregates.
+        // Read exactly one newest value per metric. Historical aggregates remain
+        // available for evidence/retention, but they must never be hydrated into
+        // application memory. MAX(id) makes equal computed_at timestamps
+        // deterministic and matches the bounded PHP 1.10.90 query.
         let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
             "SELECT t1.metric, t1.value \
              FROM iicp_telemetry_aggregates t1 \
-             INNER JOIN ( \
-                 SELECT metric, MAX(computed_at) AS max_at \
-                 FROM iicp_telemetry_aggregates \
-                 WHERE window = '24h' \
-                 GROUP BY metric \
-             ) t2 ON t1.metric = t2.metric AND t1.computed_at = t2.max_at \
-             WHERE t1.window = '24h'",
+             WHERE t1.id IN ( \
+                 SELECT MAX(candidate.id) \
+                 FROM iicp_telemetry_aggregates candidate \
+                 INNER JOIN ( \
+                     SELECT metric, MAX(computed_at) AS latest_at \
+                     FROM iicp_telemetry_aggregates \
+                     WHERE `window` = '24h' \
+                     GROUP BY metric \
+                 ) latest ON latest.metric = candidate.metric \
+                         AND latest.latest_at = candidate.computed_at \
+                 WHERE candidate.`window` = '24h' \
+                 GROUP BY candidate.metric \
+             )",
         )
         .fetch_all(&self.pool)
         .await
@@ -3953,6 +3962,45 @@ mod tests {
         assert!((median_outlier_weight(400.0, &sample) - 1.0).abs() < 1e-9);
         // 500 > 3*150=450 → outlier
         assert!((median_outlier_weight(500.0, &sample) - 0.1).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn aggregate_lookup_is_bounded_and_deterministic_for_timestamp_ties() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "DELETE FROM iicp_telemetry_aggregates \
+             WHERE metric IN ('discover_p50_ms', 'discover_p95_ms')",
+        )
+        .execute(&pool)
+        .await
+        .expect("clear fixture rows");
+        for (metric, value, computed_at) in [
+            ("discover_p50_ms", 5.0, "2026-08-12 09:59:59"),
+            ("discover_p50_ms", 10.0, "2026-08-12 10:00:00"),
+            ("discover_p50_ms", 20.0, "2026-08-12 10:00:00"),
+            ("discover_p95_ms", 95.0, "2026-08-12 10:00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO iicp_telemetry_aggregates \
+                 (`window`, metric, value, sample_count, computed_at) \
+                 VALUES ('24h', ?, ?, 1, ?)",
+            )
+            .bind(metric)
+            .bind(value)
+            .bind(computed_at)
+            .execute(&pool)
+            .await
+            .expect("insert aggregate fixture");
+        }
+        let aggregate = MySqlRepo::new(pool).probe_aggregate_24h().await;
+        assert_eq!(aggregate.discover_p50_ms, Some(20.0));
+        assert_eq!(aggregate.discover_p95_ms, Some(95.0));
     }
 
     #[tokio::test]

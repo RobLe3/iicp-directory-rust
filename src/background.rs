@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::repo::NodeRepository;
+use iicp_directory_rs::runtime_health::RuntimeHealth;
 use sqlx::{MySql, Pool};
 
 /// ProbeNodes: actively probe each registered node's endpoint (#373 Phase B).
@@ -253,13 +254,14 @@ pub async fn run_rotate_reputation_window_loop(repo: Arc<dyn NodeRepository>) {
 /// Emits one EVICT event per expired node (#508 uptime tracking parity with PHP).
 ///
 /// PHP equivalent: `ExpireStaleNodes` Artisan command scheduled via `php artisan schedule:run`.
-pub async fn run_expire_nodes_loop(repo: Arc<dyn NodeRepository>) {
+pub async fn run_expire_nodes_loop(repo: Arc<dyn NodeRepository>, health: RuntimeHealth) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     // Skip the first tick (fires immediately at startup — all nodes are brand-new).
     interval.tick().await;
     loop {
         interval.tick().await;
         let expired_ids = repo.expire_stale().await;
+        health.advance_supervisor();
         let count = expired_ids.len();
         if count > 0 {
             eprintln!("[expire_stale] marked {count} node(s) dormant");

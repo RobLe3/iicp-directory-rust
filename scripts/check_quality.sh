@@ -2,8 +2,13 @@
 set -euo pipefail
 
 cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo clippy --locked --all-features --all-targets -- -D warnings
+cargo test --locked --all-features
+# This developer gate must validate the exact candidate before it is committed.
+# The release lane separately requires a clean worktree and packages the tagged
+# commit without this allowance.
+cargo package --locked --allow-dirty
+python3 scripts/test_directory_self_update.py
 
 # The original embedded test module inflated coverage by counting test source.
 # Preserve the 70% floor while measuring production code with both ordinary and

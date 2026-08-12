@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.1.11 — 2026-08-12
+
+- Adds an OS-independent local runtime-health snapshot, healthcheck command and
+  opt-in systemd notification/watchdog adapter without changing `/iicp/health`.
+- Adds idempotent user-level systemd service lifecycle commands and a guarded,
+  checksum-bound staged updater with rollback.
+- Makes aggregate selection deterministic when multiple newest rows share a
+  timestamp and adds a disposable-MySQL regression.
+- Adds the PHP `v1.10.90` bounded-stats parity contract and crates.io package
+  preparation while preserving PHP Genesis authority.
+
 ## 0.1.10 — 2026-08-09
 
 - Repairs the nested replica-lifecycle fixture digest and adds recursive release

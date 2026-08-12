@@ -41,9 +41,11 @@ mod reputation;
 mod router;
 mod runtime;
 mod schema;
+mod service;
 mod state;
 mod token_issuance;
 mod types;
+mod updater;
 mod validate;
 
 use std::sync::Arc;
@@ -643,7 +645,22 @@ async fn deregister(
 async fn main() {
     let cli = Cli::parse();
     if let Some(command) = cli.command {
-        if let Err(error) = runtime::run_operational_command(command).await {
+        let result = match command {
+            cli::Command::Service { action } => service::run(action),
+            cli::Command::Update { action } => updater::run(action).await,
+            cli::Command::Healthcheck { ready, json, file } => {
+                let code = runtime::run_healthcheck(file, ready, json).unwrap_or_else(|error| {
+                    eprintln!("INDETERMINATE: {error}");
+                    2
+                });
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
+            command => runtime::run_operational_command(command).await,
+        };
+        if let Err(error) = result {
             eprintln!("FATAL: {error}");
             std::process::exit(1);
         }
@@ -654,9 +671,17 @@ async fn main() {
     let env = config::environment();
     let runtime = runtime::initialize_repository(env, VERSION).await;
     let repo = runtime.repo;
+    // Local runtime health is implementation-level state, not a wire-protocol profile.
+    // A scheduler checkpoint and the stale-node supervisor advance independently so a
+    // notifier task cannot declare health merely because its own timer still runs.
+    let runtime_health = iicp_directory_rs::runtime_health::RuntimeHealth::new(true);
+    tokio::spawn(runtime::run_runtime_progress_loop(runtime_health.clone()));
 
     // Spawn background maintenance tasks before starting the HTTP server.
-    tokio::spawn(background::run_expire_nodes_loop(Arc::clone(&repo)));
+    tokio::spawn(background::run_expire_nodes_loop(
+        Arc::clone(&repo),
+        runtime_health.clone(),
+    ));
     tokio::spawn(background::run_reputation_decay_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_node_lifecycle_loop(Arc::clone(&repo)));
     tokio::spawn(background::run_prune_heartbeat_loop(Arc::clone(&repo)));
@@ -720,7 +745,24 @@ async fn main() {
     };
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("iicp-directory-rs {VERSION} listening on {addr}");
-    axum::serve(listener, router).await.expect("serve");
+    runtime_health.mark_running();
+    #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
+    let systemd_notifier =
+        iicp_directory_rs::systemd_notify::spawn_if_enabled(runtime_health.clone());
+
+    let shutdown_health = runtime_health.clone();
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown_health.mark_stopping();
+            #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
+            iicp_directory_rs::systemd_notify::notify_stopping();
+        }
+    });
+    server.await.expect("serve");
+    #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
+    if let Some(handle) = systemd_notifier {
+        handle.abort();
+    }
 }
 
 #[cfg(test)]

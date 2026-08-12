@@ -1,0 +1,50 @@
+{
+  "contracts": {
+    "behavior": {
+      "path": "parity/behavior-contract-v1.json",
+      "sha256": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+    },
+    "discovery_evidence": {
+      "path": "parity/discovery-evidence-v1.json",
+      "sha256": "9b7b1302ee68af4a4889074e42e123c380e4e5e5fd0c80b78050c97b13f45f0c"
+    },
+    "http": {
+      "path": "parity/http-contract-v2.json",
+      "sha256": "08edc5cf302a858e5576cb59e07f5b71657ae6015b5537999985db71cc4128f6"
+    },
+    "implementation_metadata": {
+      "path": "parity/directory-implementation-metadata-v1.json",
+      "sha256": "5bdd9ebd838cd5c4c972176fabebb4971a759b0ca69014328e8370a02d6ee08f"
+    },
+    "parity_manifest": {
+      "path": "parity/contract-v1.10.90.json",
+      "sha256": "680546d74728e7c62d59a7971613924964cbc3e03166d95a5723c99e2e4ad287"
+    },
+    "replica_lifecycle": {
+      "path": "parity/replica-lifecycle-contract-v1.json",
+      "sha256": "9ae2e3536891c3488a2b4d04e543364359a2b9a2c389203ece0eaca1a341b541"
+    },
+    "replica_token": {
+      "path": "parity/federation-profile-v1.json",
+      "sha256": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9"
+    },
+    "schema": {
+      "path": "schema/contract-v1.json",
+      "sha256": "6c351a3c5de1d6f6a4d7a1e2c0d35f92b2f6a57b20f5dc40719c39086734382d"
+    }
+  },
+  "genesis_cutover_authorized": false,
+  "implementation": {
+    "flavor": "rust",
+    "status": "operator_preview",
+    "version": "0.1.11"
+  },
+  "minimum_sdk_version": "0.7.102",
+  "php_deprecation_authorized": false,
+  "php_parity_baseline": {
+    "commit": "afe8b5c7c66c04cd4bed6e9b640e9a20bafe067c",
+    "version": "1.10.90"
+  },
+  "production_authority": false,
+  "schema": "iicp.directory-implementation-compatibility.v1"
+}

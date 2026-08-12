@@ -1,5 +1,6 @@
 //! Process startup and database-backed operational command composition.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use sqlx::{MySql, Pool};
@@ -8,6 +9,81 @@ use crate::cli::Command;
 use crate::repo::{InMemoryRepo, NodeRepository};
 use crate::validate::Env;
 use crate::{db, maintenance, schema};
+use iicp_directory_rs::runtime_health::RuntimeHealth;
+
+/// Advance a monotonic scheduler checkpoint independently of the notifier timer.
+/// The stale-node loop advances the separate supervisor checkpoint.
+pub(crate) async fn run_runtime_progress_loop(health: RuntimeHealth) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        health.advance_runtime();
+        let snapshot = health.snapshot();
+        if let Err(error) = iicp_directory_rs::runtime_health::write_snapshot_atomic(
+            &runtime_health_path(None),
+            &snapshot,
+        ) {
+            eprintln!("[runtime_health] snapshot write failed: {error}");
+        }
+    }
+}
+
+pub(crate) fn runtime_health_path(explicit: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or_else(|| std::env::var_os("IICP_RUNTIME_HEALTH_FILE").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .map(|root| root.join("iicp-directory-rs/health.json"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|root| root.join(".local/state/iicp-directory-rs/health.json"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp/iicp-directory-rs-health.json"))
+}
+
+pub(crate) fn run_healthcheck(
+    explicit: Option<PathBuf>,
+    require_ready: bool,
+    json: bool,
+) -> Result<i32, String> {
+    use iicp_directory_rs::runtime_health::{HealthSnapshot, Liveness, Readiness};
+    let path = runtime_health_path(explicit);
+    let raw =
+        std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let snapshot: HealthSnapshot =
+        serde_json::from_slice(&raw).map_err(|error| format!("invalid snapshot: {error}"))?;
+    let age = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .map_err(|error| format!("cannot establish snapshot freshness: {error}"))?;
+    let stale = age.as_millis() > u128::from(snapshot.progress.runtime.stale_after_ms);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "IICP Rust directory health\n  liveness  {:?}\n  readiness {:?}\n  reasons   {:?}",
+            snapshot.liveness, snapshot.readiness, snapshot.reason_codes
+        );
+    }
+    if stale {
+        return Ok(1);
+    }
+    Ok(if require_ready {
+        i32::from(snapshot.readiness != Readiness::Ready)
+    } else {
+        match snapshot.liveness {
+            Liveness::Live => 0,
+            Liveness::NotLive => 1,
+            _ => 2,
+        }
+    })
+}
 
 pub(crate) struct RepositoryRuntime {
     pub(crate) repo: Arc<dyn NodeRepository>,
@@ -79,6 +155,15 @@ async fn verified_operational_pool() -> Result<Pool<MySql>, String> {
 pub(crate) async fn run_operational_command(command: Command) -> Result<(), String> {
     let pool = verified_operational_pool().await?;
     let (value, json_requested) = match command {
+        Command::Service { .. } => {
+            return Err("service commands must be dispatched before database initialization".into())
+        }
+        Command::Healthcheck { .. } => {
+            return Err("healthcheck must be dispatched before database initialization".into())
+        }
+        Command::Update { .. } => {
+            return Err("update commands must be dispatched before database initialization".into())
+        }
         Command::DbMaintenanceStatus { retention, json } => (
             serde_json::to_value(
                 maintenance::maintenance_status(&pool, retention.policy())
