@@ -51,6 +51,10 @@ pub struct Node {
     /// Models declared by the node's capabilities (PHP discover includes this).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// Additive capability profiles for the intent selected by discovery.
+    /// Unknown profiles are metadata only and never enable behavior implicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_profiles: Vec<String>,
     /// ADR-019 pricing metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<serde_json::Value>,

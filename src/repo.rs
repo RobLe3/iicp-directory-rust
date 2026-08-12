@@ -8,6 +8,7 @@
 use crate::types::Node;
 use async_trait::async_trait;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 pub(crate) const DSR_RETENTION_REASON: &str = "Minimal ledger/security/accounting records retained; public/operator-identifying fields removed or restricted where possible.";
 
@@ -44,6 +45,8 @@ pub(crate) fn dispatch_usage_summary_value(
 pub struct NodeRecord {
     pub node: Node,
     pub intents: Vec<String>,
+    /// Per-intent additive capability profiles advertised at registration.
+    pub capability_profiles: HashMap<String, Vec<String>>,
     pub availability: Vec<AvailabilityWindow>,
     /// Plain token issued to the caller. The repository SHOULD hash this at rest;
     /// InMemoryRepo ignores it (no token auth in local/test mode).
@@ -1094,7 +1097,15 @@ impl NodeRepository for InMemoryRepo {
             })
             // NOTE: region is a preference, not an exclusion (iicp-dir §3.3) — no filter.
             // A future scoring pass may boost region matches; it must not drop non-matches.
-            .map(|r| r.node.clone())
+            .map(|r| {
+                let mut node = r.node.clone();
+                node.supported_profiles = r
+                    .capability_profiles
+                    .get(&q.intent)
+                    .cloned()
+                    .unwrap_or_default();
+                node
+            })
             .collect();
 
         // Sort by score descending; stable so equal scores keep insertion order.
@@ -1153,10 +1164,13 @@ impl NodeRepository for InMemoryRepo {
 
     async fn get(&self, node_id: &str) -> Option<Node> {
         let guard = self.records.lock().unwrap();
-        guard
-            .iter()
-            .find(|r| r.node.node_id == node_id)
-            .map(|r| r.node.clone())
+        guard.iter().find(|r| r.node.node_id == node_id).map(|r| {
+            let mut node = r.node.clone();
+            node.supported_profiles = r.capability_profiles.values().flatten().cloned().collect();
+            node.supported_profiles.sort();
+            node.supported_profiles.dedup();
+            node
+        })
     }
 
     async fn node_by_prefix(&self, prefix: &str) -> Option<Node> {
@@ -1170,7 +1184,14 @@ impl NodeRepository for InMemoryRepo {
                     .iter()
                     .find(|r| r.node.available && r.node.node_id.starts_with(prefix))
             })
-            .map(|r| r.node.clone())
+            .map(|r| {
+                let mut node = r.node.clone();
+                node.supported_profiles =
+                    r.capability_profiles.values().flatten().cloned().collect();
+                node.supported_profiles.sort();
+                node.supported_profiles.dedup();
+                node
+            })
     }
 
     async fn active_count(&self) -> u32 {
@@ -2252,6 +2273,7 @@ mod tests {
             transport_endpoint: None,
             cip_conformance_level: Some("CIP-None".to_string()),
             models: vec![],
+            supported_profiles: vec![],
             pricing: None,
             nat_type: None,
             transport_method: None,
@@ -2294,6 +2316,7 @@ mod tests {
         NodeRecord {
             node: node(id, score, available, rep),
             intents: intents.iter().map(|s| s.to_string()).collect(),
+            capability_profiles: std::collections::HashMap::new(),
             availability: vec![],
             node_token: None,
             node_hmac_key: None,
@@ -2302,6 +2325,36 @@ mod tests {
     }
 
     const CHAT: &str = "urn:iicp:intent:llm:chat:v1";
+
+    #[tokio::test]
+    async fn discover_projects_profiles_for_the_selected_capability_only() {
+        let mut record = rec(
+            "profiled",
+            0.9,
+            true,
+            0.8,
+            &[CHAT, "urn:iicp:intent:embed:v1"],
+        );
+        record.capability_profiles.insert(
+            CHAT.to_string(),
+            vec!["urn:iicp:profile:service-lifecycle:v1".to_string()],
+        );
+        record.capability_profiles.insert(
+            "urn:iicp:intent:embed:v1".to_string(),
+            vec!["urn:iicp:profile:embedding-batch-v1".to_string()],
+        );
+        let repo = InMemoryRepo::new(vec![record]);
+        let nodes = repo
+            .discover(&DiscoverQuery {
+                intent: CHAT.to_string(),
+                ..DiscoverQuery::default()
+            })
+            .await;
+        assert_eq!(
+            nodes[0].supported_profiles,
+            vec!["urn:iicp:profile:service-lifecycle:v1"]
+        );
+    }
 
     #[tokio::test]
     async fn list_public_lists_available_excludes_unavailable() {

@@ -395,6 +395,35 @@ fn intents_from_payload(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn capability_profiles_from_payload(
+    payload: &Value,
+) -> std::collections::HashMap<String, Vec<String>> {
+    payload
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(|capability| {
+                    let intent = capability.get("intent")?.as_str()?.to_string();
+                    let profiles = capability
+                        .get("supported_profiles")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some((intent, profiles))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Build a replicated `Node` from a REGISTER event payload. Fields the event carries
 /// are taken from it; the rest get federation-sensible defaults (score 0.5 so the node
 /// is discoverable; reputation refines via later REPUTATION events).
@@ -485,6 +514,7 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         transport_endpoint: None,
         cip_conformance_level,
         models,
+        supported_profiles: vec![],
         pricing: payload.get("pricing").cloned(),
         nat_type: None,
         transport_method: None,
@@ -577,6 +607,7 @@ async fn apply_register(repo: &dyn NodeRepository, ev: &FederatedEvent) -> Apply
         .register(NodeRecord {
             node,
             intents: intents_from_payload(&ev.payload),
+            capability_profiles: capability_profiles_from_payload(&ev.payload),
             availability: vec![],
             node_token: None, // replica never issues tokens; writes 307 to seed
             node_hmac_key: None,
@@ -807,6 +838,7 @@ pub async fn apply_snapshot(repo: &dyn NodeRepository, snapshot: &Value) -> usiz
     use std::collections::HashMap;
     // node_id → intents, from the capabilities[] array.
     let mut intents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut capability_profiles: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     if let Some(caps) = snapshot.get("capabilities").and_then(Value::as_array) {
         for c in caps {
             if let (Some(nid), Some(intent)) = (
@@ -817,6 +849,21 @@ pub async fn apply_snapshot(repo: &dyn NodeRepository, snapshot: &Value) -> usiz
                     .entry(nid.to_string())
                     .or_default()
                     .push(intent.to_string());
+                let profiles = c
+                    .get("supported_profiles")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                capability_profiles
+                    .entry(nid.to_string())
+                    .or_default()
+                    .insert(intent.to_string(), profiles);
             }
         }
     }
@@ -841,6 +888,10 @@ pub async fn apply_snapshot(repo: &dyn NodeRepository, snapshot: &Value) -> usiz
                 repo.register(NodeRecord {
                     node,
                     intents: intents.get(node_id).cloned().unwrap_or_default(),
+                    capability_profiles: capability_profiles
+                        .get(node_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     availability: vec![],
                     node_token: None,
                     node_hmac_key: None,

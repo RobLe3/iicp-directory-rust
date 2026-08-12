@@ -119,12 +119,20 @@ async fn replace_relations(
         .map_err(|_| RepoError::Persistence)?;
     let models = serde_json::to_string(&rec.node.models).map_err(|_| RepoError::Persistence)?;
     for intent in &rec.intents {
+        let supported_profiles = serde_json::to_string(
+            rec.capability_profiles
+                .get(intent)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+        .map_err(|_| RepoError::Persistence)?;
         sqlx::query(
-            "INSERT INTO capabilities (node_id, intent, models, max_tokens) VALUES (?, ?, ?, 0)",
+            "INSERT INTO capabilities (node_id, intent, models, max_tokens, supported_profiles) VALUES (?, ?, ?, 0, ?)",
         )
         .bind(&rec.node.node_id)
         .bind(intent)
         .bind(&models)
+        .bind(&supported_profiles)
         .execute(&mut **transaction)
         .await
         .map_err(|_| RepoError::Persistence)?;

@@ -39,6 +39,9 @@ pub(crate) struct Capability {
     /// Inference engine name (e.g. "llama.cpp") for this capability.
     #[serde(default)]
     inference_engine: Option<String>,
+    /// Additive, pre-normative execution profiles. They are projected as metadata only.
+    #[serde(default)]
+    supported_profiles: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,6 +290,7 @@ pub(crate) struct PendingRegistration {
     request: RegisterRequest,
     node: types::Node,
     intents: Vec<String>,
+    capability_profiles: std::collections::HashMap<String, Vec<String>>,
     availability: Vec<repo::AvailabilityWindow>,
     node_id: String,
     node_token: String,
@@ -445,6 +449,28 @@ fn validate_registration_capabilities(
         {
             return Some(policy_reject(&classification));
         }
+        if capability.supported_profiles.len() > 16
+            || capability.supported_profiles.iter().any(|profile| {
+                profile.len() > 160
+                    || !profile.starts_with("urn:iicp:profile:")
+                    || profile[17..].is_empty()
+                    || !profile[17..].bytes().enumerate().all(|(index, byte)| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
+                    })
+            })
+            || {
+                let unique: std::collections::HashSet<_> =
+                    capability.supported_profiles.iter().collect();
+                unique.len() != capability.supported_profiles.len()
+            }
+        {
+            return Some(reject(
+                "validation_error",
+                "invalid capability supported_profiles",
+            ));
+        }
     }
     None
 }
@@ -459,6 +485,7 @@ async fn commit_registration(
         .register(repo::NodeRecord {
             node: pending.node,
             intents: pending.intents,
+            capability_profiles: pending.capability_profiles,
             availability: pending.availability,
             node_token: Some(pending.node_token.clone()),
             node_hmac_key: Some(pending.node_hmac_key.clone()),
@@ -505,6 +532,7 @@ async fn commit_registration(
             "capabilities": pending.request.capabilities.iter().map(|capability| serde_json::json!({
                 "intent": capability.intent,
                 "models": capability.models,
+                "supported_profiles": capability.supported_profiles,
             })).collect::<Vec<_>>(),
         }),
     )
@@ -807,6 +835,7 @@ pub(crate) async fn register(
         transport_endpoint: req.transport_endpoint.clone(),
         cip_conformance_level: Some("CIP-None".into()),
         models: advertised_models,
+        supported_profiles: vec![],
         pricing: None,
         cip_policy: Some(serde_json::json!({
             "allow_remote_inference": false,
@@ -886,6 +915,16 @@ pub(crate) async fn register(
         routing_policy: types::RoutingPolicyState::default(),
     };
     let intents = req.capabilities.iter().map(|c| c.intent.clone()).collect();
+    let capability_profiles = req
+        .capabilities
+        .iter()
+        .map(|capability| {
+            (
+                capability.intent.clone(),
+                capability.supported_profiles.clone(),
+            )
+        })
+        .collect();
     let availability = req
         .availability
         .iter()
@@ -902,6 +941,7 @@ pub(crate) async fn register(
             request: req,
             node,
             intents,
+            capability_profiles,
             availability,
             node_id,
             node_token,

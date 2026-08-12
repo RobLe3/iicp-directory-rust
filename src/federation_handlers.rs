@@ -160,7 +160,15 @@ pub(crate) async fn snapshot(
             "pricing": n.pricing,
         }));
         for intent in &r.intents {
-            capabilities.push(serde_json::json!({ "node_id": n.node_id, "intent": intent }));
+            capabilities.push(serde_json::json!({
+                "node_id": n.node_id,
+                "intent": intent,
+                "supported_profiles": r
+                    .capability_profiles
+                    .get(intent)
+                    .cloned()
+                    .unwrap_or_default(),
+            }));
         }
     }
     let ts_ms = std::time::SystemTime::now()
