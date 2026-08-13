@@ -180,9 +180,9 @@ pub trait NodeRepository: Send + Sync {
     /// Remove a node from the directory (iicp-dir §3.6 deregister). Returns true if found.
     async fn deregister(&self, node_id: &str) -> bool;
 
-    /// Verify that `token` is valid for `node_id`. InMemoryRepo always returns true
-    /// (no token validation in local/test mode). MySqlRepo compares against node_token_hash.
-    /// Phase 4 upgrades this to bcrypt::verify once the hash function is changed.
+    /// Verify that `token` is valid for `node_id`. InMemoryRepo is permissive
+    /// by default and can opt into plaintext-token checks for focused lifecycle
+    /// tests. MySqlRepo compares against node_token_hash.
     async fn verify_node_token(&self, node_id: &str, token: &str) -> bool;
 
     /// Return active peers not in `known_ids` for the PEER_EXCHANGE endpoint (iicp-dir §3.5).
@@ -869,6 +869,9 @@ type ReplicaTuple = (String, String, String, String, i64);
 #[derive(Debug, Default)]
 pub struct InMemoryRepo {
     records: std::sync::Mutex<Vec<NodeRecord>>,
+    /// Optional strict token checking for HTTP lifecycle canaries. Ordinary
+    /// in-memory tests retain the historical permissive behavior.
+    verify_tokens: bool,
     /// Outstanding ADR-047 challenge by node ID. Kept separate from the public node model.
     liveness_challenges: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// ADR-048 (#374): per-(node, evaluator) health snapshots —
@@ -916,6 +919,7 @@ impl InMemoryRepo {
     pub fn new(records: Vec<NodeRecord>) -> Self {
         Self {
             records: std::sync::Mutex::new(records),
+            verify_tokens: false,
             liveness_challenges: std::sync::Mutex::new(std::collections::HashMap::new()),
             health_obs: std::sync::Mutex::new(Vec::new()),
             replicas: std::sync::Mutex::new(Vec::new()),
@@ -925,6 +929,14 @@ impl InMemoryRepo {
             operators: std::sync::Mutex::new(std::collections::HashMap::new()),
             dispatch_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
             probe_results: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_token_verification(records: Vec<NodeRecord>) -> Self {
+        Self {
+            verify_tokens: true,
+            ..Self::new(records)
         }
     }
 }
@@ -1225,9 +1237,24 @@ impl NodeRepository for InMemoryRepo {
         guard.len() < before
     }
 
-    /// InMemoryRepo: skip token validation — all tokens accepted in local/test mode.
-    async fn verify_node_token(&self, _node_id: &str, _token: &str) -> bool {
-        true
+    /// InMemoryRepo keeps issued tokens only in process memory.  Comparing them
+    /// gives HTTP lifecycle tests realistic rotation/replay behavior without
+    /// weakening the production bcrypt-backed repository.
+    async fn verify_node_token(&self, node_id: &str, token: &str) -> bool {
+        if !self.verify_tokens {
+            return true;
+        }
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|record| record.node.node_id == node_id)
+            .is_some_and(|record| {
+                record
+                    .node_token
+                    .as_deref()
+                    .is_none_or(|expected| expected == token)
+            })
     }
 
     async fn peers_excluding(&self, known_ids: &[String], limit: usize) -> Vec<Node> {
