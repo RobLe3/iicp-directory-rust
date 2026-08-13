@@ -3283,6 +3283,133 @@ fn e050_strict_shared_parity_fixture() {
     }
 }
 
+fn strict_e050_http_state() -> AppState {
+    AppState {
+        repo: Arc::new(InMemoryRepo::new_with_token_verification(vec![])),
+        env: Env::Production,
+        signing_key: None,
+        directory_did: DEFAULT_DIRECTORY_DID.to_string(),
+        directory_service_endpoint: "https://iicp.network/v1".to_string(),
+        register_rate: new_register_rate(),
+        strict_e050_secured: true,
+        allow_insecure_tls: false,
+        skip_liveness_check: true,
+    }
+}
+
+fn strict_e050_body(node_id: &str, endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": node_id,
+        "endpoint": endpoint,
+        "region": "eu-central",
+        "limits": {"max_concurrent": 1, "tokens_per_min": 1000},
+        "cx_public_key": {"algorithm": "X25519", "key": "test-public-key"},
+        "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]
+    })
+}
+
+async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn e050_strict_http_rejects_missing_and_malformed_tokens_without_rotation() {
+    let state = strict_e050_http_state();
+    let router = app(state.clone());
+    let first = router
+        .clone()
+        .oneshot(post_register(strict_e050_body(
+            "strict-http-missing",
+            "https://1.1.1.1",
+        )))
+        .await
+        .unwrap();
+    if first.status() != StatusCode::CREATED {
+        panic!("first registration failed: {}", response_json(first).await);
+    }
+    let first_token = response_json(first).await["node_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let missing = router
+        .clone()
+        .oneshot(post_register(strict_e050_body(
+            "strict-http-missing",
+            "https://1.1.1.1",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response_json(missing).await["error"], "IICP-E050");
+
+    let mut malformed_body = strict_e050_body("strict-http-missing", "https://8.8.8.8");
+    malformed_body["current_node_token"] = serde_json::json!("malformed-token");
+    let malformed = router.oneshot(post_register(malformed_body)).await.unwrap();
+    assert_eq!(malformed.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response_json(malformed).await["error"], "IICP-E050");
+    assert!(
+        state
+            .repo
+            .verify_node_token("strict-http-missing", &first_token)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn e050_strict_http_rotates_valid_token_and_rejects_stale_replay() {
+    let state = strict_e050_http_state();
+    let router = app(state.clone());
+    let first = router
+        .clone()
+        .oneshot(post_register(strict_e050_body(
+            "strict-http-replay",
+            "https://1.1.1.1",
+        )))
+        .await
+        .unwrap();
+    if first.status() != StatusCode::CREATED {
+        panic!("first registration failed: {}", response_json(first).await);
+    }
+    let first_token = response_json(first).await["node_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut refresh_body = strict_e050_body("strict-http-replay", "https://8.8.8.8");
+    refresh_body["current_node_token"] = serde_json::json!(first_token);
+    let refresh = router
+        .clone()
+        .oneshot(post_register(refresh_body))
+        .await
+        .unwrap();
+    assert_eq!(refresh.status(), StatusCode::CREATED);
+    let new_token = response_json(refresh).await["node_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first_token, new_token);
+
+    let mut replay_body = strict_e050_body("strict-http-replay", "https://9.9.9.9");
+    replay_body["current_node_token"] = serde_json::json!(first_token);
+    let replay = router.oneshot(post_register(replay_body)).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response_json(replay).await["error"], "IICP-E050");
+    assert!(
+        !state
+            .repo
+            .verify_node_token("strict-http-replay", &first_token)
+            .await
+    );
+    assert!(
+        state
+            .repo
+            .verify_node_token("strict-http-replay", &new_token)
+            .await
+    );
+}
+
 #[tokio::test]
 async fn stats_returns_active_node_count() {
     // test_state has 2 available nodes → active_count() = 2.
