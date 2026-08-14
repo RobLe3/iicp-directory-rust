@@ -26,7 +26,18 @@ def fixture_root() -> Path:
 def test_current_contract_passes() -> tuple[bool, str]:
     root = fixture_root()
     try:
-        return "PASS" in compatibility.verify(root, "v0.1.10.json"), "current nested fixture contract passes"
+        return "PASS" in compatibility.verify(root, "v0.1.12.json"), "current nested fixture contract passes"
+    finally:
+        shutil.rmtree(root.parent)
+
+
+def test_current_release_accepts_safe_nested_fixture_paths() -> tuple[bool, str]:
+    root = fixture_root()
+    try:
+        return (
+            "PASS" in compatibility.verify(root, "v0.1.12.json"),
+            "current release accepts pinned effective-capability fixture paths",
+        )
     finally:
         shutil.rmtree(root.parent)
 
@@ -37,7 +48,7 @@ def test_tampered_nested_fixture_fails() -> tuple[bool, str]:
         target = root / "parity" / "replica-lifecycle-contract-v1.json"
         target.write_text(target.read_text(encoding="utf-8") + "\n", encoding="utf-8")
         try:
-            compatibility.verify(root, "v0.1.10.json")
+            compatibility.verify(root, "v0.1.12.json")
         except ValueError as exc:
             return "nested fixture digest mismatch" in str(exc), str(exc)
         return False, "tampered nested fixture was accepted"
@@ -48,16 +59,16 @@ def test_tampered_nested_fixture_fails() -> tuple[bool, str]:
 def test_truncated_nested_digest_fails() -> tuple[bool, str]:
     root = fixture_root()
     try:
-        contract = root / "parity" / "contract-v1.10.89.json"
+        contract = root / "parity" / "contract-v1.10.91.json"
         payload = json.loads(contract.read_text(encoding="utf-8"))
         payload["fixtures"]["replica-lifecycle-contract-v1.json"] = "a" * 48
         contract.write_text(json.dumps(payload), encoding="utf-8")
-        manifest = root / "compatibility" / "v0.1.10.json"
+        manifest = root / "compatibility" / "v0.1.12.json"
         compat = json.loads(manifest.read_text(encoding="utf-8"))
         compat["contracts"]["parity_manifest"]["sha256"] = compatibility.sha256(contract)
         manifest.write_text(json.dumps(compat), encoding="utf-8")
         try:
-            compatibility.verify(root, "v0.1.10.json")
+            compatibility.verify(root, "v0.1.12.json")
         except ValueError as exc:
             return "nested fixture digest must be" in str(exc), str(exc)
         return False, "truncated nested digest was accepted"
@@ -69,16 +80,16 @@ def test_truncated_nested_digest_fails() -> tuple[bool, str]:
 def test_missing_nested_fixture_fails() -> tuple[bool, str]:
     root = fixture_root()
     try:
-        contract = root / "parity" / "contract-v1.10.89.json"
+        contract = root / "parity" / "contract-v1.10.91.json"
         payload = json.loads(contract.read_text(encoding="utf-8"))
         payload["fixtures"]["missing.json"] = "a" * 64
         contract.write_text(json.dumps(payload), encoding="utf-8")
-        manifest = root / "compatibility" / "v0.1.10.json"
+        manifest = root / "compatibility" / "v0.1.12.json"
         compat = json.loads(manifest.read_text(encoding="utf-8"))
         compat["contracts"]["parity_manifest"]["sha256"] = compatibility.sha256(contract)
         manifest.write_text(json.dumps(compat), encoding="utf-8")
         try:
-            compatibility.verify(root, "v0.1.10.json")
+            compatibility.verify(root, "v0.1.12.json")
         except ValueError as exc:
             return "nested fixture is missing" in str(exc), str(exc)
         return False, "missing nested fixture was accepted"
@@ -89,17 +100,17 @@ def test_missing_nested_fixture_fails() -> tuple[bool, str]:
 def test_substituted_nested_fixture_name_fails() -> tuple[bool, str]:
     root = fixture_root()
     try:
-        contract = root / "parity" / "contract-v1.10.89.json"
+        contract = root / "parity" / "contract-v1.10.91.json"
         payload = json.loads(contract.read_text(encoding="utf-8"))
         digest = payload["fixtures"].pop("replica-lifecycle-contract-v1.json")
         payload["fixtures"]["../schema/contract-v1.json"] = digest
         contract.write_text(json.dumps(payload), encoding="utf-8")
-        manifest = root / "compatibility" / "v0.1.10.json"
+        manifest = root / "compatibility" / "v0.1.12.json"
         compat = json.loads(manifest.read_text(encoding="utf-8"))
         compat["contracts"]["parity_manifest"]["sha256"] = compatibility.sha256(contract)
         manifest.write_text(json.dumps(compat), encoding="utf-8")
         try:
-            compatibility.verify(root, "v0.1.10.json")
+            compatibility.verify(root, "v0.1.12.json")
         except ValueError as exc:
             return "nested fixture name must be" in str(exc), str(exc)
         return False, "substituted nested fixture path was accepted"
@@ -108,7 +119,14 @@ def test_substituted_nested_fixture_name_fails() -> tuple[bool, str]:
 
 def main() -> int:
     failed = []
-    for name, test in (("current_contract", test_current_contract_passes), ("tampered_nested", test_tampered_nested_fixture_fails), ("truncated_digest", test_truncated_nested_digest_fails), ("missing_nested", test_missing_nested_fixture_fails), ("substituted_name", test_substituted_nested_fixture_name_fails)):
+    for name, test in (
+        ("current_contract", test_current_contract_passes),
+        ("safe_nested_path", test_current_release_accepts_safe_nested_fixture_paths),
+        ("tampered_nested", test_tampered_nested_fixture_fails),
+        ("truncated_digest", test_truncated_nested_digest_fails),
+        ("missing_nested", test_missing_nested_fixture_fails),
+        ("substituted_name", test_substituted_nested_fixture_name_fails),
+    ):
         ok, detail = test()
         print(f"{'✓' if ok else '✗'} {name}: {detail}")
         if not ok:

@@ -1,10 +1,9 @@
 # iicp-directory-rust — PHP Feature Parity Checklist
 
-Last refreshed: **2026-08-13**. Rust `v0.1.11` pins the shared
-`contract-v1.10.90.json`, whose PHP runtime authority is `v1.10.90`. The
-release adds bounded-stats parity, local runtime-health and service-lifecycle
-evidence without rewriting the immutable HTTP and behavior fixtures that those
-contracts reference. Older contracts remain immutable evidence; none
+Last refreshed: **2026-08-14**. Rust `v0.1.12` pins the shared
+`contract-v1.10.91.json`, whose PHP runtime authority is `v1.10.91`. The
+release adds effective-capability and directory-state parity without rewriting
+the immutable HTTP and behavior fixtures that those contracts reference. Older contracts remain immutable evidence; none
 authorizes a production cutover.
 
 > **Status:** this Rust implementation is the second official directory

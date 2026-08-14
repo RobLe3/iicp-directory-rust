@@ -18,8 +18,13 @@ def sha256(path: Path) -> str:
 
 def checked_child(root: Path, parent: Path, name: str) -> Path:
     """Resolve a nested fixture without allowing it to leave the checkout."""
-    if Path(name).name != name:
-        raise ValueError(f"nested fixture name must be a file name: {name!r}")
+    relative = Path(name)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in ("", ".", "..") for part in relative.parts)
+    ):
+        raise ValueError(f"nested fixture name must be a safe relative path: {name!r}")
     child = (parent / name).resolve()
     if root.resolve() not in child.parents:
         raise ValueError(f"nested fixture path escapes repository: {name!r}")
