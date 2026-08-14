@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.12 — 2026-08-14
+
+- Implements shared effective-capability-v1 persistence, projection and same-intent variant matching, including bounded provenance and optional extension preservation.
+- Aligns heartbeat reactivation, active probing and conservative relay eligibility with the shared directory-state contract.
+- Adds the expand-first capability schema migration and pins PHP v1.10.91 parity without authorizing Genesis cutover.
+- Advances additive SDK release-currency evidence to the coordinated 0.7.104 candidate.
+
 ## 0.1.11 — 2026-08-12
 
 - Adds an OS-independent local runtime-health snapshot, healthcheck command and

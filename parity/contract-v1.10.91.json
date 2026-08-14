@@ -1,0 +1,27 @@
+{
+  "authority": {
+    "php_commit": "bd78380",
+    "runtime_version": "v1.10.91"
+  },
+  "contract_version": "v1.10.91",
+  "fixtures": {
+    "behavior-contract-v1.json": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+    "directory-implementation-metadata-v1.json": "5bdd9ebd838cd5c4c972176fabebb4971a759b0ca69014328e8370a02d6ee08f",
+    "discovery-evidence-v1.json": "f0471a45a1177c491581dc522b7d974e7c112f78d8e2b045f4cf7ce1d3bb1e5f",
+    "dsr-related-records-v1.json": "7bd168004f557ec4979c6d3289d38b4478a02d7a486c8a0ef107a35e556a39ab",
+    "federation-profile-v1.json": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9",
+    "http-contract-v2.json": "08edc5cf302a858e5576cb59e07f5b71657ae6015b5537999985db71cc4128f6",
+    "replica-lifecycle-contract-v1.json": "9ae2e3536891c3488a2b4d04e543364359a2b9a2c389203ece0eaca1a341b541",
+    "effective-capability-v1/advertisement-schema.json": "707da7eebc5e8b55a720386ca713c977beeadd640f4b09eb48ea99573d2b1ab0",
+    "effective-capability-v1/fixture.json": "e6e3c32aa7c4cf814e639d3a97cd1c1cb49ac020ed6ebe7e1e16bc2314e14761",
+    "effective-capability-v1/refusal-schema.json": "5d35b57c31eeb176bd7db72bfaf1ccaa84defe864bc63a10c59b97d689e52f9e",
+    "effective-capability-v1/requirements-schema.json": "0d234ef4de420b977661d3222c3c9f433332e8224a3320175318338c76e760e9"
+  },
+  "scope": [
+    "effective_capability_v1",
+    "same_intent_variant_matching",
+    "capability_version_phase_persistence",
+    "additive_schema_migration",
+    "legacy_discovery_compatible"
+  ]
+}

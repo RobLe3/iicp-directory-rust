@@ -10,7 +10,7 @@ fn discovery_evidence_fixture_is_content_free_and_pins_parity_values() {
         fixture["invariants"]["sdk_compatibility_baseline"],
         "0.7.68"
     );
-    assert_eq!(fixture["invariants"]["sdk_latest_known_version"], "0.7.101");
+    assert_eq!(fixture["invariants"]["sdk_latest_known_version"], "0.7.104");
     assert_eq!(
         fixture["invariants"]["failure_domain_basis"],
         "not_attested"
