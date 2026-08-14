@@ -159,16 +159,24 @@ pub(crate) async fn snapshot(
             "cip_policy": n.cip_policy,
             "pricing": n.pricing,
         }));
-        for intent in &r.intents {
-            capabilities.push(serde_json::json!({
-                "node_id": n.node_id,
-                "intent": intent,
-                "supported_profiles": r
-                    .capability_profiles
-                    .get(intent)
-                    .cloned()
-                    .unwrap_or_default(),
-            }));
+        if r.capabilities.is_empty() {
+            for intent in &r.intents {
+                capabilities.push(serde_json::json!({
+                    "node_id": n.node_id,
+                    "intent": intent,
+                    "supported_profiles": r
+                        .capability_profiles
+                        .get(intent)
+                        .cloned()
+                        .unwrap_or_default(),
+                }));
+            }
+        } else {
+            for capability in &r.capabilities {
+                let mut value = serde_json::to_value(capability).unwrap_or_default();
+                value["node_id"] = serde_json::json!(n.node_id);
+                capabilities.push(value);
+            }
         }
     }
     let ts_ms = std::time::SystemTime::now()

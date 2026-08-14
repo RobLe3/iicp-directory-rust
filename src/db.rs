@@ -550,6 +550,56 @@ struct HeartbeatStateRow {
     dormant_since: Option<chrono::NaiveDateTime>,
 }
 
+#[derive(sqlx::FromRow)]
+struct CapabilityRow {
+    intent: String,
+    capability_version: Option<String>,
+    capability_phase: Option<u32>,
+    variant_id: Option<String>,
+    models: String,
+    max_tokens: u32,
+    input_modalities: Option<String>,
+    output_modalities: Option<String>,
+    features: Option<String>,
+    execution_capabilities: Option<String>,
+    capability_limits: Option<String>,
+    supported_profiles: Option<String>,
+    claim_provenance: Option<String>,
+    extensions: Option<String>,
+    quantization: Option<String>,
+    inference_engine: Option<String>,
+}
+
+impl From<CapabilityRow> for crate::types::EffectiveCapability {
+    fn from(row: CapabilityRow) -> Self {
+        fn parse<T: serde::de::DeserializeOwned + Default>(raw: Option<&str>) -> T {
+            raw.and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_default()
+        }
+        Self {
+            intent: row.intent,
+            version: row.capability_version,
+            phase: row.capability_phase,
+            variant_id: row.variant_id,
+            models: serde_json::from_str(&row.models).unwrap_or_default(),
+            max_tokens: (row.max_tokens > 0).then_some(row.max_tokens),
+            quantization: row.quantization,
+            inference_engine: row.inference_engine,
+            input_modalities: parse(row.input_modalities.as_deref()),
+            output_modalities: parse(row.output_modalities.as_deref()),
+            features: parse(row.features.as_deref()),
+            execution_capabilities: parse(row.execution_capabilities.as_deref()),
+            limits: parse(row.capability_limits.as_deref()),
+            supported_profiles: parse(row.supported_profiles.as_deref()),
+            claim_provenance: row
+                .claim_provenance
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok()),
+            extensions: parse(row.extensions.as_deref()),
+        }
+    }
+}
+
 fn tier_from_score(s: f64) -> String {
     // PHP NodeScorer thresholds (S.12 §5.1.1 REP2, CIP spec v0.6.9).
     // "bronze" is the floor tier for all sub-Silver nodes; "none" is retired (2026-05-30).
@@ -609,6 +659,7 @@ impl From<NodeRow> for Node {
                 .as_deref()
                 .and_then(|raw| serde_json::from_str(raw).ok())
                 .unwrap_or_default(),
+            capabilities: vec![],
             pricing: None,
             // Phase 5 fields — MySQL columns pending Phase 5 migration; default None/empty.
             nat_type: None,
@@ -716,6 +767,40 @@ async fn capability_profile_union(pool: &Pool<MySql>, node_id: &str) -> Vec<Stri
     profiles.sort();
     profiles.dedup();
     profiles
+}
+
+async fn capability_records(
+    pool: &Pool<MySql>,
+    node_id: &str,
+    intent: Option<&str>,
+) -> Vec<crate::types::EffectiveCapability> {
+    let select = r#"SELECT intent, capability_version, capability_phase, variant_id,
+                           CAST(models AS CHAR) AS models, max_tokens,
+                           CAST(input_modalities AS CHAR) AS input_modalities,
+                           CAST(output_modalities AS CHAR) AS output_modalities,
+                           CAST(features AS CHAR) AS features,
+                           CAST(execution_capabilities AS CHAR) AS execution_capabilities,
+                           CAST(capability_limits AS CHAR) AS capability_limits,
+                           CAST(supported_profiles AS CHAR) AS supported_profiles,
+                           CAST(claim_provenance AS CHAR) AS claim_provenance,
+                           CAST(extensions AS CHAR) AS extensions,
+                           quantization, inference_engine
+                    FROM capabilities WHERE node_id = ?"#;
+    let rows: Vec<CapabilityRow> = if let Some(intent) = intent {
+        sqlx::query_as(&format!("{select} AND intent = ? ORDER BY id ASC"))
+            .bind(node_id)
+            .bind(intent)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+    } else {
+        sqlx::query_as(&format!("{select} ORDER BY id ASC"))
+            .bind(node_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+    };
+    rows.into_iter().map(Into::into).collect()
 }
 
 // ── MySqlRepo ─────────────────────────────────────────────────────────────────
@@ -937,7 +1022,7 @@ async fn mysql_dsr_export(
     let nodes = mysql_dsr_node_rows(pool, subject).await?;
     let capabilities = mysql_dsr_node_table_rows(
         pool,
-        "SELECT CAST(JSON_OBJECT('node_id',node_id,'intent',intent,'models',models,'max_tokens',max_tokens,'quantization',quantization,'inference_engine',inference_engine,'input_modalities',input_modalities,'supported_profiles',supported_profiles) AS CHAR) AS row_json FROM capabilities",
+        "SELECT CAST(JSON_OBJECT('node_id',node_id,'intent',intent,'version',capability_version,'phase',capability_phase,'variant_id',variant_id,'models',models,'max_tokens',max_tokens,'quantization',quantization,'inference_engine',inference_engine,'input_modalities',input_modalities,'output_modalities',output_modalities,'features',features,'execution_capabilities',execution_capabilities,'limits',capability_limits,'supported_profiles',supported_profiles,'claim_provenance',claim_provenance,'extensions',extensions) AS CHAR) AS row_json FROM capabilities",
         "node_id",
         &subject.node_ids,
         "node_id, id",
@@ -1482,8 +1567,8 @@ impl NodeRepository for MySqlRepo {
                       n.sdk_language, n.implementation_name, n.implementation_version, n.sdk_compatibility_version, n.sdk_version,
                       CAST(n.supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
                       CAST(n.health_models AS CHAR) AS health_models,
-                      CAST(c.models AS CHAR) AS capability_models,
-                      CAST(c.supported_profiles AS CHAR) AS capability_supported_profiles,
+                      CAST(NULL AS CHAR) AS capability_models,
+                      CAST(NULL AS CHAR) AS capability_supported_profiles,
                       CAST(n.backend_stability AS CHAR) AS backend_stability,
                       CAST(n.pricing_credits_per_1000 AS DOUBLE) AS pricing_credits_per_1000,
                       CAST(n.cx_public_key AS CHAR) AS cx_public_key,
@@ -1497,8 +1582,9 @@ impl NodeRepository for MySqlRepo {
                       ) AS DOUBLE) AS availability_score,
                       CAST(n.policy_manifest AS CHAR) AS policy_manifest
                FROM nodes n
-               INNER JOIN capabilities c ON c.node_id = n.id
-               WHERE c.intent = ?
+               WHERE EXISTS (
+                   SELECT 1 FROM capabilities c WHERE c.node_id = n.id AND c.intent = ?
+               )
                  AND n.available = 1
                  AND n.status = 'active'
                  AND n.endpoint_verified_dead_at IS NULL
@@ -1514,7 +1600,32 @@ impl NodeRepository for MySqlRepo {
         .await
         .unwrap_or_default();
 
-        rows.into_iter().map(Node::from).collect()
+        let mut nodes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let mut node = Node::from(row);
+            if !seen.insert(node.node_id.clone()) {
+                continue;
+            }
+            node.capabilities =
+                capability_records(&self.pool, &node.node_id, Some(&q.intent)).await;
+            node.models = node
+                .capabilities
+                .iter()
+                .flat_map(|capability| capability.models.iter().cloned())
+                .collect();
+            node.models.sort();
+            node.models.dedup();
+            node.supported_profiles = node
+                .capabilities
+                .iter()
+                .flat_map(|capability| capability.supported_profiles.iter().cloned())
+                .collect();
+            node.supported_profiles.sort();
+            node.supported_profiles.dedup();
+            nodes.push(node);
+        }
+        nodes
     }
 
     /// Register (or re-register) a node. Uses INSERT … ON DUPLICATE KEY UPDATE so that
@@ -1588,6 +1699,7 @@ impl NodeRepository for MySqlRepo {
 
         let mut node = row.map(Node::from)?;
         node.supported_profiles = capability_profile_union(&self.pool, &node.node_id).await;
+        node.capabilities = capability_records(&self.pool, &node.node_id, None).await;
         Some(node)
     }
 
@@ -1619,6 +1731,7 @@ impl NodeRepository for MySqlRepo {
 
         let mut node = row.map(Node::from)?;
         node.supported_profiles = capability_profile_union(&self.pool, &node.node_id).await;
+        node.capabilities = capability_records(&self.pool, &node.node_id, None).await;
         Some(node)
     }
 
@@ -3528,33 +3641,36 @@ impl NodeRepository for MySqlRepo {
                 .unwrap_or_default();
             capability_profiles.insert((nid, intent), parsed);
         }
-        rows.into_iter()
-            .map(|r| {
-                let node = Node::from(r);
-                let node_intents = intents.get(&node.node_id).cloned().unwrap_or_default();
-                let node_profiles = node_intents
-                    .iter()
-                    .map(|intent| {
-                        (
-                            intent.clone(),
-                            capability_profiles
-                                .get(&(node.node_id.clone(), intent.clone()))
-                                .cloned()
-                                .unwrap_or_default(),
-                        )
-                    })
-                    .collect();
-                NodeRecord {
-                    node,
-                    intents: node_intents,
-                    capability_profiles: node_profiles,
-                    availability: vec![],
-                    node_token: None,
-                    node_hmac_key: None,
-                    proxy_token: None,
-                }
-            })
-            .collect()
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut node = Node::from(row);
+            let node_intents = intents.get(&node.node_id).cloned().unwrap_or_default();
+            let node_profiles = node_intents
+                .iter()
+                .map(|intent| {
+                    (
+                        intent.clone(),
+                        capability_profiles
+                            .get(&(node.node_id.clone(), intent.clone()))
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            let capabilities = capability_records(&self.pool, &node.node_id, None).await;
+            node.capabilities = capabilities.clone();
+            records.push(NodeRecord {
+                node,
+                intents: node_intents,
+                capabilities,
+                capability_profiles: node_profiles,
+                availability: vec![],
+                node_token: None,
+                node_hmac_key: None,
+                proxy_token: None,
+            });
+        }
+        records
     }
 
     async fn rotate_reputation_windows(&self) -> u32 {
@@ -4024,7 +4140,7 @@ impl NodeRepository for MySqlRepo {
 
 #[cfg(test)]
 mod tests {
-    use super::{credit_ttl_idle, init_pool, median_outlier_weight, MySqlRepo};
+    use super::{capability_records, credit_ttl_idle, init_pool, median_outlier_weight, MySqlRepo};
     use crate::repo::{DiscoverQuery, NodeRepository, ProbeRouteTransition};
     use serde_json::Value;
     use sqlx::mysql::MySqlPoolOptions;
@@ -4059,6 +4175,60 @@ mod tests {
     fn test_signing_key() -> String {
         let public_key = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
         format!("{}{}", "11".repeat(32), public_key)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn effective_capability_variants_round_trip_disposable_mysql() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, status, available) \
+             VALUES ('effective-capability', 'https://example.invalid/v1', 'test', 'x', 1, 1, 'active', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed node");
+        sqlx::query(
+            "INSERT INTO capabilities \
+             (node_id, intent, capability_version, capability_phase, variant_id, models, max_tokens, \
+              input_modalities, output_modalities, features, execution_capabilities, capability_limits, \
+              supported_profiles, claim_provenance, extensions) \
+             VALUES ('effective-capability', 'urn:iicp:intent:llm:chat:v1', '1.0.0', 1, \
+                     'vision-tools', JSON_ARRAY('fixture-vision'), 8192, JSON_ARRAY('text','image'), \
+                     JSON_ARRAY('text'), JSON_ARRAY('structured_output','tool_calling'), JSON_ARRAY(), \
+                     JSON_OBJECT('context_tokens', JSON_OBJECT('value', 131072, 'unit', 'tokens')), \
+                     JSON_ARRAY('urn:iicp:profile:service-lifecycle:v1'), \
+                     JSON_OBJECT('source', 'runtime_introspection'), \
+                     JSON_OBJECT('org.example.optional-batching', \
+                       JSON_OBJECT('required', false, 'value', JSON_OBJECT('enabled', true))))",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed effective capability");
+
+        let capabilities = capability_records(
+            &pool,
+            "effective-capability",
+            Some("urn:iicp:intent:llm:chat:v1"),
+        )
+        .await;
+        assert_eq!(capabilities.len(), 1);
+        let capability = &capabilities[0];
+        assert_eq!(capability.variant_id.as_deref(), Some("vision-tools"));
+        assert_eq!(capability.version.as_deref(), Some("1.0.0"));
+        assert_eq!(capability.phase, Some(1));
+        assert_eq!(capability.features, ["structured_output", "tool_calling"]);
+        assert_eq!(capability.limits["context_tokens"].value, 131072.0);
+        assert_eq!(
+            capability.extensions["org.example.optional-batching"].value["enabled"],
+            true
+        );
     }
 
     #[tokio::test]

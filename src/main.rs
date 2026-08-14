@@ -17,6 +17,8 @@ mod deployment_provenance;
 mod directory_evidence;
 mod discovery;
 mod discovery_policy;
+#[allow(dead_code)] // pure pre-normative matcher; no HTTP binding is authorized yet
+mod effective_capability;
 mod federation;
 mod federation_handlers;
 mod health;

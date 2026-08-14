@@ -403,6 +403,7 @@ fn public_discover_node(value: serde_json::Value) -> serde_json::Value {
         "quantization",
         "inference_engine",
         "supported_profiles",
+        "capabilities",
         "backend",
         "cip_policy",
         "cip_conformance_level",

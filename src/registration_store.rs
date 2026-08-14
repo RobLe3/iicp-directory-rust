@@ -117,16 +117,65 @@ async fn replace_relations(
         .execute(&mut **transaction)
         .await
         .map_err(|_| RepoError::Persistence)?;
-    let models = serde_json::to_string(&rec.node.models).map_err(|_| RepoError::Persistence)?;
-    for intent in &rec.intents {
-        let supported_profiles = serde_json::to_string(
-            rec.capability_profiles
-                .get(intent)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-        .map_err(|_| RepoError::Persistence)?;
-        sqlx::query(
+    if !rec.capabilities.is_empty() {
+        for capability in &rec.capabilities {
+            let models =
+                serde_json::to_string(&capability.models).map_err(|_| RepoError::Persistence)?;
+            let input_modalities = serde_json::to_string(&capability.input_modalities)
+                .map_err(|_| RepoError::Persistence)?;
+            let output_modalities = serde_json::to_string(&capability.output_modalities)
+                .map_err(|_| RepoError::Persistence)?;
+            let features =
+                serde_json::to_string(&capability.features).map_err(|_| RepoError::Persistence)?;
+            let execution_capabilities = serde_json::to_string(&capability.execution_capabilities)
+                .map_err(|_| RepoError::Persistence)?;
+            let limits =
+                serde_json::to_string(&capability.limits).map_err(|_| RepoError::Persistence)?;
+            let supported_profiles = serde_json::to_string(&capability.supported_profiles)
+                .map_err(|_| RepoError::Persistence)?;
+            let claim_provenance = capability
+                .claim_provenance
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|_| RepoError::Persistence)?;
+            let extensions = serde_json::to_string(&capability.extensions)
+                .map_err(|_| RepoError::Persistence)?;
+            sqlx::query(
+                "INSERT INTO capabilities (node_id, intent, capability_version, capability_phase, variant_id, models, max_tokens, input_modalities, output_modalities, features, execution_capabilities, capability_limits, supported_profiles, claim_provenance, extensions, quantization, inference_engine) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.node.node_id)
+            .bind(&capability.intent)
+            .bind(&capability.version)
+            .bind(capability.phase)
+            .bind(&capability.variant_id)
+            .bind(&models)
+            .bind(capability.max_tokens.unwrap_or(0))
+            .bind(&input_modalities)
+            .bind(&output_modalities)
+            .bind(&features)
+            .bind(&execution_capabilities)
+            .bind(&limits)
+            .bind(&supported_profiles)
+            .bind(&claim_provenance)
+            .bind(&extensions)
+            .bind(&capability.quantization)
+            .bind(&capability.inference_engine)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| RepoError::Persistence)?;
+        }
+    } else {
+        let models = serde_json::to_string(&rec.node.models).map_err(|_| RepoError::Persistence)?;
+        for intent in &rec.intents {
+            let supported_profiles = serde_json::to_string(
+                rec.capability_profiles
+                    .get(intent)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+            .map_err(|_| RepoError::Persistence)?;
+            sqlx::query(
             "INSERT INTO capabilities (node_id, intent, models, max_tokens, supported_profiles) VALUES (?, ?, ?, 0, ?)",
         )
         .bind(&rec.node.node_id)
@@ -136,6 +185,7 @@ async fn replace_relations(
         .execute(&mut **transaction)
         .await
         .map_err(|_| RepoError::Persistence)?;
+        }
     }
     sqlx::query("DELETE FROM availability_windows WHERE node_id = ?")
         .bind(&rec.node.node_id)

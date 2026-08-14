@@ -424,6 +424,19 @@ fn capability_profiles_from_payload(
         .unwrap_or_default()
 }
 
+fn capabilities_from_payload(payload: &Value) -> Vec<crate::types::EffectiveCapability> {
+    payload
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(|capability| serde_json::from_value(capability.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Build a replicated `Node` from a REGISTER event payload. Fields the event carries
 /// are taken from it; the rest get federation-sensible defaults (score 0.5 so the node
 /// is discoverable; reputation refines via later REPUTATION events).
@@ -515,6 +528,7 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         cip_conformance_level,
         models,
         supported_profiles: vec![],
+        capabilities: capabilities_from_payload(payload),
         pricing: payload.get("pricing").cloned(),
         nat_type: None,
         transport_method: None,
@@ -607,6 +621,7 @@ async fn apply_register(repo: &dyn NodeRepository, ev: &FederatedEvent) -> Apply
         .register(NodeRecord {
             node,
             intents: intents_from_payload(&ev.payload),
+            capabilities: capabilities_from_payload(&ev.payload),
             capability_profiles: capability_profiles_from_payload(&ev.payload),
             availability: vec![],
             node_token: None, // replica never issues tokens; writes 307 to seed
@@ -888,6 +903,19 @@ pub async fn apply_snapshot(repo: &dyn NodeRepository, snapshot: &Value) -> usiz
                 repo.register(NodeRecord {
                     node,
                     intents: intents.get(node_id).cloned().unwrap_or_default(),
+                    capabilities: snapshot
+                        .get("capabilities")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter(|item| {
+                                    item.get("node_id").and_then(Value::as_str) == Some(node_id)
+                                })
+                                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     capability_profiles: capability_profiles
                         .get(node_id)
                         .cloned()
