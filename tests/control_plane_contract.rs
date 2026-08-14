@@ -53,4 +53,30 @@ fn rust_source_consumes_current_control_plane_contract() {
     );
     assert_eq!(dsr["record_limit_per_family"], 500);
     assert_eq!(dsr["record_families"].as_object().unwrap().len(), 11);
+
+    let expanded: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/dsr-related-records-v2.json")).unwrap();
+    assert_eq!(
+        expanded["schema"],
+        "iicp.directory.dsr-related-records-parity.v2"
+    );
+    let capability_fields = expanded["record_families"]["capabilities"]
+        .as_array()
+        .expect("capability field contract");
+    for required in [
+        "version",
+        "variant_id",
+        "output_modalities",
+        "features",
+        "execution_capabilities",
+        "limits",
+        "supported_profiles",
+        "claim_provenance",
+        "extensions",
+    ] {
+        assert!(
+            capability_fields.iter().any(|field| field == required),
+            "missing effective-capability DSR field {required}"
+        );
+    }
 }
