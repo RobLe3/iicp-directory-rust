@@ -73,6 +73,17 @@ pub enum RepoError {
     Persistence,
 }
 
+/// A transition in the independently observed direct-route state.
+///
+/// This is deliberately separate from node availability and relay capability:
+/// a failed direct route must not hide a still-valid relay route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeRouteTransition {
+    Unchanged,
+    Demoted,
+    Restored,
+}
+
 impl std::fmt::Display for RepoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "repository persistence failed")
@@ -361,6 +372,12 @@ pub trait NodeRepository: Send + Sync {
     /// Record a directory-internal reachability probe result in iicp_telemetry_probes.
     /// `passed` = TCP/HTTP connection succeeded. `test_id` = "DIR-PROBE-NODE-01".
     async fn record_probe_result(&self, node_id: &str, passed: bool, test_id: &str);
+
+    /// Apply a confirmed active-probe observation to the direct route.
+    /// Implementations must emit evidence only when the persisted route state changes.
+    async fn apply_probe_route_state(&self, _node_id: &str, _passed: bool) -> ProbeRouteTransition {
+        ProbeRouteTransition::Unchanged
+    }
 
     /// Count of probe tokens active in the last 2 hours, plus their distinct regions.
     /// Used by `/v1/stats` `probes.active_count` + `probes.regions` (PHP StatsController parity).

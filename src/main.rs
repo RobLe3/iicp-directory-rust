@@ -669,7 +669,14 @@ async fn main() {
     observability::mark_started();
     let addr = "0.0.0.0:8090";
     let env = config::environment();
-    let runtime = runtime::initialize_repository(env, VERSION).await;
+    let signing_key = match config::signing_key(env) {
+        Ok(key) => key,
+        Err(error) => {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
+        }
+    };
+    let runtime = runtime::initialize_repository(env, VERSION, signing_key.clone()).await;
     let repo = runtime.repo;
     // Local runtime health is implementation-level state, not a wire-protocol profile.
     // A scheduler checkpoint and the stale-node supervisor advance independently so a
@@ -721,13 +728,6 @@ async fn main() {
 
     // #442: load this directory's Ed25519 signing key (libsodium 128-hex). When set, the
     // register/deregister write paths emit signed events onto /v1/events (become a seed).
-    let signing_key = match config::signing_key(env) {
-        Ok(key) => key,
-        Err(error) => {
-            eprintln!("FATAL: {error}");
-            std::process::exit(1);
-        }
-    };
     let state = AppState {
         repo,
         env,

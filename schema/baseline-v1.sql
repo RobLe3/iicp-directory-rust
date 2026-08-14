@@ -21,6 +21,7 @@ CREATE TABLE `capabilities` (
   `models` json NOT NULL,
   `max_tokens` int unsigned NOT NULL,
   `input_modalities` json DEFAULT NULL,
+  `supported_profiles` json DEFAULT NULL,
   `quantization` varchar(32) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `inference_engine` varchar(32) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `created_at` timestamp NULL DEFAULT NULL,

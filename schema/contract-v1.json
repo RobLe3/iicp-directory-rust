@@ -100,6 +100,12 @@
           "extra": "",
           "nullable": true
         },
+        "supported_profiles": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
         "intent": {
           "column_type": "varchar(255)",
           "default": null,

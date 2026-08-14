@@ -90,7 +90,11 @@ pub(crate) struct RepositoryRuntime {
     pub(crate) mysql_pool: Option<Pool<MySql>>,
 }
 
-pub(crate) async fn initialize_repository(env: Env, version: &str) -> RepositoryRuntime {
+pub(crate) async fn initialize_repository(
+    env: Env,
+    version: &str,
+    signing_key: Option<String>,
+) -> RepositoryRuntime {
     // A configured database is an explicit persistence contract: connection or
     // schema failures are fatal, never a silent downgrade to ephemeral memory.
     if let Ok(url) = std::env::var("DATABASE_URL") {
@@ -107,7 +111,7 @@ pub(crate) async fn initialize_repository(env: Env, version: &str) -> Repository
                 }
                 println!("iicp-directory-rs {version}: MySQL pool connected");
                 RepositoryRuntime {
-                    repo: Arc::new(db::MySqlRepo::new(pool.clone())),
+                    repo: Arc::new(db::MySqlRepo::with_signing_key(pool.clone(), signing_key)),
                     mysql_pool: Some(pool),
                 }
             }

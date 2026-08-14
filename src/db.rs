@@ -26,6 +26,63 @@ fn is_transient_transaction_error(error: &sqlx::Error) -> bool {
         .is_some_and(|database| matches!(database.number(), 1205 | 1213))
 }
 
+async fn append_signed_event_in_tx(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    secret_key_hex: &str,
+    event_type: &str,
+    node_id: &str,
+    payload: &serde_json::Value,
+) -> Result<i64, sqlx::Error> {
+    let (last_seq, prev_sig): (i64, Option<String>) = sqlx::query_as(
+        "SELECT CAST(last_seq AS SIGNED), last_signature \
+         FROM node_event_chain_heads WHERE chain_id = 'genesis' FOR UPDATE",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let seq = last_seq + 1;
+    let prev_hash = crate::federation::prev_hash_from(prev_sig.as_deref());
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let signature = crate::federation::sign_event(
+        secret_key_hex,
+        &event_id,
+        event_type,
+        seq,
+        ts_ms,
+        payload,
+        &prev_hash,
+    )
+    .ok_or_else(|| sqlx::Error::Protocol("invalid directory event signing key".to_string()))?;
+    sqlx::query(
+        "INSERT INTO node_events \
+         (event_id, seq, event_type, node_id, ts_ms, payload, prev_hash, signature) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&event_id)
+    .bind(seq)
+    .bind(event_type)
+    .bind(node_id)
+    .bind(ts_ms)
+    .bind(payload.to_string())
+    .bind(&prev_hash)
+    .bind(&signature)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE node_event_chain_heads \
+         SET last_seq = ?, last_signature = ?, updated_at = NOW() \
+         WHERE chain_id = 'genesis'",
+    )
+    .bind(seq)
+    .bind(signature)
+    .execute(&mut **tx)
+    .await?;
+    Ok(seq)
+}
+
 enum CreditMutationError {
     NonceReplay,
     NodeNotFound,
@@ -484,6 +541,15 @@ struct NodeRow {
     availability_score: f64,
 }
 
+#[derive(sqlx::FromRow)]
+struct HeartbeatStateRow {
+    reputation_score: f64,
+    rep_hourly_gain: f64,
+    rep_hourly_window_start: Option<chrono::NaiveDateTime>,
+    status: String,
+    dormant_since: Option<chrono::NaiveDateTime>,
+}
+
 fn tier_from_score(s: f64) -> String {
     // PHP NodeScorer thresholds (S.12 §5.1.1 REP2, CIP spec v0.6.9).
     // "bronze" is the floor tier for all sub-Silver nodes; "none" is retired (2026-05-30).
@@ -656,11 +722,20 @@ async fn capability_profile_union(pool: &Pool<MySql>, node_id: &str) -> Vec<Stri
 
 pub struct MySqlRepo {
     pool: Pool<MySql>,
+    signing_key: Option<String>,
 }
 
 impl MySqlRepo {
+    #[cfg(test)]
     pub fn new(pool: Pool<MySql>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            signing_key: None,
+        }
+    }
+
+    pub fn with_signing_key(pool: Pool<MySql>, signing_key: Option<String>) -> Self {
+        Self { pool, signing_key }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -678,18 +753,25 @@ impl MySqlRepo {
         let mut tx = self.pool.begin().await?;
         // RT-01b (#381): fetch velocity window alongside score. Laravel stores
         // rep_hourly_gain as DECIMAL(8,4), so cast it for sqlx decoding.
-        let row: Option<(f64, f64, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
-            "SELECT CAST(reputation_score AS DOUBLE), CAST(rep_hourly_gain AS DOUBLE), \
-                    CAST(rep_hourly_window_start AS DATETIME) \
+        let row: Option<HeartbeatStateRow> = sqlx::query_as(
+            "SELECT CAST(reputation_score AS DOUBLE) AS reputation_score, \
+                    CAST(rep_hourly_gain AS DOUBLE) AS rep_hourly_gain, \
+                    CAST(rep_hourly_window_start AS DATETIME) AS rep_hourly_window_start, \
+                    status, CAST(dormant_since AS DATETIME) AS dormant_since \
              FROM nodes WHERE id = ? FOR UPDATE",
         )
         .bind(node_id)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some((old_score, hourly_gain, window_start)) = row else {
+        let Some(row) = row else {
             return Ok(None);
         };
+        let was_dormant = row.status == "dormant";
+        let old_score = row.reputation_score;
+        let hourly_gain = row.rep_hourly_gain;
+        let window_start = row.rep_hourly_window_start;
+        let dormant_since = row.dormant_since;
 
         const MAX_HOURLY_GAIN: f64 = 0.20;
         let (effective_delta, new_hourly_gain, reset_window) = if delta > 0.0 {
@@ -724,7 +806,7 @@ impl MySqlRepo {
              rep_hourly_gain = ?, \
              rep_hourly_window_start = CASE WHEN ? = 1 THEN NOW() ELSE rep_hourly_window_start END, \
              health_models = COALESCE(?, health_models), \
-             status = 'active', last_seen = NOW() WHERE id = ?",
+             status = 'active', dormant_since = NULL, last_seen = NOW() WHERE id = ?",
         )
         .bind(load as f32)
         .bind(available)
@@ -738,6 +820,21 @@ impl MySqlRepo {
         .bind(node_id)
         .execute(&mut *tx)
         .await?;
+
+        if was_dormant {
+            let now = chrono::Utc::now();
+            let dormant_since_ms = dormant_since.map(|value| value.and_utc().timestamp_millis());
+            let dormancy_duration_seconds =
+                dormant_since.map(|value| (now.naive_utc() - value).num_seconds().max(0));
+            let payload = serde_json::json!({
+                "dormant_since_ms": dormant_since_ms,
+                "dormancy_duration_seconds": dormancy_duration_seconds,
+            });
+            if let Some(signing_key) = self.signing_key.as_deref() {
+                append_signed_event_in_tx(&mut tx, signing_key, "REACTIVATE", node_id, &payload)
+                    .await?;
+            }
+        }
 
         tx.commit().await?;
         Ok(Some(new_score))
@@ -1403,6 +1500,8 @@ impl NodeRepository for MySqlRepo {
                INNER JOIN capabilities c ON c.node_id = n.id
                WHERE c.intent = ?
                  AND n.available = 1
+                 AND n.status = 'active'
+                 AND n.endpoint_verified_dead_at IS NULL
                  AND n.reputation_score >= ?
                  AND (n.last_seen IS NULL OR n.last_seen >= NOW() - INTERVAL 90 SECOND)
                ORDER BY n.reputation_score DESC
@@ -2893,84 +2992,21 @@ impl NodeRepository for MySqlRepo {
                 }
             };
 
-            // The durable head survives event retention and serializes sequence/signature
-            // allocation across all writers. This is the same invariant as PHP
-            // NodeEventLogger; an absent row is a schema error, never a MAX(seq) fallback.
-            let head: Result<(i64, Option<String>), sqlx::Error> = sqlx::query_as(
-                "SELECT CAST(last_seq AS SIGNED), last_signature \
-                 FROM node_event_chain_heads WHERE chain_id = 'genesis' FOR UPDATE",
-            )
-            .fetch_one(&mut *tx)
-            .await;
-            let (last_seq, prev_sig) = match head {
-                Ok(head) => head,
+            let seq_result =
+                append_signed_event_in_tx(&mut tx, secret_key_hex, event_type, node_id, payload)
+                    .await;
+            let seq = match seq_result {
+                Ok(seq) => seq,
                 Err(error) => {
+                    let retry = is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS;
                     let _ = tx.rollback().await;
-                    eprintln!("signed event: chain head unavailable: {error}");
+                    if retry {
+                        continue;
+                    }
+                    eprintln!("signed event: append failed: {error}");
                     return None;
                 }
             };
-
-            let seq = last_seq + 1;
-            let prev_hash = crate::federation::prev_hash_from(prev_sig.as_deref());
-            let event_id = uuid::Uuid::new_v4().to_string();
-            let ts_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let sig = crate::federation::sign_event(
-                secret_key_hex,
-                &event_id,
-                event_type,
-                seq,
-                ts_ms,
-                payload,
-                &prev_hash,
-            );
-
-            let inserted = sqlx::query(
-                "INSERT INTO node_events \
-                 (event_id, seq, event_type, node_id, ts_ms, payload, prev_hash, signature) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&event_id)
-            .bind(seq)
-            .bind(event_type)
-            .bind(node_id)
-            .bind(ts_ms)
-            .bind(payload.to_string())
-            .bind(&prev_hash)
-            .bind(&sig)
-            .execute(&mut *tx)
-            .await;
-            if let Err(error) = inserted {
-                let retry = is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS;
-                let _ = tx.rollback().await;
-                if retry {
-                    continue;
-                }
-                eprintln!("signed event: append failed: {error}");
-                return None;
-            }
-
-            let advanced = sqlx::query(
-                "UPDATE node_event_chain_heads \
-                 SET last_seq = ?, last_signature = ?, updated_at = NOW() \
-                 WHERE chain_id = 'genesis'",
-            )
-            .bind(seq)
-            .bind(&sig)
-            .execute(&mut *tx)
-            .await;
-            if let Err(error) = advanced {
-                let retry = is_transient_transaction_error(&error) && attempt + 1 < ATTEMPTS;
-                let _ = tx.rollback().await;
-                if retry {
-                    continue;
-                }
-                eprintln!("signed event: chain-head update failed: {error}");
-                return None;
-            }
 
             match tx.commit().await {
                 Ok(()) => return Some(seq),
@@ -3588,15 +3624,14 @@ impl NodeRepository for MySqlRepo {
     }
 
     async fn log_event(&self, node_id: &str, event_type: &str, payload: &str) {
-        let _ = sqlx::query(
-            "INSERT INTO node_events (event_id, seq, event_type, node_id, ts_ms, payload) \
-             VALUES (UUID(), 0, ?, ?, UNIX_TIMESTAMP(NOW()) * 1000, ?)",
-        )
-        .bind(event_type)
-        .bind(node_id)
-        .bind(payload)
-        .execute(&self.pool)
-        .await;
+        let Some(signing_key) = self.signing_key.as_deref() else {
+            return;
+        };
+        let value = serde_json::from_str(payload)
+            .unwrap_or_else(|_| serde_json::json!({"reason": "invalid_internal_event_payload"}));
+        let _ = self
+            .append_signed_event(signing_key, event_type, node_id, &value)
+            .await;
     }
 
     async fn last_probe_at(&self) -> Option<String> {
@@ -3640,6 +3675,121 @@ impl NodeRepository for MySqlRepo {
         .bind(passed)
         .execute(&self.pool)
         .await;
+    }
+
+    async fn apply_probe_route_state(
+        &self,
+        node_id: &str,
+        passed: bool,
+    ) -> crate::repo::ProbeRouteTransition {
+        use crate::repo::ProbeRouteTransition;
+
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                eprintln!("probe route transition could not start transaction: {error}");
+                return ProbeRouteTransition::Unchanged;
+            }
+        };
+        let state: Option<(bool, Option<chrono::NaiveDateTime>)> = match sqlx::query_as(
+            "SELECT public_reachable, CAST(endpoint_verified_dead_at AS DATETIME) \
+             FROM nodes WHERE id = ? FOR UPDATE",
+        )
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = tx.rollback().await;
+                eprintln!("probe route transition could not read route state: {error}");
+                return ProbeRouteTransition::Unchanged;
+            }
+        };
+        let Some((public_reachable, dead_since)) = state else {
+            let _ = tx.rollback().await;
+            return ProbeRouteTransition::Unchanged;
+        };
+
+        let transition = if passed && (!public_reachable || dead_since.is_some()) {
+            ProbeRouteTransition::Restored
+        } else if !passed && public_reachable {
+            ProbeRouteTransition::Demoted
+        } else {
+            let _ = tx.rollback().await;
+            return ProbeRouteTransition::Unchanged;
+        };
+
+        let update = match transition {
+            ProbeRouteTransition::Restored => {
+                sqlx::query(
+                    "UPDATE nodes SET public_reachable = 1, endpoint_verified_dead_at = NULL \
+                 WHERE id = ?",
+                )
+                .bind(node_id)
+                .execute(&mut *tx)
+                .await
+            }
+            ProbeRouteTransition::Demoted => {
+                sqlx::query(
+                    "UPDATE nodes SET public_reachable = 0, endpoint_verified_dead_at = NOW() \
+                 WHERE id = ? AND public_reachable = 1",
+                )
+                .bind(node_id)
+                .execute(&mut *tx)
+                .await
+            }
+            ProbeRouteTransition::Unchanged => unreachable!(),
+        };
+        if let Err(error) = update {
+            let _ = tx.rollback().await;
+            eprintln!("probe route transition could not update route state: {error}");
+            return ProbeRouteTransition::Unchanged;
+        }
+
+        let (event_type, payload) = match transition {
+            ProbeRouteTransition::Restored => (
+                "REACHABILITY_RESTORE",
+                serde_json::json!({
+                    "from": public_reachable,
+                    "to": true,
+                    "reason": "probe_success",
+                    "probe_source": "directory_active_probe",
+                    "endpoint_verified_dead_at_cleared": dead_since.is_some(),
+                }),
+            ),
+            ProbeRouteTransition::Demoted => (
+                "REACHABILITY_DEMOTE",
+                serde_json::json!({
+                    "from": true,
+                    "to": false,
+                    "reason": "confirmed_probe_failure",
+                    "probe_source": "directory_active_probe",
+                    "endpoint_verified_dead_at_set": true,
+                }),
+            ),
+            ProbeRouteTransition::Unchanged => unreachable!(),
+        };
+        let Some(signing_key) = self.signing_key.as_deref() else {
+            let _ = tx.rollback().await;
+            eprintln!("probe route transition skipped because event signing is unavailable");
+            return ProbeRouteTransition::Unchanged;
+        };
+        if let Err(error) =
+            append_signed_event_in_tx(&mut tx, signing_key, event_type, node_id, &payload).await
+        {
+            let _ = tx.rollback().await;
+            eprintln!("probe route transition could not record evidence: {error}");
+            return ProbeRouteTransition::Unchanged;
+        }
+
+        match tx.commit().await {
+            Ok(()) => transition,
+            Err(error) => {
+                eprintln!("probe route transition could not commit: {error}");
+                ProbeRouteTransition::Unchanged
+            }
+        }
     }
 
     async fn probe_active_count_and_regions(&self) -> (i64, Vec<String>) {
@@ -3875,7 +4025,7 @@ impl NodeRepository for MySqlRepo {
 #[cfg(test)]
 mod tests {
     use super::{credit_ttl_idle, init_pool, median_outlier_weight, MySqlRepo};
-    use crate::repo::NodeRepository;
+    use crate::repo::{DiscoverQuery, NodeRepository, ProbeRouteTransition};
     use serde_json::Value;
     use sqlx::mysql::MySqlPoolOptions;
     use std::sync::Arc;
@@ -3904,6 +4054,176 @@ mod tests {
             value = &value[*key];
         }
         value.as_i64().expect("fixture integer field")
+    }
+
+    fn test_signing_key() -> String {
+        let public_key = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+        format!("{}{}", "11".repeat(32), public_key)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn dormant_heartbeat_reactivates_once_and_clears_dormancy() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
+              status, available, dormant_since, last_seen) \
+             VALUES ('lifecycle-reactivate', 'https://example.invalid/v1', 'test', 'x', 1, 1, \
+                     'dormant', 0, NOW() - INTERVAL 5 MINUTE, NOW() - INTERVAL 5 MINUTE)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed dormant node");
+
+        let repo = MySqlRepo::with_signing_key(pool.clone(), Some(test_signing_key()));
+        repo.heartbeat("lifecycle-reactivate", 0.1, true, 0, 0, 0, 0.0, None)
+            .await
+            .expect("reactivation heartbeat");
+
+        let state: (String, bool, Option<chrono::NaiveDateTime>) = sqlx::query_as(
+            "SELECT status, available, CAST(dormant_since AS DATETIME) \
+             FROM nodes WHERE id = 'lifecycle-reactivate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read reactivated state");
+        assert_eq!(state.0, "active");
+        assert!(state.1);
+        assert!(state.2.is_none());
+
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM node_events \
+             WHERE node_id = 'lifecycle-reactivate' AND event_type = 'REACTIVATE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count first reactivation event");
+        assert_eq!(events, 1);
+
+        repo.heartbeat("lifecycle-reactivate", 0.1, true, 0, 0, 0, 0.0, None)
+            .await
+            .expect("ordinary heartbeat");
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM node_events \
+             WHERE node_id = 'lifecycle-reactivate' AND event_type = 'REACTIVATE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count stable reactivation events");
+        assert_eq!(
+            events, 1,
+            "ordinary heartbeats must not duplicate REACTIVATE"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn confirmed_probe_state_transitions_are_idempotent_and_keep_relay_flag() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
+              status, available, public_reachable, relay_capable, last_seen) \
+             VALUES ('probe-transition', 'https://example.invalid/v1', 'test', 'x', 1, 1, \
+                     'active', 1, 1, 1, NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed reachable node");
+        sqlx::query(
+            "INSERT INTO capabilities (node_id, intent, models, max_tokens) \
+             VALUES ('probe-transition', 'urn:iicp:intent:llm:chat:v1', JSON_ARRAY('fixture'), 1024)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed route capability");
+
+        let repo = MySqlRepo::with_signing_key(pool.clone(), Some(test_signing_key()));
+        assert_eq!(
+            repo.apply_probe_route_state("probe-transition", false)
+                .await,
+            ProbeRouteTransition::Demoted
+        );
+        assert_eq!(
+            repo.apply_probe_route_state("probe-transition", false)
+                .await,
+            ProbeRouteTransition::Unchanged
+        );
+        let demoted: (bool, bool, Option<chrono::NaiveDateTime>) = sqlx::query_as(
+            "SELECT public_reachable, relay_capable, CAST(endpoint_verified_dead_at AS DATETIME) \
+             FROM nodes WHERE id = 'probe-transition'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read demoted route");
+        assert!(!demoted.0);
+        assert!(demoted.1, "direct failure must not clear relay capability");
+        assert!(demoted.2.is_some());
+        let hidden = repo
+            .discover(&DiscoverQuery {
+                intent: "urn:iicp:intent:llm:chat:v1".to_string(),
+                limit: 10,
+                ..DiscoverQuery::default()
+            })
+            .await;
+        assert!(
+            hidden.is_empty(),
+            "a confirmed-failed endpoint is ineligible"
+        );
+
+        assert_eq!(
+            repo.apply_probe_route_state("probe-transition", true).await,
+            ProbeRouteTransition::Restored
+        );
+        assert_eq!(
+            repo.apply_probe_route_state("probe-transition", true).await,
+            ProbeRouteTransition::Unchanged
+        );
+        let restored: (bool, bool, Option<chrono::NaiveDateTime>) = sqlx::query_as(
+            "SELECT public_reachable, relay_capable, CAST(endpoint_verified_dead_at AS DATETIME) \
+             FROM nodes WHERE id = 'probe-transition'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read restored route");
+        assert!(restored.0);
+        assert!(restored.1);
+        assert!(restored.2.is_none());
+        let visible = repo
+            .discover(&DiscoverQuery {
+                intent: "urn:iicp:intent:llm:chat:v1".to_string(),
+                limit: 10,
+                ..DiscoverQuery::default()
+            })
+            .await;
+        assert_eq!(visible.len(), 1, "a restored route is eligible again");
+
+        let transitions: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT event_type, COUNT(*) FROM node_events \
+             WHERE node_id = 'probe-transition' \
+             GROUP BY event_type ORDER BY event_type",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("count route transition evidence");
+        assert_eq!(
+            transitions,
+            vec![
+                ("REACHABILITY_DEMOTE".to_string(), 1),
+                ("REACHABILITY_RESTORE".to_string(), 1),
+            ]
+        );
     }
 
     // WQ-056 / billing §11.3 — the idle-determination rule the TTL sweep applies.

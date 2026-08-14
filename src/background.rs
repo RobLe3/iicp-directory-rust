@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::repo::NodeRepository;
+use crate::repo::{NodeRepository, ProbeRouteTransition};
 use iicp_directory_rs::runtime_health::RuntimeHealth;
 use sqlx::{MySql, Pool};
 
@@ -39,14 +39,37 @@ pub async fn run_probe_nodes_loop(repo: Arc<dyn NodeRepository>) {
             if !should_probe(&extract_host(&endpoint), ipv6_egress) {
                 continue;
             }
-            let (reachable, _latency_ms) = tcp_probe(&endpoint).await;
+            let reachable = confirmed_probe(|| async { tcp_probe(&endpoint).await.0 }).await;
             repo.record_probe_result(&node_id, reachable, "DIR-PROBE-NODE-01")
                 .await;
+            match repo.apply_probe_route_state(&node_id, reachable).await {
+                ProbeRouteTransition::Demoted => {
+                    eprintln!("[probe_nodes] demoted one confirmed-failed direct route")
+                }
+                ProbeRouteTransition::Restored => {
+                    eprintln!("[probe_nodes] restored one independently verified direct route")
+                }
+                ProbeRouteTransition::Unchanged => {}
+            }
             count += 1;
         }
         if count > 0 {
             eprintln!("[probe_nodes] probed {count} node endpoint(s)");
         }
+    }
+}
+
+/// A single failed observation is not enough to change route state. A success
+/// returns immediately; a failure is confirmed once before it can be applied.
+async fn confirmed_probe<F, Fut>(mut probe: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if probe().await {
+        true
+    } else {
+        probe().await
     }
 }
 
@@ -281,6 +304,7 @@ pub async fn run_expire_nodes_loop(repo: Arc<dyn NodeRepository>, health: Runtim
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// Behavior test (2026-06-11): IPv6-literal endpoints must be skipped when
     /// the origin has no IPv6 egress — probing them only records false negatives.
@@ -317,5 +341,45 @@ mod tests {
             let host = extract_host(ep);
             assert!(should_probe(&host, false), "{ep} must be probed");
         }
+    }
+
+    #[tokio::test]
+    async fn successful_probe_does_not_issue_confirmation_probe() {
+        let calls = Cell::new(0);
+        let reachable = confirmed_probe(|| {
+            calls.set(calls.get() + 1);
+            std::future::ready(true)
+        })
+        .await;
+        assert!(reachable);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_failed_probe_cannot_produce_a_failed_route_observation() {
+        let calls = Cell::new(0);
+        let reachable = confirmed_probe(|| {
+            let call = calls.get();
+            calls.set(call + 1);
+            std::future::ready(call == 1)
+        })
+        .await;
+        assert!(
+            reachable,
+            "the confirmation success must preserve the route"
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_failed_probes_produce_a_confirmed_failure() {
+        let calls = Cell::new(0);
+        let reachable = confirmed_probe(|| {
+            calls.set(calls.get() + 1);
+            std::future::ready(false)
+        })
+        .await;
+        assert!(!reachable);
+        assert_eq!(calls.get(), 2);
     }
 }
