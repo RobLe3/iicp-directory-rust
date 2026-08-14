@@ -76,8 +76,50 @@
     },
     "capabilities": {
       "columns": {
+        "capability_limits": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "capability_phase": {
+          "column_type": "int unsigned",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "capability_version": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "claim_provenance": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
         "created_at": {
           "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "execution_capabilities": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "extensions": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "features": {
+          "column_type": "json",
           "default": null,
           "extra": "",
           "nullable": true
@@ -95,12 +137,6 @@
           "nullable": true
         },
         "input_modalities": {
-          "column_type": "json",
-          "default": null,
-          "extra": "",
-          "nullable": true
-        },
-        "supported_profiles": {
           "column_type": "json",
           "default": null,
           "extra": "",
@@ -130,14 +166,32 @@
           "extra": "",
           "nullable": false
         },
+        "output_modalities": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
         "quantization": {
           "column_type": "varchar(32)",
           "default": null,
           "extra": "",
           "nullable": true
         },
+        "supported_profiles": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
         "updated_at": {
           "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "variant_id": {
+          "column_type": "varchar(64)",
           "default": null,
           "extra": "",
           "nullable": true
@@ -173,6 +227,14 @@
             "intent"
           ],
           "unique": false
+        },
+        "capabilities_node_intent_variant_unique": {
+          "columns": [
+            "node_id",
+            "intent",
+            "variant_id"
+          ],
+          "unique": true
         }
       }
     },
@@ -1289,6 +1351,18 @@
           "extra": "",
           "nullable": true
         },
+        "implementation_name": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "implementation_version": {
+          "column_type": "varchar(32)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
         "last_seen": {
           "column_type": "timestamp",
           "default": null,
@@ -1462,18 +1536,6 @@
           "default": "0.5",
           "extra": "",
           "nullable": false
-        },
-        "implementation_name": {
-          "column_type": "varchar(64)",
-          "default": null,
-          "extra": "",
-          "nullable": true
-        },
-        "implementation_version": {
-          "column_type": "varchar(32)",
-          "default": null,
-          "extra": "",
-          "nullable": true
         },
         "sdk_compatibility_version": {
           "column_type": "varchar(32)",

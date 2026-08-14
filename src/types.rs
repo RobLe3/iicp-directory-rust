@@ -9,6 +9,75 @@
 //! newer spec can add fields without breaking older clients (mirrors the SDK rule).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// A typed quantitative limit attached to one complete capability variant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapabilityLimit {
+    pub value: f64,
+    pub unit: String,
+}
+
+/// Provenance for a capability claim. It is evidence metadata, never authority
+/// for policy, identity, reachability or dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapabilityClaimProvenance {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+}
+
+/// An accepted namespaced extension. Required extensions are retained exactly
+/// or registration fails before persistence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapabilityExtension {
+    pub required: bool,
+    pub value: serde_json::Value,
+}
+
+/// One complete effective service variant for an intent. Matchers must never
+/// combine fields from different variants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EffectiveCapability {
+    pub intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Legacy implementation metadata retained for registration compatibility.
+    /// It is not a canonical effective-capability vocabulary field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// Legacy implementation metadata retained for registration compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, CapabilityLimit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_profiles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_provenance: Option<CapabilityClaimProvenance>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, CapabilityExtension>,
+}
 
 /// A single node in the `/v1/discover` NODELIST response (iicp-dir §3.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +124,10 @@ pub struct Node {
     /// Unknown profiles are metadata only and never enable behavior implicitly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_profiles: Vec<String>,
+    /// Complete effective variants. Discovery may select an intent, but fields
+    /// from separate variants remain separate in every public projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<EffectiveCapability>,
     /// ADR-019 pricing metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<serde_json::Value>,

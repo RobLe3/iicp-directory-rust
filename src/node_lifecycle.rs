@@ -28,23 +28,6 @@ use crate::{
 // ── register (iicp-dir §3.1) ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Capability {
-    intent: String,
-    /// Model names served by this capability (Phase 5 model-aware routing).
-    #[serde(default)]
-    models: Vec<String>,
-    /// Quantization string (e.g. "q4_k_m") for this capability.
-    #[serde(default)]
-    quantization: Option<String>,
-    /// Inference engine name (e.g. "llama.cpp") for this capability.
-    #[serde(default)]
-    inference_engine: Option<String>,
-    /// Additive, pre-normative execution profiles. They are projected as metadata only.
-    #[serde(default)]
-    supported_profiles: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct RegisterRequest {
     /// Optional (iicp-dir §3.1: directory assigns if absent). Supplying a known id
     /// is identity recovery — register() preserves the existing reputation (ADR-026).
@@ -57,7 +40,7 @@ pub(crate) struct RegisterRequest {
     current_node_token: Option<String>,
     #[serde(default)]
     region: Option<String>,
-    capabilities: Vec<Capability>,
+    capabilities: Vec<types::EffectiveCapability>,
     // ── Phase 5 NODELIST fields (ADR-040/ADR-043) ─────────────────────────────
     /// NAT traversal type (iicp-dir §3.1). Used by RT-04 declared-reachable check.
     #[serde(default)]
@@ -437,6 +420,8 @@ fn validate_registration_profiles_and_exposure(
 fn validate_registration_capabilities(
     request: &RegisterRequest,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let mut exact = std::collections::HashSet::new();
+    let mut variants = std::collections::HashSet::new();
     for capability in &request.capabilities {
         if !validate_intent(&capability.intent) {
             return Some(reject(
@@ -448,6 +433,100 @@ fn validate_registration_capabilities(
             policy::IntentPolicyGuard::public_mesh_refusal(&capability.intent)
         {
             return Some(policy_reject(&classification));
+        }
+        let canonical = serde_json::to_string(capability).unwrap_or_default();
+        if !exact.insert(canonical)
+            || capability.variant_id.as_ref().is_some_and(|variant| {
+                !variants.insert((capability.intent.clone(), variant.clone()))
+            })
+        {
+            return Some(reject("validation_error", "duplicate capability variant"));
+        }
+        if capability
+            .variant_id
+            .as_deref()
+            .is_some_and(|value| !valid_capability_identifier(value, 64))
+            || capability
+                .version
+                .as_deref()
+                .is_some_and(|value| value.is_empty() || value.len() > 32)
+            || capability.phase == Some(0)
+            || capability.max_tokens == Some(0)
+            || !valid_capability_string_set(&capability.models)
+            || !valid_capability_string_set(&capability.input_modalities)
+            || !valid_capability_string_set(&capability.output_modalities)
+            || !valid_capability_string_set(&capability.features)
+            || !valid_capability_string_set(&capability.execution_capabilities)
+        {
+            return Some(reject("validation_error", "invalid capability variant"));
+        }
+        if capability
+            .input_modalities
+            .iter()
+            .any(|value| !matches!(value.as_str(), "text" | "image" | "audio" | "video"))
+            || capability
+                .output_modalities
+                .iter()
+                .any(|value| !matches!(value.as_str(), "text" | "image" | "audio" | "video"))
+        {
+            return Some(reject("validation_error", "invalid capability modality"));
+        }
+        if capability.limits.len() > 32
+            || capability.limits.iter().any(|(name, limit)| {
+                !valid_limit_name(name)
+                    || !limit.value.is_finite()
+                    || limit.value < 0.0
+                    || !matches!(
+                        limit.unit.as_str(),
+                        "tokens" | "items" | "bytes" | "milliseconds" | "dimensions"
+                    )
+            })
+        {
+            return Some(reject("validation_error", "invalid capability limit"));
+        }
+        if capability.claim_provenance.as_ref().is_some_and(|claim| {
+            !matches!(
+                claim.source.as_str(),
+                "heuristic_fallback"
+                    | "operator_assertion"
+                    | "provider_metadata"
+                    | "runtime_introspection"
+                    | "conformance_probe"
+            ) || claim
+                .observed_at
+                .as_deref()
+                .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_err())
+                || claim
+                    .valid_until
+                    .as_deref()
+                    .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_err())
+                || claim
+                    .evidence_ref
+                    .as_deref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 255)
+        }) {
+            return Some(reject(
+                "validation_error",
+                "invalid capability claim provenance",
+            ));
+        }
+        if capability.extensions.len() > 32
+            || capability.extensions.iter().any(|(name, _extension)| {
+                name.len() < 3
+                    || name.len() > 128
+                    || !name.contains('.')
+                    || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'_' | b':' | b'-')
+                    })
+            })
+        {
+            return Some(reject(
+                "validation_error",
+                "invalid namespaced capability extension",
+            ));
         }
         if capability.supported_profiles.len() > 16
             || capability.supported_profiles.iter().any(|profile| {
@@ -475,6 +554,36 @@ fn validate_registration_capabilities(
     None
 }
 
+fn valid_capability_identifier(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_capability_string_set(values: &[String]) -> bool {
+    values.len() <= 64
+        && values
+            .iter()
+            .all(|value| !value.is_empty() && value.len() <= 255)
+        && values
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == values.len()
+}
+
+fn valid_limit_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 async fn commit_registration(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -485,6 +594,7 @@ async fn commit_registration(
         .register(repo::NodeRecord {
             node: pending.node,
             intents: pending.intents,
+            capabilities: pending.request.capabilities.clone(),
             capability_profiles: pending.capability_profiles,
             availability: pending.availability,
             node_token: Some(pending.node_token.clone()),
@@ -531,8 +641,21 @@ async fn commit_registration(
             "supported_receipt_profiles": pending.request.supported_receipt_profiles,
             "capabilities": pending.request.capabilities.iter().map(|capability| serde_json::json!({
                 "intent": capability.intent,
+                "version": capability.version,
+                "phase": capability.phase,
+                "variant_id": capability.variant_id,
                 "models": capability.models,
+                "max_tokens": capability.max_tokens,
+                "quantization": capability.quantization,
+                "inference_engine": capability.inference_engine,
+                "input_modalities": capability.input_modalities,
+                "output_modalities": capability.output_modalities,
+                "features": capability.features,
+                "execution_capabilities": capability.execution_capabilities,
+                "limits": capability.limits,
                 "supported_profiles": capability.supported_profiles,
+                "claim_provenance": capability.claim_provenance,
+                "extensions": capability.extensions,
             })).collect::<Vec<_>>(),
         }),
     )
@@ -836,6 +959,7 @@ pub(crate) async fn register(
         cip_conformance_level: Some("CIP-None".into()),
         models: advertised_models,
         supported_profiles: vec![],
+        capabilities: req.capabilities.clone(),
         pricing: None,
         cip_policy: Some(serde_json::json!({
             "allow_remote_inference": false,

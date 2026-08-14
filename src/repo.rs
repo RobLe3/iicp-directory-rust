@@ -45,6 +45,9 @@ pub(crate) fn dispatch_usage_summary_value(
 pub struct NodeRecord {
     pub node: Node,
     pub intents: Vec<String>,
+    /// Complete capability variants as registered. Legacy records may leave
+    /// this empty and continue to use `intents` plus `capability_profiles`.
+    pub capabilities: Vec<crate::types::EffectiveCapability>,
     /// Per-intent additive capability profiles advertised at registration.
     pub capability_profiles: HashMap<String, Vec<String>>,
     pub availability: Vec<AvailabilityWindow>,
@@ -1128,11 +1131,25 @@ impl NodeRepository for InMemoryRepo {
             // A future scoring pass may boost region matches; it must not drop non-matches.
             .map(|r| {
                 let mut node = r.node.clone();
-                node.supported_profiles = r
-                    .capability_profiles
-                    .get(&q.intent)
+                node.capabilities = r
+                    .capabilities
+                    .iter()
+                    .filter(|capability| capability.intent == q.intent)
                     .cloned()
-                    .unwrap_or_default();
+                    .collect();
+                node.supported_profiles = if node.capabilities.is_empty() {
+                    r.capability_profiles
+                        .get(&q.intent)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    node.capabilities
+                        .iter()
+                        .flat_map(|capability| capability.supported_profiles.iter().cloned())
+                        .collect()
+                };
+                node.supported_profiles.sort();
+                node.supported_profiles.dedup();
                 node
             })
             .collect();
@@ -1195,6 +1212,7 @@ impl NodeRepository for InMemoryRepo {
         let guard = self.records.lock().unwrap();
         guard.iter().find(|r| r.node.node_id == node_id).map(|r| {
             let mut node = r.node.clone();
+            node.capabilities = r.capabilities.clone();
             node.supported_profiles = r.capability_profiles.values().flatten().cloned().collect();
             node.supported_profiles.sort();
             node.supported_profiles.dedup();
@@ -1215,6 +1233,7 @@ impl NodeRepository for InMemoryRepo {
             })
             .map(|r| {
                 let mut node = r.node.clone();
+                node.capabilities = r.capabilities.clone();
                 node.supported_profiles =
                     r.capability_profiles.values().flatten().cloned().collect();
                 node.supported_profiles.sort();
@@ -2318,6 +2337,7 @@ mod tests {
             cip_conformance_level: Some("CIP-None".to_string()),
             models: vec![],
             supported_profiles: vec![],
+            capabilities: vec![],
             pricing: None,
             nat_type: None,
             transport_method: None,
@@ -2360,6 +2380,7 @@ mod tests {
         NodeRecord {
             node: node(id, score, available, rep),
             intents: intents.iter().map(|s| s.to_string()).collect(),
+            capabilities: vec![],
             capability_profiles: std::collections::HashMap::new(),
             availability: vec![],
             node_token: None,

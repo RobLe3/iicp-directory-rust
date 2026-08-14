@@ -59,6 +59,7 @@ fn test_state() -> AppState {
             cip_conformance_level: Some("CIP-None".into()),
             models: vec![],
             supported_profiles: vec![],
+            capabilities: vec![],
             pricing: None,
             nat_type: None,
             transport_method: None,
@@ -98,6 +99,7 @@ fn test_state() -> AppState {
             routing_policy: types::RoutingPolicyState::default(),
         },
         intents: vec![chat.into()],
+        capabilities: vec![],
         capability_profiles: std::collections::HashMap::new(),
         availability: vec![],
         node_token: None,
@@ -1343,6 +1345,106 @@ async fn registration_rejects_conflicting_sdk_version_axes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn effective_capability_variants_survive_registration_and_discovery() {
+    let body = serde_json::json!({
+        "endpoint": "https://1.1.1.1",
+        "region": "eu-central",
+        "capabilities": [
+            {
+                "intent": "urn:iicp:intent:llm:chat:v1",
+                "version": "1.0.0",
+                "phase": 1,
+                "variant_id": "text-basic",
+                "models": ["fixture-small"],
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "limits": {"context_tokens": {"value": 8192, "unit": "tokens"}}
+            },
+            {
+                "intent": "urn:iicp:intent:llm:chat:v1",
+                "variant_id": "vision-tools",
+                "models": ["fixture-vision"],
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"],
+                "features": ["structured_output", "tool_calling"],
+                "supported_profiles": ["urn:iicp:profile:service-lifecycle:v1"],
+                "claim_provenance": {"source": "runtime_introspection"},
+                "extensions": {
+                    "org.example.optional-batching": {
+                        "required": false,
+                        "value": {"enabled": true}
+                    }
+                }
+            }
+        ]
+    });
+    let state = test_state();
+    let registration = app(state.clone())
+        .oneshot(post_register(body))
+        .await
+        .unwrap();
+    assert_eq!(registration.status(), StatusCode::CREATED);
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let node = value["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["endpoint"] == "https://1.1.1.1")
+        .unwrap();
+    let capabilities = node["capabilities"].as_array().unwrap();
+    assert_eq!(capabilities.len(), 2);
+    assert_eq!(capabilities[0]["variant_id"], "text-basic");
+    assert_eq!(capabilities[0]["version"], "1.0.0");
+    assert_eq!(capabilities[0]["phase"], 1);
+    assert_eq!(capabilities[1]["variant_id"], "vision-tools");
+    assert_eq!(capabilities[1]["features"][1], "tool_calling");
+    assert_eq!(
+        capabilities[1]["extensions"]["org.example.optional-batching"]["value"]["enabled"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn registration_rejects_duplicate_capability_variants_and_invalid_limits() {
+    let capability = serde_json::json!({
+        "intent": "urn:iicp:intent:llm:chat:v1",
+        "variant_id": "text-basic",
+        "input_modalities": ["text"]
+    });
+    let duplicate = app(test_state())
+        .oneshot(post_register(serde_json::json!({
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [capability.clone(), capability]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let invalid_limit = app(test_state())
+        .oneshot(post_register(serde_json::json!({
+            "endpoint": "https://1.1.1.1",
+            "capabilities": [{
+                "intent": "urn:iicp:intent:llm:chat:v1",
+                "limits": {"context_tokens": {"value": -1, "unit": "tokens"}}
+            }]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(invalid_limit.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -4192,6 +4294,7 @@ async fn discover_excludes_node_with_empty_health_models_unfiltered() {
             cip_conformance_level: Some("CIP-None".into()),
             models: vec!["qwen2.5:0.5b".into()],
             supported_profiles: vec![],
+            capabilities: vec![],
             pricing: None,
             nat_type: None,
             transport_method: None,
@@ -4229,6 +4332,7 @@ async fn discover_excludes_node_with_empty_health_models_unfiltered() {
             routing_policy: types::RoutingPolicyState::default(),
         },
         intents: vec![chat.into()],
+        capabilities: vec![],
         capability_profiles: std::collections::HashMap::new(),
         availability: vec![],
         node_token: None,
@@ -4286,6 +4390,7 @@ async fn discover_runtime_policy_applies_qos_boundary_and_php_ranking() {
             .map(|node| NodeRecord {
                 node,
                 intents: vec![chat.into()],
+                capabilities: vec![],
                 capability_profiles: std::collections::HashMap::new(),
                 availability: vec![],
                 node_token: None,

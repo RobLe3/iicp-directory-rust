@@ -166,3 +166,12 @@ The Genesis-cutover evidence lane is documented in
 environment template and a content-free PHP/Rust observer. Preparing or testing
 that lane does not authorize starting a persistent service; the seven-day
 observation window requires explicit maintainer approval.
+## Effective-capability schema upgrade
+
+The runtime bootstraps a genuinely empty database but never mutates an existing
+one. Before running a build that includes the effective-capability Profile over
+an existing standalone preview database, back up the database and apply the
+reviewed `migrations/022_add_effective_capability_fields.sql` change. Startup
+then verifies the complete embedded schema contract and fails closed if the
+upgrade is missing or partial. A shared PHP/Rust deployment must use the
+authoritative PHP migration sequence rather than replaying this standalone SQL.
