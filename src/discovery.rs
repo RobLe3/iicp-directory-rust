@@ -24,7 +24,7 @@ use crate::{
 };
 
 pub(crate) const SDK_BASELINE_VERSION: &str = "0.7.68";
-const SDK_LATEST_KNOWN_VERSION: &str = "0.7.104";
+const SDK_LATEST_KNOWN_VERSION: &str = "0.7.105";
 const PROFILE_ID: &str = "iicp.profile.compatibility.v0";
 const PROFILE_VERSION: &str = "0.4.0-draft";
 pub(crate) const PROFILE_FIXTURE_SHA256: &str =
