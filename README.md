@@ -6,6 +6,12 @@ The protocol is defined by the public [IICP specification](https://github.com/Ro
 This repository owns the Rust implementation, not the protocol, website,
 production deployment, or Genesis Seed credentials and data.
 
+This makes the directory an intent-resolution and provider-eligibility control
+plane, not a task-execution protocol or universal agent runtime. MCP, A2A, HTTP
+or another negotiated binding may execute after selection. See the public
+[protocol positioning](https://github.com/RobLe3/IICP/blob/main/standards/IICP_PROTOCOL_POSITIONING.md)
+and [adjacent-protocol comparison](https://github.com/RobLe3/IICP/blob/main/standards/PROTOCOL_COMPARISON_2026-08-15.md).
+
 Release compatibility and the PHP transition boundary are defined in
 [`RELEASE_POLICY.md`](RELEASE_POLICY.md).
 
