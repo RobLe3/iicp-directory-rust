@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.13 — 2026-08-15
+
+- Advances additive SDK release-currency evidence to the coordinated 0.7.105 line.
+- Pins PHP v1.10.92 parity without changing the HTTP contract, schema, security defaults or operator-preview boundary.
+
+
 ## 0.1.12 — 2026-08-14
 
 - Implements shared effective-capability-v1 persistence, projection and same-intent variant matching, including bounded provenance and optional extension preservation.
