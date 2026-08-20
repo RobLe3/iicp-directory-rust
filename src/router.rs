@@ -12,6 +12,7 @@ use axum::{
 use crate::observability::{health, stats};
 use crate::probe::probe_node;
 use crate::registry::{registry_intents, registry_node_detail, registry_nodes, registry_stats};
+use crate::restricted_domain_auth::restricted_domain_gate;
 use crate::{
     audit_report, badge_svg, badges_list, bootstrap, compliance_attestation, conformance_submit,
     conformance_verify, consumer_token_issue, credits_award, credits_balance, credits_quote,
@@ -24,6 +25,7 @@ use crate::{
 };
 
 pub(crate) fn app(state: AppState) -> Router {
+    let middleware_state = state.clone();
     Router::new()
         .route("/health", get(health))
         .route("/iicp/health", get(health))
@@ -131,6 +133,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/api/v1/probe", get(probe_node))
         .route("/", get(root_info))
         .layer(middleware::from_fn(json_error_boundary))
+        .layer(middleware::from_fn_with_state(
+            middleware_state,
+            restricted_domain_gate,
+        ))
         .with_state(state)
 }
 

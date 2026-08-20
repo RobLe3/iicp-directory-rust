@@ -137,10 +137,30 @@ For a durable installation, backup and recovery guidance, read
 | `IICP_ROOT_KEY_ID` | — | DID verification-method ID for the configured signing key. |
 | `IICP_OPENAPI_VERSION`, `IICP_PROTOCOL_MIN`, `IICP_PROTOCOL_MAX` | `1.7.0`, `1.9.0`, `1.9.0` | Compatibility metadata in the signed deployment record. |
 | `IICP_RUNTIME_HEALTH_FILE` | platform runtime/state directory | Private local runtime-health snapshot used by the healthcheck and supervision adapters. |
+| `IICP_RESTRICTED_DOMAIN_ENABLED` | `false` | Enables fail-closed restricted trust-domain admission on registration, discovery, bootstrap, heartbeat, peer, dispatch and relay surfaces. |
+| `IICP_TRUST_DOMAIN_ID` | — | Stable restricted-domain identifier. Required when restricted mode is enabled. |
+| `IICP_TRUST_DOMAIN_AUTHORITY_ID` | — | Membership issuer identifier. Required when restricted mode is enabled. |
+| `IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH` | `1` | Minimum accepted credential generation; increasing it invalidates older credentials. |
+| `IICP_TRUST_DOMAIN_MAX_CREDENTIAL_TTL` | `86400` | Maximum membership lifetime in seconds, with a minimum of 60. |
 
 In production mode, `POST /v1/register` and `POST /api/v1/register` reject private/loopback endpoints. Use `APP_ENV=local` for local endpoint tests.
 The deployment-provenance endpoint returns 503 until every required release
 input and the signing key are present.
+
+Restricted mode is additive and disabled by default. It requires durable MySQL
+storage and cannot currently be combined with replica mode; startup fails
+instead of silently weakening either boundary. Requests to protected routes
+carry `X-IICP-Membership` and `X-IICP-Subject-Id`. Membership administration is
+local and prints a newly issued credential only once:
+
+```bash
+iicp-directory-rs trust-domain-membership-issue \
+  --kind node --subject node-1 --scopes registration,heartbeat,peers
+iicp-directory-rs trust-domain-membership-revoke --kind node --subject node-1
+```
+
+These controls do not make the Rust preview the Genesis authority and do not
+enable cross-domain federation.
 
 ## Test baseline
 

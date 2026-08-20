@@ -168,6 +168,12 @@ pub(crate) async fn run_operational_command(command: Command) -> Result<(), Stri
         Command::Update { .. } => {
             return Err("update commands must be dispatched before database initialization".into())
         }
+        Command::TrustDomainMembershipIssue { .. }
+        | Command::TrustDomainMembershipRevoke { .. } => {
+            return Err(
+                "membership commands must be dispatched before operational reporting".into(),
+            )
+        }
         Command::DbMaintenanceStatus { retention, json } => (
             serde_json::to_value(
                 maintenance::maintenance_status(&pool, retention.policy())

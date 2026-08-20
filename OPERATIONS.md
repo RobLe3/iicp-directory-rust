@@ -21,6 +21,12 @@ cat > "$HOME/.config/iicp-directory.env" <<'EOF'
 DATABASE_URL=mysql://user:password@127.0.0.1/iicp_directory
 IICP_GENESIS_ED25519_SECRET_KEY=<operator-managed-secret>
 APP_ENV=production
+# Optional restricted-domain deployment. All values are required together.
+# IICP_RESTRICTED_DOMAIN_ENABLED=true
+# IICP_TRUST_DOMAIN_ID=example.internal
+# IICP_TRUST_DOMAIN_AUTHORITY_ID=did:web:directory.example
+# IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH=1
+# IICP_TRUST_DOMAIN_MAX_CREDENTIAL_TTL=86400
 EOF
 chmod 600 "$HOME/.config/iicp-directory.env"
 

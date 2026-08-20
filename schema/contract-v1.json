@@ -2302,6 +2302,113 @@
           "unique": true
         }
       }
+    },
+    "trust_domain_memberships": {
+      "columns": {
+        "created_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "domain_id": {
+          "column_type": "varchar(191)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "expires_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "generation": {
+          "column_type": "bigint unsigned",
+          "default": "1",
+          "extra": "",
+          "nullable": false
+        },
+        "id": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "issuer_id": {
+          "column_type": "varchar(191)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "revoked_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "scopes": {
+          "column_type": "json",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "subject_id": {
+          "column_type": "varchar(191)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "subject_kind": {
+          "column_type": "varchar(16)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "token_hash": {
+          "column_type": "char(64)",
+          "default": null,
+          "extra": "",
+          "nullable": false
+        },
+        "updated_at": {
+          "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "PRIMARY": {
+          "columns": [
+            "id"
+          ],
+          "unique": true
+        },
+        "trust_domain_membership_subject_unique": {
+          "columns": [
+            "domain_id",
+            "subject_kind",
+            "subject_id"
+          ],
+          "unique": true
+        },
+        "trust_domain_membership_validity_index": {
+          "columns": [
+            "domain_id",
+            "revoked_at",
+            "expires_at"
+          ],
+          "unique": false
+        },
+        "trust_domain_memberships_token_hash_unique": {
+          "columns": [
+            "token_hash"
+          ],
+          "unique": true
+        }
+      }
     }
   }
 }

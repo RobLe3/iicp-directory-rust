@@ -116,6 +116,7 @@ fn test_state() -> AppState {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     }
 }
 
@@ -3079,6 +3080,7 @@ async fn re_register_with_known_id_preserves_reputation() {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     };
     let router = app(st);
     let body = |id: &str| {
@@ -3150,6 +3152,7 @@ async fn re_register_issues_new_token_that_works_for_heartbeat() {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     };
     let router = app(st);
     let body = serde_json::json!({
@@ -3206,6 +3209,7 @@ async fn full_lifecycle_register_discover_heartbeat() {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     };
     let router = app(st);
 
@@ -3396,6 +3400,7 @@ fn strict_e050_http_state() -> AppState {
         strict_e050_secured: true,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     }
 }
 
@@ -3978,6 +3983,7 @@ async fn register_invalid_node_id_is_422() {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     };
     for bad_id in &[
         "",
@@ -3995,6 +4001,7 @@ async fn register_invalid_node_id_is_422() {
             strict_e050_secured: false,
             allow_insecure_tls: false,
             skip_liveness_check: true,
+            restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
         })
         .oneshot(post_register(serde_json::json!({
             "node_id": bad_id,
@@ -4027,6 +4034,7 @@ async fn register_valid_custom_node_id_accepted() {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     };
     let resp = app(st)
         .oneshot(post_register(serde_json::json!({
@@ -4056,6 +4064,7 @@ async fn register_ack_contains_proxy_token() {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     };
     let resp = app(st)
         .oneshot(post_register(serde_json::json!({
@@ -4138,6 +4147,7 @@ async fn telemetry_rt03_rejects_self_report() {
         strict_e050_secured: false,
         allow_insecure_tls: false,
         skip_liveness_check: true,
+        restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
     };
     let body = serde_json::json!({
         "node_id": "self-node",

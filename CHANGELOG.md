@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add disabled-by-default restricted trust-domain membership persistence,
+  issuance, rotation, revocation, startup validation and HTTP admission.
+- Consume the existing shared CUG decision fixture without changing public
+  mode, federation state or Genesis authority.
+
+## Unreleased
+
 - Pin the pre-normative restricted trust-domain fixture and execute all 30
   CUG-01 through CUG-10 decisions through one pure Rust policy.
 - This establishes semantic parity evidence only. Membership persistence, HTTP

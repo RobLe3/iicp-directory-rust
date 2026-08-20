@@ -40,6 +40,7 @@ mod registry;
 mod replica;
 mod repo;
 mod reputation;
+mod restricted_domain_auth;
 mod router;
 mod runtime;
 mod schema;
@@ -660,6 +661,10 @@ async fn main() {
                 }
                 Ok(())
             }
+            command @ (cli::Command::TrustDomainMembershipIssue { .. }
+            | cli::Command::TrustDomainMembershipRevoke { .. }) => {
+                restricted_domain_auth::run_command(command).await
+            }
             command => runtime::run_operational_command(command).await,
         };
         if let Err(error) = result {
@@ -679,6 +684,7 @@ async fn main() {
         }
     };
     let runtime = runtime::initialize_repository(env, VERSION, signing_key.clone()).await;
+    let mysql_pool = runtime.mysql_pool.clone();
     let repo = runtime.repo;
     // Local runtime health is implementation-level state, not a wire-protocol profile.
     // A scheduler checkpoint and the stale-node supervisor advance independently so a
@@ -708,6 +714,18 @@ async fn main() {
     // Capture the seed URL first: it both drives the sync loop and the write-gate
     // (DIR-FED-18) so the replica 307-redirects writes to the seed.
     let replica_config = replica::ReplicaConfig::from_env();
+    let restricted_config =
+        restricted_domain_auth::RestrictedDomainConfig::from_env(replica_config.is_some())
+            .unwrap_or_else(|error| {
+                eprintln!("FATAL: {error}");
+                std::process::exit(1)
+            });
+    let restricted_domain =
+        restricted_domain_auth::RestrictedDomainService::new(restricted_config, mysql_pool)
+            .unwrap_or_else(|error| {
+                eprintln!("FATAL: {error}");
+                std::process::exit(1)
+            });
     let directory_identity = match config::directory_identity(replica_config.as_ref()) {
         Ok(identity) => identity,
         Err(error) => {
@@ -740,6 +758,7 @@ async fn main() {
         strict_e050_secured: config::strict_e050_secured(),
         allow_insecure_tls: config::allow_insecure_tls(env),
         skip_liveness_check: config::skip_liveness_check(env),
+        restricted_domain,
     };
     let router = match replica_seed_url {
         Some(seed) => app(state).layer(middleware::from_fn_with_state(seed, replica_write_gate)),

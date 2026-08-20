@@ -397,4 +397,22 @@ CREATE TABLE `reputations` (
   PRIMARY KEY (`node_id`),
   CONSTRAINT `reputations_node_id_foreign` FOREIGN KEY (`node_id`) REFERENCES `nodes` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE `trust_domain_memberships` (
+  `id` char(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `domain_id` varchar(191) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `subject_kind` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `subject_id` varchar(191) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `issuer_id` varchar(191) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `token_hash` char(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `scopes` json NOT NULL,
+  `generation` bigint unsigned NOT NULL DEFAULT '1',
+  `expires_at` timestamp NOT NULL,
+  `revoked_at` timestamp NULL DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT NULL,
+  `updated_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `trust_domain_membership_subject_unique` (`domain_id`,`subject_kind`,`subject_id`),
+  UNIQUE KEY `trust_domain_memberships_token_hash_unique` (`token_hash`),
+  KEY `trust_domain_membership_validity_index` (`domain_id`,`revoked_at`,`expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 SET FOREIGN_KEY_CHECKS=1;
