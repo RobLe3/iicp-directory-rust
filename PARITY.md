@@ -21,11 +21,17 @@ pre-normative IICP Profile candidate and pinned at SHA-256
 `0b23cc925dd3409d1c39d788e54281e60255b16dcd83fe5e4be84720ddd6039f`.
 The Rust policy classifies all 30 vectors in their stable refusal order.
 
-This is semantic evidence, not an implementation-support claim. The operator
-preview does not yet persist membership or enforce it on HTTP routes, peer
-inputs, relay selection or federation. Public behavior is unchanged. PHP
-remains Genesis authority, and no cutover, deployment or federation activation
-is authorized by this fixture work.
+`parity/restricted-trust-domain-membership-v0.json` is the byte-identical
+Ed25519 known-answer fixture for peer-verifiable membership. The operator CLI
+can issue the signed assertion alongside the separate directory bearer
+credential when the subject's identity key is supplied. The bearer value is
+never included in the assertion.
+
+The preview persists membership and enforces it on protected directory HTTP
+routes. Rust client peer admission, relay selection, CIP inheritance and
+federation enforcement remain separate work. Public behavior is unchanged.
+PHP remains Genesis authority, and no cutover, deployment or federation
+activation is authorized by this work.
 
 The post-`v1.10.76` refresh is tracked by issue #1 and its bounded follow-ups.
 Signed-event appends now use the PHP-compatible durable, row-locked chain head;

@@ -72,6 +72,10 @@ pub(crate) enum Command {
         scopes: Vec<String>,
         #[arg(long, default_value_t = 86_400)]
         ttl_seconds: u64,
+        #[arg(long, requires = "subject_public_key")]
+        subject_key_id: Option<String>,
+        #[arg(long, requires = "subject_key_id")]
+        subject_public_key: Option<String>,
     },
     /// Revoke the current restricted trust-domain membership for a subject.
     TrustDomainMembershipRevoke {
