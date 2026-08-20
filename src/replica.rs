@@ -518,6 +518,14 @@ fn node_from_register(node_id: &str, payload: &Value) -> Option<Node> {
         active_jobs: 0,
         max_concurrent: 4,
         reputation_score: 0.5,
+        reputation_model: payload
+            .get("reputation_model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        reputation_epoch: payload
+            .get("reputation_epoch")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         latency_estimate_ms: None,
         completed_tasks_count: 0,
         tasks_failed: 0,

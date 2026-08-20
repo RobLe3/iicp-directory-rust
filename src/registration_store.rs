@@ -40,12 +40,13 @@ async fn upsert_node(
     sqlx::query(
         r#"INSERT INTO nodes
              (id, endpoint, region, available, relay_capable, node_token_hash, node_hmac_key,
-              proxy_token_hash, max_concurrent, tokens_per_min, reputation_score, status,
+              proxy_token_hash, max_concurrent, tokens_per_min, reputation_score,
+              reputation_model, reputation_epoch, status,
               operator_pubkey, operator_verified, operator_trust_tier, backend,
               sdk_language, implementation_name, implementation_version, sdk_compatibility_version, sdk_version,
               supported_receipt_profiles, public_listing, operator_url, policy_manifest,
               credit_cost_multiplier, pricing_model)
-           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE
              endpoint = VALUES(endpoint), region = VALUES(region), available = 1,
              relay_capable = VALUES(relay_capable), status = 'active',
@@ -78,6 +79,8 @@ async fn upsert_node(
     .bind(proxy_hash)
     .bind(rec.node.max_concurrent)
     .bind(reputation::STARTING_SCORE as f32)
+    .bind(&rec.node.reputation_model)
+    .bind(&rec.node.reputation_epoch)
     .bind(&rec.node.operator_pubkey)
     .bind(rec.node.operator_verified)
     .bind(&rec.node.operator_trust_tier)

@@ -50,6 +50,8 @@ fn test_state() -> AppState {
             active_jobs: 0,
             max_concurrent: 4,
             reputation_score: 0.8,
+            reputation_model: Some("outcome-v2".into()),
+            reputation_epoch: Some("test-epoch".into()),
             latency_estimate_ms: None,
             completed_tasks_count: 0,
             health_label: Some("healthy".into()),
@@ -3780,7 +3782,10 @@ async fn heartbeat_persists_tasks_failed_for_success_signal() {
     // success signal can be computed.
     let st = test_state();
     // a/b exist in test_state; heartbeat node "a" with 7 ok + 3 failed.
-    let new = st.repo.heartbeat("a", 0.1, true, 0, 10, 3, 0.0, None).await;
+    let new = st
+        .repo
+        .heartbeat("a", 0.1, true, 0, 10, 3, 0.0, None, None)
+        .await;
     assert!(new.is_some());
     let n = st.repo.get("a").await.expect("node a");
     assert_eq!(n.completed_tasks_count, 10, "tasks_total += success+failed");
@@ -4225,6 +4230,7 @@ async fn heartbeat_stores_health_models_when_provided() {
             0,
             0,
             0.0,
+            None,
             Some(vec!["llama3:latest".into(), "qwen2.5:0.5b".into()]),
         )
         .await;
@@ -4243,16 +4249,85 @@ async fn heartbeat_none_health_models_preserves_existing_list() {
     let st = test_state();
     // First heartbeat sets the list.
     st.repo
-        .heartbeat("a", 0.1, true, 0, 0, 0, 0.0, Some(vec!["model-x".into()]))
+        .heartbeat(
+            "a",
+            0.1,
+            true,
+            0,
+            0,
+            0,
+            0.0,
+            None,
+            Some(vec!["model-x".into()]),
+        )
         .await;
     // Second heartbeat with None must NOT clear it.
-    st.repo.heartbeat("a", 0.2, true, 0, 0, 0, 0.0, None).await;
+    st.repo
+        .heartbeat("a", 0.2, true, 0, 0, 0, 0.0, None, None)
+        .await;
     let n = st.repo.get("a").await.expect("node a");
     assert_eq!(
         n.health_models.as_deref(),
         Some(["model-x".to_string()].as_slice()),
         "#494: None health_models must not overwrite an existing list (backward compat)"
     );
+}
+
+#[tokio::test]
+async fn heartbeat_duplicate_metrics_batch_is_acknowledged_without_reapplication() {
+    let st = test_state();
+    let first = st
+        .repo
+        .heartbeat(
+            "a",
+            0.1,
+            true,
+            0,
+            3,
+            1,
+            -0.02,
+            Some("batch-retry-1".into()),
+            None,
+        )
+        .await
+        .expect("first heartbeat");
+    let duplicate = st
+        .repo
+        .heartbeat(
+            "a",
+            0.1,
+            true,
+            0,
+            3,
+            1,
+            -0.02,
+            Some("batch-retry-1".into()),
+            None,
+        )
+        .await
+        .expect("duplicate heartbeat");
+
+    assert!(first.metrics_applied);
+    assert!(!duplicate.metrics_applied);
+    assert_eq!(duplicate.score, first.score);
+    let node = st.repo.get("a").await.expect("node a");
+    assert_eq!(node.completed_tasks_count, 3);
+    assert_eq!(node.tasks_failed, 1);
+}
+
+#[tokio::test]
+async fn audit_integrity_evidence_does_not_change_outcome_reputation() {
+    let st = test_state();
+    let before = st.repo.get("a").await.expect("node a").reputation_score;
+    let result = st
+        .repo
+        .apply_audit_report("a", "reporter", "declaration_divergence")
+        .await;
+    let after = st.repo.get("a").await.expect("node a").reputation_score;
+
+    assert!(result.applied);
+    assert_eq!(result.reason, "integrity_evidence_accepted");
+    assert_eq!(before, after);
 }
 
 /// discover ?model= filter uses health_models when present.
@@ -4295,6 +4370,8 @@ async fn discover_excludes_node_with_empty_health_models_unfiltered() {
             active_jobs: 0,
             max_concurrent: 4,
             reputation_score: 0.8,
+            reputation_model: Some("outcome-v2".into()),
+            reputation_epoch: Some("test-epoch".into()),
             latency_estimate_ms: None,
             completed_tasks_count: 0,
             health_label: Some("healthy".into()),

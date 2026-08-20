@@ -8,30 +8,15 @@
 
 /// Normative delta constants — iicp-semantics §11.2.
 const DELTA_SUCCESS: f64 = 0.01;
-const DELTA_OK: f64 = 0.0;
-const DELTA_LATENCY_BREACH: f64 = -0.05;
 const DELTA_FAILURE: f64 = -0.05;
-/// Interactive QoS latency budget (ms) — iicp-semantics §11.1.
-const LATENCY_BUDGET_MS: f64 = 2000.0;
 /// RT-01 (#375): a single heartbeat's positive delta is capped so self-reported task
 /// counts cannot inflate a score from 0.5 → 1.0 in one call.
 const MAX_POSITIVE_DELTA_PER_HEARTBEAT: f64 = 0.10;
 
 /// Compute the reputation delta for one heartbeat's reported task outcomes.
 /// Positive component is capped (RT-01); negative component (failures) is not.
-pub fn compute_delta(tasks_success: u32, tasks_failed: u32, avg_latency_ms: f64) -> f64 {
-    let mut delta = 0.0;
-
-    if tasks_success > 0 {
-        let per_success = if avg_latency_ms <= LATENCY_BUDGET_MS {
-            DELTA_SUCCESS
-        } else if avg_latency_ms <= LATENCY_BUDGET_MS * 2.0 {
-            DELTA_OK
-        } else {
-            DELTA_LATENCY_BREACH
-        };
-        delta += tasks_success as f64 * per_success;
-    }
+pub fn compute_delta(tasks_success: u32, tasks_failed: u32, _avg_latency_ms: f64) -> f64 {
+    let mut delta = tasks_success as f64 * DELTA_SUCCESS;
 
     delta += tasks_failed as f64 * DELTA_FAILURE;
 
@@ -83,20 +68,49 @@ mod tests {
     }
 
     #[test]
-    fn latency_breach_penalises_success() {
-        // success but > 2× budget → per-success is a breach penalty.
-        assert_eq!(compute_delta(1, 0, 5000.0), DELTA_LATENCY_BREACH);
+    fn slow_success_still_earns_outcome_delta() {
+        assert_eq!(compute_delta(1, 0, 5000.0), DELTA_SUCCESS);
     }
 
     #[test]
-    fn ok_band_no_change() {
-        // between budget and 2× budget → neutral.
-        assert_eq!(compute_delta(3, 0, 3000.0), DELTA_OK);
+    fn moderately_slow_success_still_earns_outcome_delta() {
+        assert_eq!(compute_delta(3, 0, 3000.0), 0.03);
     }
 
     #[test]
     fn score_clamps_to_bounds() {
         assert_eq!(apply_delta(0.98, 0.10), 1.0); // clamps high
         assert_eq!(apply_delta(0.02, -0.50), 0.0); // clamps low
+    }
+
+    #[test]
+    fn canonical_outcome_v2_fixture_matches_rust_scoring() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../parity/reputation-outcome-v2.json"))
+                .expect("valid canonical outcome-v2 fixture");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let input = &case["input"];
+            let (Some(score), Some(expected)) =
+                (input["score"].as_f64(), case["expected"]["score"].as_f64())
+            else {
+                continue;
+            };
+            if input.get("deliveries").is_some() {
+                continue;
+            }
+            let observed = apply_delta(
+                score,
+                compute_delta(
+                    input["tasks_success"].as_u64().unwrap_or(0) as u32,
+                    input["tasks_failed"].as_u64().unwrap_or(0) as u32,
+                    input["avg_latency_ms"].as_f64().unwrap_or(0.0),
+                ),
+            );
+            assert!(
+                (observed - expected).abs() < 0.000_001,
+                "{}: expected {expected}, observed {observed}",
+                case["name"]
+            );
+        }
     }
 }

@@ -231,7 +231,8 @@ pub async fn run_expire_credits_loop(repo: Arc<dyn NodeRepository>) {
     }
 }
 
-/// ReputationDecay: apply hourly -0.005 decay to all nodes above score 0.30.
+/// Legacy reputation-decay scheduler. Outcome-v2 repositories return zero
+/// because elapsed time is represented by freshness/health rather than score.
 ///
 /// Fires every 3600 seconds. Mirrors the PHP `ReputationDecayCommand` Artisan job.
 /// Without this, nodes accumulate artificially high scores since positive heartbeat

@@ -155,8 +155,8 @@ struct AuditReportRequest {
 }
 
 /// `POST /v1/audit-report` (iicp-dir §7, RT-05 griefing cap).
-/// Requires bearer auth. Applies -0.05 reputation delta to target (capped at 2
-/// distinct reporters per target per 24h to prevent griefing).
+/// Requires bearer auth. Records integrity evidence without changing outcome
+/// reputation (capped at 2 distinct reporters per target per 24h).
 async fn audit_report(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
