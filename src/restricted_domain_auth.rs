@@ -9,6 +9,7 @@ use axum::Json;
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, Pool, Row};
 
+use crate::restricted_domain_membership::{self, MembershipEnvelope, MembershipInput};
 use crate::state::AppState;
 
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -29,6 +30,7 @@ pub(crate) struct RestrictedDomainConfig {
     pub(crate) enabled: bool,
     pub(crate) domain_id: String,
     pub(crate) authority_id: String,
+    pub(crate) authority_key_id: String,
     pub(crate) membership_epoch: u64,
     pub(crate) max_credential_ttl_seconds: u64,
 }
@@ -40,6 +42,8 @@ impl RestrictedDomainConfig {
             enabled,
             domain_id: std::env::var("IICP_TRUST_DOMAIN_ID").unwrap_or_default(),
             authority_id: std::env::var("IICP_TRUST_DOMAIN_AUTHORITY_ID").unwrap_or_default(),
+            authority_key_id: std::env::var("IICP_TRUST_DOMAIN_AUTHORITY_KEY_ID")
+                .unwrap_or_default(),
             membership_epoch: number("IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH", 1),
             max_credential_ttl_seconds: number("IICP_TRUST_DOMAIN_MAX_CREDENTIAL_TTL", 86_400),
         };
@@ -90,6 +94,7 @@ impl RestrictedDomainService {
                 enabled: false,
                 domain_id: String::new(),
                 authority_id: String::new(),
+                authority_key_id: String::new(),
                 membership_epoch: 1,
                 max_credential_ttl_seconds: 86_400,
             },
@@ -154,6 +159,62 @@ impl RestrictedDomainService {
         scopes: &[String],
         ttl: u64,
     ) -> Result<String, String> {
+        Ok(self.issue_record(kind, subject, scopes, ttl).await?.token)
+    }
+
+    async fn issue_with_assertion(
+        &self,
+        kind: &str,
+        subject: &str,
+        scopes: &[String],
+        ttl: u64,
+        keys: AssertionKeys<'_>,
+    ) -> Result<(String, MembershipEnvelope), String> {
+        if keys.subject_key_id.trim().is_empty() {
+            return Err("subject key identifier is required".into());
+        }
+        let requested_peer_scopes: Vec<String> = scopes
+            .iter()
+            .filter(|scope| is_peer_scope(scope.as_str()))
+            .cloned()
+            .collect();
+        restricted_domain_membership::validate_signing_inputs(
+            keys.subject_public_key,
+            keys.signing_key,
+            &requested_peer_scopes,
+        )?;
+        let record = self.issue_record(kind, subject, scopes, ttl).await?;
+        let authority_key_id = if self.config.authority_key_id.trim().is_empty() {
+            format!("{}#key-1", self.config.authority_id)
+        } else {
+            self.config.authority_key_id.clone()
+        };
+        let assertion = restricted_domain_membership::sign(
+            MembershipInput {
+                domain_id: &self.config.domain_id,
+                authority_id: &self.config.authority_id,
+                authority_key_id: &authority_key_id,
+                subject_kind: kind,
+                subject_id: subject,
+                subject_key_id: keys.subject_key_id,
+                subject_public_key: keys.subject_public_key,
+                generation: record.generation,
+                issued_at: record.issued_at,
+                expires_at: record.expires_at,
+                scopes: record.peer_scopes,
+            },
+            keys.signing_key,
+        )?;
+        Ok((record.token, assertion))
+    }
+
+    async fn issue_record(
+        &self,
+        kind: &str,
+        subject: &str,
+        scopes: &[String],
+        ttl: u64,
+    ) -> Result<IssuedMembership, String> {
         if !self.config.enabled {
             return Err("restricted trust-domain mode is not enabled".into());
         }
@@ -183,6 +244,7 @@ impl RestrictedDomainService {
         );
         let digest = hex::encode(Sha256::digest(token.as_bytes()));
         let ttl = ttl.clamp(60, self.config.max_credential_ttl_seconds);
+        let issued_at = chrono::Utc::now().timestamp();
         let mut tx = pool
             .begin()
             .await
@@ -203,7 +265,18 @@ impl RestrictedDomainService {
         tx.commit()
             .await
             .map_err(|_| "membership persistence failed")?;
-        Ok(token)
+        let peer_scopes = normalized
+            .iter()
+            .filter(|scope| is_peer_scope(scope))
+            .map(|scope| (*scope).to_string())
+            .collect();
+        Ok(IssuedMembership {
+            token,
+            generation,
+            issued_at,
+            expires_at: issued_at + ttl as i64,
+            peer_scopes,
+        })
     }
 
     pub(crate) async fn revoke(&self, kind: &str, subject: &str) -> Result<bool, String> {
@@ -215,6 +288,27 @@ impl RestrictedDomainService {
             .bind(&self.config.domain_id).bind(kind).bind(subject).execute(pool).await.map_err(|_| "membership persistence failed")?;
         Ok(result.rows_affected() == 1)
     }
+}
+
+fn is_peer_scope(scope: &str) -> bool {
+    matches!(
+        scope,
+        "bootstrap" | "peers" | "relay" | "execution" | "cip" | "federation"
+    )
+}
+
+struct IssuedMembership {
+    token: String,
+    generation: u64,
+    issued_at: i64,
+    expires_at: i64,
+    peer_scopes: Vec<String>,
+}
+
+struct AssertionKeys<'a> {
+    subject_key_id: &'a str,
+    subject_public_key: &'a str,
+    signing_key: &'a str,
 }
 
 pub(crate) async fn run_command(command: crate::cli::Command) -> Result<(), String> {
@@ -236,9 +330,35 @@ pub(crate) async fn run_command(command: crate::cli::Command) -> Result<(), Stri
             subject,
             scopes,
             ttl_seconds,
+            subject_key_id,
+            subject_public_key,
         } => {
-            let token = service.issue(&kind, &subject, &scopes, ttl_seconds).await?;
-            println!("{token}");
+            if let (Some(key_id), Some(public_key)) = (subject_key_id, subject_public_key) {
+                let signing_key = crate::config::signing_key(crate::config::environment())?
+                    .ok_or("directory signing key is required for a peer-verifiable assertion")?;
+                let (token, assertion) = service
+                    .issue_with_assertion(
+                        &kind,
+                        &subject,
+                        &scopes,
+                        ttl_seconds,
+                        AssertionKeys {
+                            subject_key_id: &key_id,
+                            subject_public_key: &public_key,
+                            signing_key: &signing_key,
+                        },
+                    )
+                    .await?;
+                println!("{token}");
+                println!(
+                    "{}",
+                    serde_json::to_string(&assertion)
+                        .map_err(|_| "membership assertion serialization failed")?
+                );
+            } else {
+                let token = service.issue(&kind, &subject, &scopes, ttl_seconds).await?;
+                println!("{token}");
+            }
         }
         crate::cli::Command::TrustDomainMembershipRevoke { kind, subject } => {
             if !service.revoke(&kind, &subject).await? {
@@ -341,6 +461,7 @@ mod tests {
             enabled: true,
             domain_id: "".into(),
             authority_id: "a".into(),
+            authority_key_id: "a#key-1".into(),
             membership_epoch: 1,
             max_credential_ttl_seconds: 60,
         };
@@ -349,6 +470,7 @@ mod tests {
             enabled: true,
             domain_id: "d".into(),
             authority_id: "a".into(),
+            authority_key_id: "a#key-1".into(),
             membership_epoch: 1,
             max_credential_ttl_seconds: 60,
         };
@@ -371,6 +493,7 @@ mod tests {
             enabled: true,
             domain_id: "test.example".into(),
             authority_id: "did:web:directory.test".into(),
+            authority_key_id: "did:web:directory.test#key-1".into(),
             membership_epoch: 1,
             max_credential_ttl_seconds: 3600,
         };

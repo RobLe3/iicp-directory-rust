@@ -10,13 +10,9 @@
   keeping latency, health and integrity evidence separate.
 - Advance SDK release-currency evidence to the coordinated 0.7.106 candidate
   and pin PHP directory 1.10.93 parity.
-
-
-- Pin the pre-normative restricted trust-domain fixture and execute all 30
-  CUG-01 through CUG-10 decisions through one pure Rust policy.
-- This establishes semantic parity evidence only. Membership persistence, HTTP
-  enforcement, migration compatibility and federation remain incomplete and
-  disabled; PHP remains Genesis authority.
+- Add optional directory-signed, peer-verifiable membership assertions using
+  the shared deterministic Ed25519 fixture. The separate bearer credential is
+  not exposed to peers, and public defaults remain unchanged.
 
 ## 0.1.13 — 2026-08-15
 

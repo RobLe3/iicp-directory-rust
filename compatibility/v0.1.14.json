@@ -28,6 +28,10 @@
       "path": "parity/federation-profile-v1.json",
       "sha256": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9"
     },
+    "restricted_domain_membership": {
+      "path": "parity/restricted-trust-domain-membership-v0.json",
+      "sha256": "78cb70b19dabed5be0175555cf2b4bb123dd4bc77ce36b67b745f311f3d941d4"
+    },
     "schema": {
       "path": "schema/contract-v1.json",
       "sha256": "c3567df04131cbbddf8cf236268f576f2cd611def0b4b228a7954a2d56d0e655"

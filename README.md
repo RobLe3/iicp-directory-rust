@@ -140,6 +140,7 @@ For a durable installation, backup and recovery guidance, read
 | `IICP_RESTRICTED_DOMAIN_ENABLED` | `false` | Enables fail-closed restricted trust-domain admission on registration, discovery, bootstrap, heartbeat, peer, dispatch and relay surfaces. |
 | `IICP_TRUST_DOMAIN_ID` | — | Stable restricted-domain identifier. Required when restricted mode is enabled. |
 | `IICP_TRUST_DOMAIN_AUTHORITY_ID` | — | Membership issuer identifier. Required when restricted mode is enabled. |
+| `IICP_TRUST_DOMAIN_AUTHORITY_KEY_ID` | `<authority-id>#key-1` | Verification-method identifier placed in peer-verifiable membership assertions. |
 | `IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH` | `1` | Minimum accepted credential generation; increasing it invalidates older credentials. |
 | `IICP_TRUST_DOMAIN_MAX_CREDENTIAL_TTL` | `86400` | Maximum membership lifetime in seconds, with a minimum of 60. |
 
@@ -155,12 +156,17 @@ local and prints a newly issued credential only once:
 
 ```bash
 iicp-directory-rs trust-domain-membership-issue \
-  --kind node --subject node-1 --scopes registration,heartbeat,peers
+  --kind node --subject node-1 --scopes registration,heartbeat,peers \
+  --subject-key-id 'did:key:node-1#key-1' \
+  --subject-public-key BASE64URL_ED25519_PUBLIC_KEY
 iicp-directory-rs trust-domain-membership-revoke --kind node --subject node-1
 ```
 
-These controls do not make the Rust preview the Genesis authority and do not
-enable cross-domain federation.
+Supplying both subject-key options also prints a short-lived, directory-signed
+membership assertion. It binds public identity, domain, generation, expiry and
+peer scopes without exposing the bearer credential. These controls do not make
+the Rust preview the Genesis authority and do not enable cross-domain
+federation.
 
 ## Test baseline
 

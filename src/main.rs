@@ -41,6 +41,7 @@ mod replica;
 mod repo;
 mod reputation;
 mod restricted_domain_auth;
+mod restricted_domain_membership;
 mod router;
 mod runtime;
 mod schema;
