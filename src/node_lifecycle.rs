@@ -950,6 +950,8 @@ pub(crate) async fn register(
         active_jobs: 0,
         max_concurrent: 0,
         reputation_score: reputation::STARTING_SCORE,
+        reputation_model: Some("outcome-v2".to_string()),
+        reputation_epoch: Some("outcome-v2-initial".to_string()),
         latency_estimate_ms: None,
         completed_tasks_count: 0,
         health_label: None,

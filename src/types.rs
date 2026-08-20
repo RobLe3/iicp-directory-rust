@@ -96,6 +96,10 @@ pub struct Node {
     #[serde(default)]
     pub reputation_score: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reputation_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reputation_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_estimate_ms: Option<u32>,
     #[serde(default)]
     pub completed_tasks_count: u64,

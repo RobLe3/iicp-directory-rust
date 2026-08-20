@@ -2341,6 +2341,8 @@ mod tests {
             active_jobs: 0,
             max_concurrent: 4,
             reputation_score: rep,
+            reputation_model: Some("outcome-v2".into()),
+            reputation_epoch: Some("test-epoch".into()),
             latency_estimate_ms: None,
             completed_tasks_count: 0,
             health_label: None,

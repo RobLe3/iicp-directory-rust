@@ -470,6 +470,10 @@ struct NodeRow {
     endpoint: String,
     region: String,
     reputation_score: f64,
+    #[sqlx(default)]
+    reputation_model: Option<String>,
+    #[sqlx(default)]
+    reputation_epoch: Option<String>,
     available: bool,
     load: f64,
     active_jobs: u32,
@@ -643,6 +647,8 @@ impl From<NodeRow> for Node {
             active_jobs: r.active_jobs,
             max_concurrent: r.max_concurrent,
             reputation_score: rep,
+            reputation_model: r.reputation_model,
+            reputation_epoch: r.reputation_epoch,
             latency_estimate_ms: if lat > 0.0 { Some(lat as u32) } else { None },
             completed_tasks_count: r.tasks_total as u64,
             // ADR-044 health vector computed from full telemetry — deferred to Phase 2.
@@ -1578,7 +1584,7 @@ impl NodeRepository for MySqlRepo {
             n => n as u32,
         };
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT n.id, n.endpoint, n.region, n.reputation_score, n.available,
+            r#"SELECT n.id, n.endpoint, n.region, n.reputation_score, n.reputation_model, n.reputation_epoch, n.available,
                       n.load, n.active_jobs, n.max_concurrent, n.tasks_total,
                       n.avg_latency_ms, n.exposure_mode, n.transport_endpoint,
                       n.credit_cost_multiplier, n.pricing_model, n.attested, n.tasks_failed,
@@ -1702,7 +1708,7 @@ impl NodeRepository for MySqlRepo {
     /// Fetch a single node by id for the node-detail endpoint (iicp-dir §3.4.x).
     async fn get(&self, node_id: &str) -> Option<Node> {
         let row: Option<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
                       available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                       tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                       exposure_mode, transport_endpoint,
@@ -1729,7 +1735,7 @@ impl NodeRepository for MySqlRepo {
         // custom name), AVAILABLE only, exact match preferred. The website resolves node
         // detail by 8-hex prefix, so exact-only get() would 404 those.
         let row: Option<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
                       available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                       tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                       exposure_mode, transport_endpoint,
@@ -1773,7 +1779,7 @@ impl NodeRepository for MySqlRepo {
     /// Bootstrap: return recently-seen active nodes sorted by last_seen desc (iicp-dir §3.7).
     async fn bootstrap(&self, limit: usize) -> Vec<Node> {
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
                       available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                       tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                       exposure_mode, transport_endpoint,
@@ -1798,7 +1804,7 @@ impl NodeRepository for MySqlRepo {
     /// as `bootstrap`/`active_count`, no LIMIT.
     async fn active_nodes(&self) -> Vec<Node> {
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
                       available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                       tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                       exposure_mode, transport_endpoint,
@@ -1858,7 +1864,8 @@ impl NodeRepository for MySqlRepo {
         if known_ids.is_empty() {
             let rows: Vec<NodeRow> = sqlx::query_as(
                 r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
-                          available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                          reputation_model, reputation_epoch, available,
+                          CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                           tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                           exposure_mode, transport_endpoint,
                           CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
@@ -1880,7 +1887,7 @@ impl NodeRepository for MySqlRepo {
         // Fetch all candidates and filter in Rust to avoid dynamic SQL binding complexity.
         // known_ids is bounded (max 20) so this is safe — no unbounded IN clause.
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
                       available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                       tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                       exposure_mode, transport_endpoint,
@@ -1951,7 +1958,7 @@ impl NodeRepository for MySqlRepo {
     async fn list_public(&self, offset: u64, limit: usize) -> Vec<Node> {
         let cap = limit.min(100) as u32;
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
                       available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                       tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                       exposure_mode, transport_endpoint,
@@ -3619,7 +3626,7 @@ impl NodeRepository for MySqlRepo {
     async fn snapshot_records(&self) -> Vec<NodeRecord> {
         // All nodes (the active_nodes row-map without the liveness WHERE) + their intents.
         let rows: Vec<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score,
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
                       available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
                       tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
                       exposure_mode, transport_endpoint,
