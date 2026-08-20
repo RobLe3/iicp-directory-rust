@@ -1,13 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.1.14 — 2026-08-20
 
 - Add disabled-by-default restricted trust-domain membership persistence,
   issuance, rotation, revocation, startup validation and HTTP admission.
 - Consume the existing shared CUG decision fixture without changing public
   mode, federation state or Genesis authority.
+- Add outcome-v2 reputation persistence and idempotent heartbeat metric batches,
+  keeping latency, health and integrity evidence separate.
+- Advance SDK release-currency evidence to the coordinated 0.7.106 candidate
+  and pin PHP directory 1.10.93 parity.
 
-## Unreleased
 
 - Pin the pre-normative restricted trust-domain fixture and execute all 30
   CUG-01 through CUG-10 decisions through one pure Rust policy.
