@@ -1115,6 +1115,8 @@ pub(crate) struct HeartbeatRequest {
     #[serde(default)]
     metrics: Option<HeartbeatMetrics>,
     #[serde(default)]
+    metrics_batch_id: Option<String>,
+    #[serde(default)]
     pricing: Option<HeartbeatPricing>,
     /// #494 — live model list probed by the SDK on each heartbeat.
     /// null / absent = SDK did not report (backward compat); [] = no models loaded.
@@ -1153,6 +1155,11 @@ pub(crate) async fn heartbeat(
     }
 
     let m = req.metrics.unwrap_or_default();
+    if req.metrics_batch_id.as_ref().is_some_and(|id| {
+        id.is_empty() || id.len() > 64 || !id.bytes().all(|b| (0x21..=0x7e).contains(&b))
+    }) {
+        return reject("validation_error", "invalid metrics_batch_id");
+    }
     // PHP HeartbeatController caps tasks at 1000 per call (physically implausible above this).
     let tasks_success = m.tasks_success.min(1000);
     let tasks_failed = m.tasks_failed.min(1000);
@@ -1203,11 +1210,13 @@ pub(crate) async fn heartbeat(
             tasks_delta,
             tasks_failed,
             delta,
+            req.metrics_batch_id.clone(),
             req.health_models,
         )
         .await
     {
-        Some(score) => {
+        Some(outcome) => {
+            let score = outcome.score;
             let next_challenge = hex::encode(uuid::Uuid::new_v4().as_bytes());
             if st
                 .repo
@@ -1230,7 +1239,7 @@ pub(crate) async fn heartbeat(
                 );
             }
             // PHP logs REPUTATION_UPDATE event when tasks are reported (Phase 6 prereq).
-            if tasks_delta > 0 {
+            if tasks_delta > 0 && outcome.metrics_applied {
                 let payload = serde_json::json!({
                     "source": "heartbeat_metrics",
                     "tasks_success": tasks_success,
@@ -1252,6 +1261,9 @@ pub(crate) async fn heartbeat(
                 "ok": true,
                 "next_heartbeat_ms": 30000,
                 "reputation_score": (score * 10000.0).round() / 10000.0,
+                "reputation_model": outcome.reputation_model,
+                "reputation_epoch": outcome.reputation_epoch,
+                "metrics_batch_accepted": req.metrics_batch_id,
                 "challenge": next_challenge,
             });
             if free_credits > 0.0 {

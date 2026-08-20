@@ -137,6 +137,14 @@ pub struct DiscoverQuery {
     pub min_reputation: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HeartbeatOutcome {
+    pub score: f64,
+    pub metrics_applied: bool,
+    pub reputation_model: String,
+    pub reputation_epoch: Option<String>,
+}
+
 #[async_trait]
 pub trait NodeRepository: Send + Sync {
     /// Return scored, filtered nodes for a discovery query (iicp-dir §3.3/§3.4).
@@ -163,10 +171,11 @@ pub trait NodeRepository: Send + Sync {
         // computed (was previously folded into tasks_delta and dropped).
         tasks_failed_delta: u32,
         delta: f64,
+        metrics_batch_id: Option<String>,
         // #494 — live model list probed by the SDK on each heartbeat.
         // None = SDK did not report (backward compat); Some([]) = no models loaded.
         health_models: Option<Vec<String>>,
-    ) -> Option<f64>;
+    ) -> Option<HeartbeatOutcome>;
 
     /// Fetch a single node by id for the node-detail endpoint (iicp-dir §3.4.x). `None` if unknown.
     async fn get(&self, node_id: &str) -> Option<Node>;
@@ -210,10 +219,8 @@ pub trait NodeRepository: Send + Sync {
     /// Returns the IDs of nodes that were just marked dormant (uptime tracking #508).
     async fn expire_stale(&self) -> Vec<String>;
 
-    /// Apply one hourly reputation decay pass (iicp-semantics §11 decay rule: -0.005/hr,
-    /// floor 0.30). Called by the ReputationDecay background task (every 3600s).
-    /// InMemoryRepo applies the decay in-memory; MySqlRepo uses a single UPDATE.
-    /// Returns the count of nodes whose score was updated.
+    /// Legacy compatibility hook. `outcome-v2` does not change with elapsed
+    /// time; freshness and liveness are separate evidence dimensions.
     async fn decay_reputation_pass(&self) -> u32;
 
     /// Public node listing for `/v1/registry/nodes` (ADR-017, iicp-dir §3.10a).
@@ -907,6 +914,7 @@ pub struct InMemoryRepo {
     operators: std::sync::Mutex<std::collections::HashMap<String, OperatorRow>>,
     dispatch_usage: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
     probe_results: std::sync::Mutex<Vec<ProbeResult>>,
+    last_metrics_batches: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// In-memory operator-identity record (#463/#310). `ordinal`/`tier`/`badge` are the founder
@@ -949,6 +957,7 @@ impl InMemoryRepo {
             operators: std::sync::Mutex::new(std::collections::HashMap::new()),
             dispatch_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
             probe_results: std::sync::Mutex::new(Vec::new()),
+            last_metrics_batches: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1190,22 +1199,39 @@ impl NodeRepository for InMemoryRepo {
         tasks_delta: u32,
         tasks_failed_delta: u32,
         delta: f64,
+        metrics_batch_id: Option<String>,
         health_models: Option<Vec<String>>,
-    ) -> Option<f64> {
+    ) -> Option<HeartbeatOutcome> {
         let mut guard = self.records.lock().unwrap();
         let rec = guard.iter_mut().find(|r| r.node.node_id == node_id)?;
+        let metrics_applied = metrics_batch_id.as_ref().is_none_or(|batch_id| {
+            let mut batches = self.last_metrics_batches.lock().unwrap();
+            if batches.get(node_id) == Some(batch_id) {
+                false
+            } else {
+                batches.insert(node_id.to_string(), batch_id.clone());
+                true
+            }
+        });
         rec.node.load = load;
         rec.node.available = available;
         rec.node.active_jobs = active_jobs;
-        rec.node.completed_tasks_count += tasks_delta as u64;
-        rec.node.tasks_failed += tasks_failed_delta as u64;
-        rec.node.reputation_score =
-            crate::reputation::apply_delta(rec.node.reputation_score, delta);
+        if metrics_applied {
+            rec.node.completed_tasks_count += tasks_delta as u64;
+            rec.node.tasks_failed += tasks_failed_delta as u64;
+            rec.node.reputation_score =
+                crate::reputation::apply_delta(rec.node.reputation_score, delta);
+        }
         // #494 — update live model list only when the SDK reported one.
         if health_models.is_some() {
             rec.node.health_models = health_models;
         }
-        Some(rec.node.reputation_score)
+        Some(HeartbeatOutcome {
+            score: rec.node.reputation_score,
+            metrics_applied,
+            reputation_model: "outcome-v2".to_string(),
+            reputation_epoch: Some("outcome-v2-initial".to_string()),
+        })
     }
 
     async fn get(&self, node_id: &str) -> Option<Node> {
@@ -1314,17 +1340,7 @@ impl NodeRepository for InMemoryRepo {
     }
 
     async fn decay_reputation_pass(&self) -> u32 {
-        const FLOOR: f64 = 0.30;
-        const DECAY: f64 = 0.005;
-        let mut guard = self.records.lock().unwrap();
-        let mut count = 0u32;
-        for rec in guard.iter_mut() {
-            if rec.node.reputation_score > FLOOR {
-                rec.node.reputation_score = (rec.node.reputation_score - DECAY).max(FLOOR);
-                count += 1;
-            }
-        }
-        count
+        0
     }
 
     async fn list_public(&self, offset: u64, limit: usize) -> Vec<Node> {
@@ -1674,22 +1690,19 @@ impl NodeRepository for InMemoryRepo {
         (true, 1) // InMemoryRepo: always accepted, quorum=1 in test mode
     }
 
-    /// InMemoryRepo: always applies the delta (no reporter-count tracking in test mode).
+    /// InMemoryRepo: accepts the integrity evidence without changing outcome reputation.
     async fn apply_audit_report(
         &self,
         target_node_id: &str,
         _reporter_node_id: &str,
         _finding: &str,
     ) -> AuditResult {
-        const DELTA: f64 = -0.05;
         let mut guard = self.records.lock().unwrap();
         if let Some(rec) = guard.iter_mut().find(|r| r.node.node_id == target_node_id) {
-            rec.node.reputation_score =
-                crate::reputation::apply_delta(rec.node.reputation_score, DELTA);
             AuditResult {
                 applied: true,
                 new_score: rec.node.reputation_score,
-                reason: "applied",
+                reason: "integrity_evidence_accepted",
             }
         } else {
             AuditResult {
@@ -2526,29 +2539,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decay_reduces_score_above_floor() {
+    async fn outcome_v2_does_not_decay_with_elapsed_time() {
         let repo = InMemoryRepo::new(vec![
-            rec("hi", 0.9, true, 0.9, &[CHAT]),  // above floor — should decay
-            rec("lo", 0.5, true, 0.28, &[CHAT]), // below floor — should NOT decay
+            rec("hi", 0.9, true, 0.9, &[CHAT]),
+            rec("lo", 0.5, true, 0.28, &[CHAT]),
         ]);
         let count = repo.decay_reputation_pass().await;
-        assert_eq!(count, 1); // only "hi" decayed
-                              // "hi" node: reputation_score was 0.9 → after decay 0.895, still > 0.30.
-                              // Access via get() to check.
+        assert_eq!(count, 0);
         let hi = repo.get("hi").await.unwrap();
-        assert!((hi.reputation_score - 0.895).abs() < 1e-6);
-        // "lo" node: below floor, unchanged at 0.28.
+        assert!((hi.reputation_score - 0.9).abs() < 1e-6);
         let lo = repo.get("lo").await.unwrap();
         assert!((lo.reputation_score - 0.28).abs() < 1e-6);
-    }
-
-    #[tokio::test]
-    async fn decay_floors_at_0_30() {
-        let repo = InMemoryRepo::new(vec![rec("edge", 0.5, true, 0.303, &[CHAT])]);
-        repo.decay_reputation_pass().await;
-        let n = repo.get("edge").await.unwrap();
-        // 0.303 - 0.005 = 0.298 → floors to 0.30
-        assert!((n.reputation_score - 0.30).abs() < 1e-6);
     }
 
     // SECURITY (#404): operator_pubkey is the directory-private operator identity (ADR-045)

@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS nodes (
     tokens_per_min  INT UNSIGNED        NOT NULL DEFAULT 0,
     -- Denormalized from reputations (W-042 / D2prime)
     reputation_score          FLOAT             NOT NULL DEFAULT 0.5,
+    legacy_reputation_score   FLOAT             NULL,
+    reputation_model          VARCHAR(32)       NOT NULL DEFAULT 'outcome-v2',
+    reputation_epoch          CHAR(36)          NULL,
+    last_metrics_batch_id     VARCHAR(64)        NULL,
     tasks_total               INT UNSIGNED      NOT NULL DEFAULT 0,
     tasks_failed              INT UNSIGNED      NOT NULL DEFAULT 0,
     avg_latency_ms            FLOAT             NOT NULL DEFAULT 0.0,

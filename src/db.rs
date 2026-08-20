@@ -548,6 +548,9 @@ struct HeartbeatStateRow {
     rep_hourly_window_start: Option<chrono::NaiveDateTime>,
     status: String,
     dormant_since: Option<chrono::NaiveDateTime>,
+    last_metrics_batch_id: Option<String>,
+    reputation_model: String,
+    reputation_epoch: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -833,8 +836,9 @@ impl MySqlRepo {
         tasks_delta: u32,
         tasks_failed_delta: u32,
         delta: f64,
+        metrics_batch_id: Option<&str>,
         health_models: Option<&[String]>,
-    ) -> Result<Option<f64>, sqlx::Error> {
+    ) -> Result<Option<crate::repo::HeartbeatOutcome>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         // RT-01b (#381): fetch velocity window alongside score. Laravel stores
         // rep_hourly_gain as DECIMAL(8,4), so cast it for sqlx decoding.
@@ -842,7 +846,8 @@ impl MySqlRepo {
             "SELECT CAST(reputation_score AS DOUBLE) AS reputation_score, \
                     CAST(rep_hourly_gain AS DOUBLE) AS rep_hourly_gain, \
                     CAST(rep_hourly_window_start AS DATETIME) AS rep_hourly_window_start, \
-                    status, CAST(dormant_since AS DATETIME) AS dormant_since \
+                    status, CAST(dormant_since AS DATETIME) AS dormant_since, last_metrics_batch_id, \
+                    reputation_model, reputation_epoch \
              FROM nodes WHERE id = ? FOR UPDATE",
         )
         .bind(node_id)
@@ -857,6 +862,13 @@ impl MySqlRepo {
         let hourly_gain = row.rep_hourly_gain;
         let window_start = row.rep_hourly_window_start;
         let dormant_since = row.dormant_since;
+        let metrics_applied =
+            metrics_batch_id.is_none_or(|id| row.last_metrics_batch_id.as_deref() != Some(id));
+        let (tasks_delta, tasks_failed_delta, delta) = if metrics_applied {
+            (tasks_delta, tasks_failed_delta, delta)
+        } else {
+            (0, 0, 0.0)
+        };
 
         const MAX_HOURLY_GAIN: f64 = 0.20;
         let (effective_delta, new_hourly_gain, reset_window) = if delta > 0.0 {
@@ -891,6 +903,7 @@ impl MySqlRepo {
              rep_hourly_gain = ?, \
              rep_hourly_window_start = CASE WHEN ? = 1 THEN NOW() ELSE rep_hourly_window_start END, \
              health_models = COALESCE(?, health_models), \
+             last_metrics_batch_id = COALESCE(?, last_metrics_batch_id), \
              status = 'active', dormant_since = NULL, last_seen = NOW() WHERE id = ?",
         )
         .bind(load as f32)
@@ -902,6 +915,7 @@ impl MySqlRepo {
         .bind(new_hourly_gain as f32)
         .bind(reset_window as i32)
         .bind(health_models_json)
+        .bind(metrics_batch_id)
         .bind(node_id)
         .execute(&mut *tx)
         .await?;
@@ -922,7 +936,12 @@ impl MySqlRepo {
         }
 
         tx.commit().await?;
-        Ok(Some(new_score))
+        Ok(Some(crate::repo::HeartbeatOutcome {
+            score: new_score,
+            metrics_applied,
+            reputation_model: row.reputation_model,
+            reputation_epoch: row.reputation_epoch,
+        }))
     }
 }
 
@@ -1651,8 +1670,9 @@ impl NodeRepository for MySqlRepo {
         tasks_delta: u32,
         tasks_failed_delta: u32,
         delta: f64,
+        metrics_batch_id: Option<String>,
         health_models: Option<Vec<String>>,
-    ) -> Option<f64> {
+    ) -> Option<crate::repo::HeartbeatOutcome> {
         for attempt in 0..3 {
             match self
                 .heartbeat_once(
@@ -1663,6 +1683,7 @@ impl NodeRepository for MySqlRepo {
                     tasks_delta,
                     tasks_failed_delta,
                     delta,
+                    metrics_batch_id.as_deref(),
                     health_models.as_deref(),
                 )
                 .await
@@ -1917,17 +1938,9 @@ impl NodeRepository for MySqlRepo {
         ids.into_iter().map(|(id,)| id).collect()
     }
 
-    /// Reputation decay — apply -0.005 per pass (hourly), floor 0.30.
-    /// Single UPDATE touches only nodes above the floor (iicp-semantics §11 decay rule).
+    /// Legacy compatibility hook. Outcome-v2 keeps liveness/freshness separate.
     async fn decay_reputation_pass(&self) -> u32 {
-        let result = sqlx::query(
-            "UPDATE nodes \
-             SET reputation_score = GREATEST(0.30, reputation_score - 0.005) \
-             WHERE status = 'active' AND reputation_score > 0.30",
-        )
-        .execute(&self.pool)
-        .await;
-        result.map(|r| r.rows_affected() as u32).unwrap_or(0)
+        0
     }
 
     /// Public node listing (ADR-017 registry, iicp-dir §3.10a). Mirrors the PHP
@@ -2497,9 +2510,9 @@ impl NodeRepository for MySqlRepo {
             .collect()
     }
 
-    /// Audit report: RT-05 griefing cap + RT-05b reporter eligibility (#379, #383).
+    /// Audit report: integrity evidence with RT-05 griefing cap and reporter eligibility.
     /// - RT-05b bypass 1: reporter must be ≥3 days old and have reputation ≥0.55.
-    /// - RT-05b bypass 2: nodes.reputation_score is already updated here (PHP parity).
+    /// Outcome reputation is intentionally unchanged; integrity evidence remains separate.
     async fn apply_audit_report(
         &self,
         target_node_id: &str,
@@ -2507,7 +2520,6 @@ impl NodeRepository for MySqlRepo {
         _finding: &str,
     ) -> AuditResult {
         const MAX_REPORTERS: i64 = 2;
-        const DELTA: f64 = -0.05;
         const AUDIT_MIN_AGE_DAYS: i64 = 3;
         const AUDIT_MIN_REPUTATION: f64 = 0.55;
 
@@ -2591,12 +2603,7 @@ impl NodeRepository for MySqlRepo {
             };
         };
 
-        let new_score = crate::reputation::apply_delta(old_score as f64, DELTA);
-        let _ = sqlx::query("UPDATE nodes SET reputation_score = ? WHERE id = ?")
-            .bind(new_score as f32)
-            .bind(target_node_id)
-            .execute(&self.pool)
-            .await;
+        let new_score = old_score as f64;
 
         // Log the event to node_events for the reporter-count query above.
         let payload = serde_json::json!({ "reporter_node_id": reporter_node_id }).to_string();
@@ -2612,7 +2619,7 @@ impl NodeRepository for MySqlRepo {
         AuditResult {
             applied: true,
             new_score,
-            reason: "applied",
+            reason: "integrity_evidence_accepted",
         }
     }
 
@@ -4252,7 +4259,7 @@ mod tests {
         .expect("seed dormant node");
 
         let repo = MySqlRepo::with_signing_key(pool.clone(), Some(test_signing_key()));
-        repo.heartbeat("lifecycle-reactivate", 0.1, true, 0, 0, 0, 0.0, None)
+        repo.heartbeat("lifecycle-reactivate", 0.1, true, 0, 0, 0, 0.0, None, None)
             .await
             .expect("reactivation heartbeat");
 
@@ -4276,7 +4283,7 @@ mod tests {
         .expect("count first reactivation event");
         assert_eq!(events, 1);
 
-        repo.heartbeat("lifecycle-reactivate", 0.1, true, 0, 0, 0, 0.0, None)
+        repo.heartbeat("lifecycle-reactivate", 0.1, true, 0, 0, 0, 0.0, None, None)
             .await
             .expect("ordinary heartbeat");
         let events: i64 = sqlx::query_scalar(
@@ -4672,6 +4679,7 @@ mod tests {
                     0,
                     positive_delta,
                     None,
+                    None,
                 )
                 .await
                 .expect("heartbeat must persist")
@@ -4710,6 +4718,7 @@ mod tests {
             0,
             positive_delta,
             None,
+            None,
         )
         .await
         .expect("in-window heartbeat");
@@ -4740,6 +4749,7 @@ mod tests {
             0,
             positive_delta,
             None,
+            None,
         )
         .await
         .expect("new-window heartbeat");
@@ -4763,6 +4773,7 @@ mod tests {
                 0,
                 positive_delta,
                 None,
+                None,
             )
             .await
             .expect("reloaded heartbeat");
@@ -4775,6 +4786,7 @@ mod tests {
                 0,
                 1,
                 negative_delta,
+                None,
                 None,
             )
             .await
@@ -4824,14 +4836,16 @@ mod tests {
         let repo = MySqlRepo::new(pool.clone());
         for _ in 0..2 {
             let result = repo
-                .heartbeat("heartbeat-noop", 0.0, true, 0, 0, 0, 0.0, None)
+                .heartbeat("heartbeat-noop", 0.0, true, 0, 0, 0, 0.0, None, None)
                 .await;
             // MySQL stores `FLOAT` as IEEE-754 single precision, so a persisted
             // 0.70 is read back as its f32 representation rather than the exact
             // f64 literal. This is a no-op-state assertion, not an exact binary
             // representation assertion.
             assert!(
-                result.is_some_and(|score| (score - 0.70).abs() < 0.0001),
+                result
+                    .as_ref()
+                    .is_some_and(|outcome| (outcome.score - 0.70).abs() < 0.0001),
                 "saturated heartbeat must preserve the stored reputation score: {result:?}"
             );
         }

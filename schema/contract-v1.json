@@ -1363,8 +1363,20 @@
           "extra": "",
           "nullable": true
         },
+        "last_metrics_batch_id": {
+          "column_type": "varchar(64)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
         "last_seen": {
           "column_type": "timestamp",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "legacy_reputation_score": {
+          "column_type": "double",
           "default": null,
           "extra": "",
           "nullable": true
@@ -1530,6 +1542,18 @@
           "default": null,
           "extra": "",
           "nullable": true
+        },
+        "reputation_epoch": {
+          "column_type": "char(36)",
+          "default": null,
+          "extra": "",
+          "nullable": true
+        },
+        "reputation_model": {
+          "column_type": "varchar(32)",
+          "default": "outcome-v2",
+          "extra": "",
+          "nullable": false
         },
         "reputation_score": {
           "column_type": "double",
