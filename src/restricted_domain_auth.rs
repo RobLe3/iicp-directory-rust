@@ -194,10 +194,10 @@ impl RestrictedDomainService {
             (v.0 + 1).max(self.config.membership_epoch)
         });
         sqlx::query(
-            "INSERT INTO trust_domain_memberships (domain_id,issuer_id,subject_kind,subject_id,token_hash,scopes,generation,expires_at,revoked_at) \
-             VALUES (?,?,?,?,?,?,?,DATE_ADD(NOW(), INTERVAL ? SECOND),NULL) \
-             ON DUPLICATE KEY UPDATE issuer_id=VALUES(issuer_id),token_hash=VALUES(token_hash),scopes=VALUES(scopes),generation=VALUES(generation),expires_at=VALUES(expires_at),revoked_at=NULL"
-        ).bind(&self.config.domain_id).bind(&self.config.authority_id).bind(kind).bind(subject).bind(digest)
+            "INSERT INTO trust_domain_memberships (id,domain_id,issuer_id,subject_kind,subject_id,token_hash,scopes,generation,expires_at,revoked_at,created_at,updated_at) \
+             VALUES (?,?,?,?,?,?,?,?,DATE_ADD(NOW(), INTERVAL ? SECOND),NULL,NOW(),NOW()) \
+             ON DUPLICATE KEY UPDATE issuer_id=VALUES(issuer_id),token_hash=VALUES(token_hash),scopes=VALUES(scopes),generation=VALUES(generation),expires_at=VALUES(expires_at),revoked_at=NULL,updated_at=NOW()"
+        ).bind(uuid::Uuid::new_v4().to_string()).bind(&self.config.domain_id).bind(&self.config.authority_id).bind(kind).bind(subject).bind(digest)
          .bind(serde_json::to_string(&normalized).map_err(|_| "invalid scopes")?).bind(generation).bind(ttl)
          .execute(&mut *tx).await.map_err(|_| "membership persistence failed")?;
         tx.commit()
@@ -223,10 +223,11 @@ pub(crate) async fn run_command(command: crate::cli::Command) -> Result<(), Stri
     let pool = crate::db::init_pool(&url)
         .await
         .map_err(|_| "membership database connection failed")?;
-    sqlx::migrate!()
-        .run(&pool)
+    crate::schema::verify_existing_schema(&pool)
         .await
-        .map_err(|_| "membership database migration failed")?;
+        .map_err(|_| {
+            "membership database schema is incompatible; apply the reviewed migration first"
+        })?;
     let service =
         RestrictedDomainService::new(RestrictedDomainConfig::from_env(false)?, Some(pool))?;
     match command {
@@ -359,7 +360,12 @@ mod tests {
     async fn membership_rotation_scope_epoch_and_revocation_fail_closed() {
         let url = std::env::var("IICP_TEST_DATABASE_URL").expect("disposable database URL");
         let pool = crate::db::init_pool(&url).await.expect("pool");
-        sqlx::migrate!().run(&pool).await.expect("migrations");
+        sqlx::raw_sql(include_str!(
+            "../migrations/023_create_trust_domain_memberships.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("membership schema");
         let subject = format!("node-{}", uuid::Uuid::new_v4());
         let config = RestrictedDomainConfig {
             enabled: true,
