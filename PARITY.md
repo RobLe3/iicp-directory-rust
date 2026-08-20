@@ -14,6 +14,19 @@ authorizes a production cutover.
 > the shared canonical taxonomy. `directory/parity/contract-v1.10.76.json` is the
 > authoritative checklist; do not infer operational parity from route count alone.
 
+## Restricted trust-domain preview
+
+`parity/restricted-trust-domain-v0.json` is copied byte-for-byte from the
+pre-normative IICP Profile candidate and pinned at SHA-256
+`0b23cc925dd3409d1c39d788e54281e60255b16dcd83fe5e4be84720ddd6039f`.
+The Rust policy classifies all 30 vectors in their stable refusal order.
+
+This is semantic evidence, not an implementation-support claim. The operator
+preview does not yet persist membership or enforce it on HTTP routes, peer
+inputs, relay selection or federation. Public behavior is unchanged. PHP
+remains Genesis authority, and no cutover, deployment or federation activation
+is authorized by this fixture work.
+
 The post-`v1.10.76` refresh is tracked by issue #1 and its bounded follow-ups.
 Signed-event appends now use the PHP-compatible durable, row-locked chain head;
 credit concurrency, transient retries, runtime discovery policy and

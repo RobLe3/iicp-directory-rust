@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Pin the pre-normative restricted trust-domain fixture and execute all 30
+  CUG-01 through CUG-10 decisions through one pure Rust policy.
+- This establishes semantic parity evidence only. Membership persistence, HTTP
+  enforcement, migration compatibility and federation remain incomplete and
+  disabled; PHP remains Genesis authority.
+
 ## 0.1.13 — 2026-08-15
 
 - Advances additive SDK release-currency evidence to the coordinated 0.7.105 line.
