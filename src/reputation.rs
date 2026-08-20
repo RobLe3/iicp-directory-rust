@@ -82,4 +82,35 @@ mod tests {
         assert_eq!(apply_delta(0.98, 0.10), 1.0); // clamps high
         assert_eq!(apply_delta(0.02, -0.50), 0.0); // clamps low
     }
+
+    #[test]
+    fn canonical_outcome_v2_fixture_matches_rust_scoring() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../parity/reputation-outcome-v2.json"))
+                .expect("valid canonical outcome-v2 fixture");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let input = &case["input"];
+            let (Some(score), Some(expected)) =
+                (input["score"].as_f64(), case["expected"]["score"].as_f64())
+            else {
+                continue;
+            };
+            if input.get("deliveries").is_some() {
+                continue;
+            }
+            let observed = apply_delta(
+                score,
+                compute_delta(
+                    input["tasks_success"].as_u64().unwrap_or(0) as u32,
+                    input["tasks_failed"].as_u64().unwrap_or(0) as u32,
+                    input["avg_latency_ms"].as_f64().unwrap_or(0.0),
+                ),
+            );
+            assert!(
+                (observed - expected).abs() < 0.000_001,
+                "{}: expected {expected}, observed {observed}",
+                case["name"]
+            );
+        }
+    }
 }
