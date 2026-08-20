@@ -272,7 +272,7 @@ async fn discover_api_v1_contains_live_php_compatibility_fields() {
         );
     }
     assert_eq!(node["sdk_baseline_version"], SDK_BASELINE_VERSION);
-    assert_eq!(node["sdk_release"]["latest_known_version"], "0.7.105");
+    assert_eq!(node["sdk_release"]["latest_known_version"], "0.7.106");
     assert_eq!(node["latency_evidence"]["basis"], "none");
     assert_eq!(node["health_reasons"][0]["dimension"], "reachability");
     assert!(node["trust_progress"]["remaining_gold_requirements"].is_array());
