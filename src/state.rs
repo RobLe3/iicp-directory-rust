@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::repo::NodeRepository;
+use crate::restricted_domain_auth::RestrictedDomainService;
 use crate::validate::Env;
 
 pub(crate) type RegisterRateMap = Arc<Mutex<HashMap<String, (u32, u64)>>>;
@@ -31,6 +32,7 @@ pub(crate) struct AppState {
     pub(crate) allow_insecure_tls: bool,
     /// Local tests may disable dial-back; production never does.
     pub(crate) skip_liveness_check: bool,
+    pub(crate) restricted_domain: RestrictedDomainService,
 }
 
 #[cfg(test)]

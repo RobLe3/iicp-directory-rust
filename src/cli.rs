@@ -62,6 +62,24 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Issue or rotate a restricted trust-domain membership credential.
+    TrustDomainMembershipIssue {
+        #[arg(long, value_parser = ["node", "client"])]
+        kind: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long, value_delimiter = ',')]
+        scopes: Vec<String>,
+        #[arg(long, default_value_t = 86_400)]
+        ttl_seconds: u64,
+    },
+    /// Revoke the current restricted trust-domain membership for a subject.
+    TrustDomainMembershipRevoke {
+        #[arg(long, value_parser = ["node", "client"])]
+        kind: String,
+        #[arg(long)]
+        subject: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
