@@ -353,6 +353,9 @@ pub(crate) async fn operator_challenge(
     }))
 }
 
+// Keep the complete no-store HTTP refusal so every caller returns the same
+// security headers and structured error without reconstructing it.
+#[allow(clippy::result_large_err)]
 async fn validate_operator_key_request(
     st: &AppState,
     req: &OperatorKeyRequest,

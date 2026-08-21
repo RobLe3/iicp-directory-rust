@@ -3564,6 +3564,7 @@ async fn bootstrap_returns_peer_list() {
     let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
     assert!(v["peers"].is_array());
     assert_eq!(v["count"], 2); // 2 available nodes in test_state
+    assert!(v["peers"][0].get("membership").is_none());
 }
 
 #[tokio::test]

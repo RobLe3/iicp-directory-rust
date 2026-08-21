@@ -27,6 +27,10 @@ can issue the signed assertion alongside the separate directory bearer
 credential when the subject's identity key is supplied. The bearer value is
 never included in the assertion.
 
+`parity/restricted-trust-domain-bootstrap-v0.json` fixes the additive bootstrap
+boundary: public peers retain their legacy shape, while restricted peers require
+their own current signed envelope. A bounded response is not a revocation list.
+
 The preview persists membership and enforces it on protected directory HTTP
 routes. Rust client peer admission, relay selection, CIP inheritance and
 federation enforcement remain separate work. Public behavior is unchanged.

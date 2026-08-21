@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, Pool, Row};
+use std::collections::HashMap;
 
 use crate::restricted_domain_membership::{self, MembershipEnvelope, MembershipInput};
 use crate::state::AppState;
@@ -205,7 +206,63 @@ impl RestrictedDomainService {
             },
             keys.signing_key,
         )?;
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or("membership persistence unavailable")?;
+        let serialized = serde_json::to_string(&assertion)
+            .map_err(|_| "membership assertion serialization failed")?;
+        sqlx::query(
+            "UPDATE trust_domain_memberships SET membership_envelope=?, updated_at=NOW() \
+             WHERE domain_id=? AND subject_kind=? AND subject_id=? AND generation=?",
+        )
+        .bind(serialized)
+        .bind(&self.config.domain_id)
+        .bind(kind)
+        .bind(subject)
+        .bind(record.generation)
+        .execute(pool)
+        .await
+        .map_err(|_| "membership assertion persistence failed")?;
         Ok((record.token, assertion))
+    }
+
+    pub(crate) async fn bootstrap_memberships(
+        &self,
+        node_ids: &[String],
+    ) -> HashMap<String, MembershipEnvelope> {
+        if !self.config.enabled || node_ids.is_empty() {
+            return HashMap::new();
+        }
+        let Some(pool) = &self.pool else {
+            return HashMap::new();
+        };
+        let rows = sqlx::query(
+            "SELECT subject_id, membership_envelope FROM trust_domain_memberships \
+             WHERE domain_id=? AND subject_kind='node' AND revoked_at IS NULL \
+             AND expires_at > NOW() AND generation >= ? AND membership_envelope IS NOT NULL",
+        )
+        .bind(&self.config.domain_id)
+        .bind(self.config.membership_epoch)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .filter_map(|row| {
+                let subject: String = row.try_get("subject_id").ok()?;
+                if !node_ids.contains(&subject) {
+                    return None;
+                }
+                let raw: serde_json::Value = row.try_get("membership_envelope").ok()?;
+                let envelope: MembershipEnvelope = serde_json::from_value(raw).ok()?;
+                let scoped = envelope
+                    .assertion
+                    .scopes
+                    .iter()
+                    .any(|scope| matches!(scope.as_str(), "bootstrap" | "peers"));
+                (scoped && envelope.assertion.subject.id == subject).then_some((subject, envelope))
+            })
+            .collect()
     }
 
     async fn issue_record(

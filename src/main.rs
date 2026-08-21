@@ -585,19 +585,29 @@ pub(crate) fn err_json(
 
 async fn bootstrap(State(st): State<AppState>) -> Json<serde_json::Value> {
     let raw = st.repo.bootstrap(5).await;
-    let count = raw.len() as u32;
-    // PHP BootstrapController returns {node_id, endpoint, region, last_seen} per peer.
+    let restricted = st.restricted_domain.config.enabled;
+    let node_ids: Vec<String> = raw.iter().map(|node| node.node_id.clone()).collect();
+    let memberships = st.restricted_domain.bootstrap_memberships(&node_ids).await;
     let peers: Vec<serde_json::Value> = raw
         .into_iter()
-        .map(|n| {
-            serde_json::json!({
+        .filter_map(|n| {
+            let membership = memberships.get(&n.node_id);
+            if restricted && membership.is_none() {
+                return None;
+            }
+            let mut peer = serde_json::json!({
                 "node_id": n.node_id,
                 "endpoint": n.endpoint,
                 "region": n.region,
                 "last_seen": serde_json::Value::Null,
-            })
+            });
+            if let Some(membership) = membership {
+                peer["membership"] = serde_json::to_value(membership).ok()?;
+            }
+            Some(peer)
         })
         .collect();
+    let count = peers.len() as u32;
     serde_json::json!({ "peers": peers, "count": count }).into()
 }
 
