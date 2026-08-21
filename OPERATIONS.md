@@ -104,6 +104,69 @@ web-accessible paths. Credits, reputation, identity and signed lifecycle
 evidence require explicit retention decisions and must not be treated as raw
 telemetry.
 
+## Restricted trust-domain lifecycle
+
+Restricted mode is disabled by default. Before enabling it, record the opaque
+domain identifier, directory authority identifier, authority verification
+method and membership epoch in the operator change record. Keep the Ed25519
+signing secret in the same protected secret store used by the directory; do not
+place it in a portable configuration bundle. Startup rejects incomplete
+restricted-domain configuration, in-memory persistence and replica/federation
+mode rather than falling back to public behavior.
+
+Issue the minimum scopes needed by each participant. Supplying a subject key
+creates the peer-verifiable assertion needed for bootstrap or gossip; bearer
+membership remains limited to protected directory requests.
+
+```bash
+iicp-directory-rs trust-domain-membership-issue \
+  --kind node --subject node-1 \
+  --scopes registration,heartbeat,bootstrap,peers \
+  --subject-key-id 'did:key:node-1#key-1' \
+  --subject-public-key BASE64URL_ED25519_PUBLIC_KEY
+
+iicp-directory-rs trust-domain-membership-issue \
+  --kind client --subject client-1 --scopes discovery,dispatch
+```
+
+The bearer credential is printed once. Deliver it through an authenticated
+out-of-band channel and store only a secret reference in automation. Rotation
+issues a new generation for the same domain, kind and subject. Confirm that the
+new credential works before removing the old secret reference; the persisted
+record makes the prior credential invalid.
+
+```bash
+iicp-directory-rs trust-domain-membership-revoke \
+  --kind node --subject node-1
+```
+
+Revocation affects new protected operations immediately. Peer caches must also
+enforce assertion expiry and the configured minimum generation; absence from a
+partial bootstrap response is not, by itself, revocation. Raising
+`IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH` invalidates every older generation and is
+therefore an emergency domain-wide operation, not routine rotation.
+
+Backups of a restricted directory contain membership records and signed peer
+assertions. Protect them as authorization data. A restore rehearsal must use a
+new disposable database, the same domain/authority identity and an authorized
+copy of the signing key. Before service traffic is enabled, verify schema
+version, current epoch, revoked records, assertion expiry and one authorized
+and one unauthorized request. Do not restore into a different domain by
+editing membership rows.
+
+Loss or suspected compromise of the directory signing key requires stopping
+new enrollment and assertion issuance. Restore a verified key backup or create
+a reviewed authority-rotation plan that reissues assertions and updates every
+trust anchor; changing only the configured key while retaining old assertions
+is not a recovery procedure. If current revocation or authority state cannot be
+established, keep restricted mode unavailable rather than starting public mode.
+
+The Rust directory remains an operator preview. Restricted mode does not
+authorize Genesis activation, cross-domain federation, or a PHP-to-Rust
+cutover. A shared PHP/Rust migration must use the authoritative PHP migration
+sequence and disposable rollback evidence; do not run both flavors as writers
+against an unreviewed membership schema.
+
 ## Hardened container profile
 
 The release image runs as fixed unprivileged identity `10001:10001`. A
