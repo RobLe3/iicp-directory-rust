@@ -58,6 +58,27 @@ jobs:
           cargo test --locked
           membership_rotation_scope_epoch_and_revocation_fail_closed
           -- --ignored
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_mysql, sodium
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: RobLe3/iicp-directory-php
+          ref: 697f33dd1d1ef1976a233e7820593b3110c7b731
+          path: php-directory
+      - run: mkdir -p bootstrap/cache && composer install --no-interaction --prefer-dist --no-progress
+        working-directory: php-directory
+      - name: Cross-flavor restricted-membership migration and rollback evidence
+        env:
+          PHP_DIRECTORY_ROOT: ${{ github.workspace }}/php-directory
+          IICP_CROSS_FLAVOR_DB_NAME: iicp_cross_membership
+          IICP_CROSS_FLAVOR_DATABASE_URL: mysql://root:root@127.0.0.1:3306/iicp_cross_membership?ssl-mode=DISABLED
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: '3306'
+          MYSQL_USER: root
+          MYSQL_PASSWORD: root
+        run: scripts/run_cross_flavor_membership_compat.sh
 
   credit-ledger-concurrency:
     runs-on: ubuntu-latest
