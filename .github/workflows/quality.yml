@@ -54,6 +54,10 @@ jobs:
           cargo test --locked
           aggregate_lookup_is_bounded_and_deterministic_for_timestamp_ties
           -- --ignored
+      - run: >-
+          cargo test --locked
+          membership_rotation_scope_epoch_and_revocation_fail_closed
+          -- --ignored
 
   credit-ledger-concurrency:
     runs-on: ubuntu-latest
