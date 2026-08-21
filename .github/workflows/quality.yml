@@ -67,7 +67,7 @@ jobs:
           repository: RobLe3/iicp-directory-php
           ref: 697f33dd1d1ef1976a233e7820593b3110c7b731
           path: php-directory
-      - run: composer install --no-interaction --prefer-dist --no-progress
+      - run: mkdir -p bootstrap/cache && composer install --no-interaction --prefer-dist --no-progress
         working-directory: php-directory
       - name: Cross-flavor restricted-membership migration and rollback evidence
         env:
