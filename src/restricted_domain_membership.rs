@@ -180,6 +180,31 @@ mod tests {
     }
 
     #[test]
+    fn restricted_bootstrap_fixture_keeps_public_and_revocation_boundaries() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../parity/restricted-trust-domain-bootstrap-v0.json"
+        ))
+        .unwrap();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        let public = vectors
+            .iter()
+            .find(|vector| vector["id"] == "public-legacy-peer-remains-compatible")
+            .unwrap();
+        assert!(public["response"]["peers"][0]
+            .get("membership_vector")
+            .is_none());
+        let partial = vectors
+            .iter()
+            .find(|vector| vector["id"] == "restricted-partial-response-does-not-evict")
+            .unwrap();
+        assert_eq!(partial["expected"]["evicted"], serde_json::json!([]));
+        assert_eq!(
+            partial["expected"]["reason"],
+            "partial_absence_is_not_revocation"
+        );
+    }
+
+    #[test]
     fn issued_assertion_binds_subject_domain_generation_and_scope() {
         let authority = KeyPair::from_seed(Seed::new([7_u8; 32]));
         let subject = KeyPair::from_seed(Seed::new([9_u8; 32]));
