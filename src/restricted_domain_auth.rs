@@ -7,7 +7,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Pool, Row};
+use sqlx::{FromRow, MySql, Pool, Row};
 use std::collections::{HashMap, HashSet};
 
 use crate::restricted_domain_membership::{self, MembershipEnvelope, MembershipInput};
@@ -44,6 +44,15 @@ struct AuthorizedMembership {
     subject_kind: String,
     generation: u64,
     expires_at: i64,
+}
+
+#[derive(FromRow)]
+struct AuthorizedMembershipRow {
+    subject_id: String,
+    subject_kind: String,
+    scopes: serde_json::Value,
+    generation: u64,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,7 +149,9 @@ impl RestrictedDomainService {
         if !self.config.enabled {
             return true;
         }
-        self.authorize(token, subject_id, operation).await.is_some()
+        self.authorize(token, subject_id, operation)
+            .await
+            .is_ok_and(|membership| membership.is_some())
     }
 
     async fn authorize(
@@ -148,18 +159,18 @@ impl RestrictedDomainService {
         token: &str,
         subject_id: &str,
         operation: &str,
-    ) -> Option<AuthorizedMembership> {
+    ) -> Result<Option<AuthorizedMembership>, sqlx::Error> {
         if !self.config.enabled {
-            return None;
+            return Ok(None);
         }
         if token.is_empty() || subject_id.is_empty() {
-            return None;
+            return Ok(None);
         }
         let Some(pool) = &self.pool else {
-            return None;
+            return Ok(None);
         };
         let digest = hex::encode(Sha256::digest(token.as_bytes()));
-        let row = sqlx::query(
+        let row = sqlx::query_as::<_, AuthorizedMembershipRow>(
             "SELECT subject_id, subject_kind, scopes, generation, expires_at FROM trust_domain_memberships \
              WHERE domain_id = ? AND token_hash = ? AND revoked_at IS NULL \
              AND expires_at > NOW() AND generation >= ? LIMIT 1",
@@ -168,28 +179,25 @@ impl RestrictedDomainService {
         .bind(digest)
         .bind(self.config.membership_epoch)
         .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-        let row = row?;
-        let stored: String = row.get("subject_id");
-        if stored.as_bytes() != subject_id.as_bytes() {
-            return None;
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.subject_id.as_bytes() != subject_id.as_bytes() {
+            return Ok(None);
         }
-        let scopes: serde_json::Value = row.try_get("scopes").unwrap_or(serde_json::Value::Null);
-        if !scopes.as_array().is_some_and(|values| {
+        if !row.scopes.as_array().is_some_and(|values| {
             values
                 .iter()
                 .any(|v| v.as_str().is_some_and(|s| s == "*" || s == operation))
         }) {
-            return None;
+            return Ok(None);
         }
-        let expires_at: chrono::NaiveDateTime = row.try_get("expires_at").ok()?;
-        Some(AuthorizedMembership {
-            subject_kind: row.try_get("subject_kind").ok()?,
-            generation: row.try_get("generation").ok()?,
-            expires_at: expires_at.and_utc().timestamp(),
-        })
+        Ok(Some(AuthorizedMembership {
+            subject_kind: row.subject_kind,
+            generation: row.generation,
+            expires_at: row.expires_at.timestamp(),
+        }))
     }
 
     pub(crate) async fn issue(
@@ -577,12 +585,14 @@ pub(crate) async fn restricted_domain_gate(
     if !claimed.is_empty() && body_subject.as_deref().is_some_and(|v| v != claimed) {
         return denied();
     }
-    let Some(membership) = st
+    let membership = match st
         .restricted_domain
         .authorize(&token, subject, operation)
         .await
-    else {
-        return denied();
+    {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return denied(),
+        Err(_) => return unavailable(),
     };
     let response = next
         .run(Request::from_parts(parts, Body::from(bytes)))
@@ -638,6 +648,10 @@ async fn project_decision(response: Response, decision: RestrictedDirectoryDecis
 
 fn denied() -> Response {
     (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":{"code":"restricted_domain_denied","message":"Restricted trust-domain membership is required"}}))).into_response()
+}
+
+fn unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":{"code":"restricted_domain_unavailable","message":"Restricted trust-domain authorization is unavailable"}}))).into_response()
 }
 
 #[cfg(test)]
