@@ -166,7 +166,9 @@ Supplying both subject-key options also prints a short-lived, directory-signed
 membership assertion. It binds public identity, domain, generation, expiry and
 peer scopes without exposing the bearer credential. These controls do not make
 the Rust preview the Genesis authority and do not enable cross-domain
-federation.
+federation. Restricted discovery rechecks provider membership before ranking,
+so expired, revoked or pre-epoch nodes cannot remain eligible merely because a
+registration record is still live.
 
 ## Test baseline
 

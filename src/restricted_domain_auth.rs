@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, Pool, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::restricted_domain_membership::{self, MembershipEnvelope, MembershipInput};
 use crate::state::AppState;
@@ -262,6 +262,33 @@ impl RestrictedDomainService {
                     .any(|scope| matches!(scope.as_str(), "bootstrap" | "peers"));
                 (scoped && envelope.assertion.subject.id == subject).then_some((subject, envelope))
             })
+            .collect()
+    }
+
+    /// Return only node identifiers whose domain membership is current at the
+    /// time of this decision. Caller authentication does not establish that a
+    /// provider registered earlier is still eligible after expiry, revocation
+    /// or an epoch advance.
+    pub(crate) async fn current_node_members(&self, node_ids: &[String]) -> HashSet<String> {
+        if !self.config.enabled || node_ids.is_empty() {
+            return HashSet::new();
+        }
+        let Some(pool) = &self.pool else {
+            return HashSet::new();
+        };
+        let rows = sqlx::query(
+            "SELECT subject_id FROM trust_domain_memberships \
+             WHERE domain_id=? AND subject_kind='node' AND revoked_at IS NULL \
+             AND expires_at > NOW() AND generation >= ?",
+        )
+        .bind(&self.config.domain_id)
+        .bind(self.config.membership_epoch)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .filter_map(|row| row.try_get::<String, _>("subject_id").ok())
+            .filter(|subject| node_ids.contains(subject))
             .collect()
     }
 
@@ -568,6 +595,10 @@ mod tests {
             .unwrap();
         assert!(!service.verify(&first, &subject, "heartbeat").await);
         assert!(service.verify(&second, &subject, "peers").await);
+        assert!(service
+            .current_node_members(std::slice::from_ref(&subject))
+            .await
+            .contains(&subject));
 
         let epoch_service = RestrictedDomainService::new(
             RestrictedDomainConfig {
@@ -580,5 +611,9 @@ mod tests {
         assert!(!epoch_service.verify(&second, &subject, "peers").await);
         assert!(service.revoke("node", &subject).await.unwrap());
         assert!(!service.verify(&second, &subject, "peers").await);
+        assert!(service
+            .current_node_members(std::slice::from_ref(&subject))
+            .await
+            .is_empty());
     }
 }
