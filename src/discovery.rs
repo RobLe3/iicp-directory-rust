@@ -206,7 +206,7 @@ pub(crate) async fn discover(
     let requested_limit = p.limit.unwrap_or(10).clamp(1, 50);
     let started = Instant::now();
     let repository_started = Instant::now();
-    let nodes = st
+    let mut nodes = st
         .repo
         .discover(&DiscoverQuery {
             intent,
@@ -217,6 +217,14 @@ pub(crate) async fn discover(
             min_reputation: p.min_reputation,
         })
         .await;
+    if st.restricted_domain.config.enabled {
+        let node_ids = nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<Vec<_>>();
+        let current_members = st.restricted_domain.current_node_members(&node_ids).await;
+        nodes.retain(|node| current_members.contains(&node.node_id));
+    }
     let repository_ms = repository_started.elapsed().as_secs_f64() * 1000.0;
     let nodes = discovery_policy::select_and_rank(
         nodes,
