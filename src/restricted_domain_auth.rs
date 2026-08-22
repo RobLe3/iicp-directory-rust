@@ -2,12 +2,12 @@
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Pool, Row};
+use sqlx::{FromRow, MySql, Pool, Row};
 use std::collections::{HashMap, HashSet};
 
 use crate::restricted_domain_membership::{self, MembershipEnvelope, MembershipInput};
@@ -25,6 +25,35 @@ const ALLOWED_SCOPES: &[&str] = &[
     "dispatch",
     "relay",
 ];
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RestrictedDirectoryDecision {
+    schema: &'static str,
+    profile: &'static str,
+    decision: &'static str,
+    operation: &'static str,
+    domain_id: String,
+    authority_id: String,
+    subject_kind: String,
+    membership_generation: u64,
+    membership_expires_at: i64,
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizedMembership {
+    subject_kind: String,
+    generation: u64,
+    expires_at: i64,
+}
+
+#[derive(FromRow)]
+struct AuthorizedMembershipRow {
+    subject_id: String,
+    subject_kind: String,
+    scopes: serde_json::Value,
+    generation: u64,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RestrictedDomainConfig {
@@ -115,19 +144,34 @@ impl RestrictedDomainService {
         Ok(Self { config, pool })
     }
 
-    pub(crate) async fn verify(&self, token: &str, subject_id: &str, operation: &str) -> bool {
+    #[cfg(test)]
+    async fn verify(&self, token: &str, subject_id: &str, operation: &str) -> bool {
         if !self.config.enabled {
             return true;
         }
+        self.authorize(token, subject_id, operation)
+            .await
+            .is_ok_and(|membership| membership.is_some())
+    }
+
+    async fn authorize(
+        &self,
+        token: &str,
+        subject_id: &str,
+        operation: &str,
+    ) -> Result<Option<AuthorizedMembership>, sqlx::Error> {
+        if !self.config.enabled {
+            return Ok(None);
+        }
         if token.is_empty() || subject_id.is_empty() {
-            return false;
+            return Ok(None);
         }
         let Some(pool) = &self.pool else {
-            return false;
+            return Ok(None);
         };
         let digest = hex::encode(Sha256::digest(token.as_bytes()));
-        let row = sqlx::query(
-            "SELECT subject_id, scopes FROM trust_domain_memberships \
+        let row = sqlx::query_as::<_, AuthorizedMembershipRow>(
+            "SELECT subject_id, subject_kind, scopes, generation, expires_at FROM trust_domain_memberships \
              WHERE domain_id = ? AND token_hash = ? AND revoked_at IS NULL \
              AND expires_at > NOW() AND generation >= ? LIMIT 1",
         )
@@ -135,22 +179,25 @@ impl RestrictedDomainService {
         .bind(digest)
         .bind(self.config.membership_epoch)
         .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+        .await?;
         let Some(row) = row else {
-            return false;
+            return Ok(None);
         };
-        let stored: String = row.get("subject_id");
-        if stored.as_bytes() != subject_id.as_bytes() {
-            return false;
+        if row.subject_id.as_bytes() != subject_id.as_bytes() {
+            return Ok(None);
         }
-        let scopes: serde_json::Value = row.try_get("scopes").unwrap_or(serde_json::Value::Null);
-        scopes.as_array().is_some_and(|values| {
+        if !row.scopes.as_array().is_some_and(|values| {
             values
                 .iter()
                 .any(|v| v.as_str().is_some_and(|s| s == "*" || s == operation))
-        })
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(AuthorizedMembership {
+            subject_kind: row.subject_kind,
+            generation: row.generation,
+            expires_at: row.expires_at.timestamp(),
+        }))
     }
 
     pub(crate) async fn issue(
@@ -470,6 +517,35 @@ fn protected_operation(method: &Method, path: &str) -> Option<&'static str> {
     }
 }
 
+fn projected_operation(operation: &str) -> Option<&'static str> {
+    match operation {
+        "registration" => Some("registration"),
+        "discovery" => Some("discovery"),
+        "bootstrap" => Some("bootstrap"),
+        "dispatch" => Some("dispatch_ticket"),
+        "consumer_token" => Some("consumer_token"),
+        _ => None,
+    }
+}
+
+fn directory_decision(
+    config: &RestrictedDomainConfig,
+    operation: &str,
+    membership: AuthorizedMembership,
+) -> Option<RestrictedDirectoryDecision> {
+    Some(RestrictedDirectoryDecision {
+        schema: "iicp.restricted-trust-domain.directory-decision.v0",
+        profile: "urn:iicp:profile:restricted-trust-domain:v1",
+        decision: "eligible",
+        operation: projected_operation(operation)?,
+        domain_id: config.domain_id.clone(),
+        authority_id: config.authority_id.clone(),
+        subject_kind: membership.subject_kind,
+        membership_generation: membership.generation,
+        membership_expires_at: membership.expires_at,
+    })
+}
+
 pub(crate) async fn restricted_domain_gate(
     State(st): State<AppState>,
     req: Request,
@@ -509,24 +585,169 @@ pub(crate) async fn restricted_domain_gate(
     if !claimed.is_empty() && body_subject.as_deref().is_some_and(|v| v != claimed) {
         return denied();
     }
-    if !st
+    let membership = match st
         .restricted_domain
-        .verify(&token, subject, operation)
+        .authorize(&token, subject, operation)
         .await
     {
-        return denied();
+        Ok(Some(membership)) => membership,
+        Ok(None) => return denied(),
+        Err(_) => return unavailable(),
+    };
+    let response = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
+    let Some(decision) = directory_decision(&st.restricted_domain.config, operation, membership)
+    else {
+        return response;
+    };
+    project_decision(response, decision).await
+}
+
+async fn project_decision(response: Response, decision: RestrictedDirectoryDecision) -> Response {
+    if !response.status().is_success() {
+        return response;
     }
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
+    let (mut parts, body) = response.into_parts();
+    let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":{"code":"restricted_decision_projection_failed","message":"Restricted authorization evidence could not be produced"}})),
+        ).into_response();
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":{"code":"restricted_decision_projection_failed","message":"Restricted authorization evidence could not be produced"}})),
+        ).into_response();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":{"code":"restricted_decision_projection_failed","message":"Restricted authorization evidence could not be produced"}})),
+        ).into_response();
+    };
+    object.insert(
+        "restricted_domain_decision".into(),
+        serde_json::to_value(decision).expect("decision projection is serializable"),
+    );
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    parts.headers.insert(
+        header::VARY,
+        HeaderValue::from_static("X-IICP-Membership, X-IICP-Subject-Id"),
+    );
+    Response::from_parts(
+        parts,
+        Body::from(serde_json::to_vec(&value).expect("JSON serialization")),
+    )
 }
 
 fn denied() -> Response {
     (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":{"code":"restricted_domain_denied","message":"Restricted trust-domain membership is required"}}))).into_response()
 }
 
+fn unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":{"code":"restricted_domain_unavailable","message":"Restricted trust-domain authorization is unavailable"}}))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    const DIRECTORY_DECISION_FIXTURE: &str =
+        include_str!("../parity/restricted-trust-domain-directory-decision-v0.json");
+
+    #[test]
+    fn directory_decision_matches_shared_positive_vectors() {
+        let fixture: serde_json::Value = serde_json::from_str(DIRECTORY_DECISION_FIXTURE).unwrap();
+        let config = RestrictedDomainConfig {
+            enabled: true,
+            domain_id: "domain-test-a".into(),
+            authority_id: "did:iicp:test:directory-a".into(),
+            authority_key_id: "did:iicp:test:directory-a#key-1".into(),
+            membership_epoch: 1,
+            max_credential_ttl_seconds: 86_400,
+        };
+        for vector in fixture["vectors"].as_array().unwrap() {
+            if vector["expected"] != "eligible" {
+                continue;
+            }
+            let expected = &vector["projection"];
+            let wire_operation = match expected["operation"].as_str().unwrap() {
+                "dispatch_ticket" => "dispatch",
+                value => value,
+            };
+            let decision = directory_decision(
+                &config,
+                wire_operation,
+                AuthorizedMembership {
+                    subject_kind: expected["subject_kind"].as_str().unwrap().into(),
+                    generation: expected["membership_generation"].as_u64().unwrap(),
+                    expires_at: expected["membership_expires_at"].as_i64().unwrap(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(decision).unwrap(),
+                *expected,
+                "{}",
+                vector["id"]
+            );
+        }
+        assert!(directory_decision(
+            &config,
+            "heartbeat",
+            AuthorizedMembership {
+                subject_kind: "node".into(),
+                generation: 1,
+                expires_at: 1
+            }
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn projection_rewrites_json_and_cache_headers_without_stale_length() {
+        let mut response = Json(serde_json::json!({"nodes": []})).into_response();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("12"));
+        let response = project_decision(
+            response,
+            RestrictedDirectoryDecision {
+                schema: "iicp.restricted-trust-domain.directory-decision.v0",
+                profile: "urn:iicp:profile:restricted-trust-domain:v1",
+                decision: "eligible",
+                operation: "discovery",
+                domain_id: "domain-test-a".into(),
+                authority_id: "did:iicp:test:directory-a".into(),
+                subject_kind: "client".into(),
+                membership_generation: 7,
+                membership_expires_at: 1_800_000_300,
+            },
+        )
+        .await;
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["restricted_domain_decision"]["operation"],
+            "discovery"
+        );
+        assert!(value["restricted_domain_decision"]
+            .get("subject_id")
+            .is_none());
+    }
+
     #[test]
     fn protected_route_inventory_is_explicit() {
         assert_eq!(
