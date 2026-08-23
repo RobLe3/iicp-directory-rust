@@ -131,6 +131,11 @@ For a durable installation, backup and recovery guidance, read
 | `IICP_SEED_URL` | — | Configured seed location. This is not identity or trust evidence. |
 | `IICP_SEED_DID` | — | Expected `did:web` seed identity. Required separately from `IICP_SEED_URL` in replica mode. |
 | `IICP_REPLICA_DID`, `IICP_REPLICA_ENDPOINT` | — | Stable replica identity and HTTPS endpoint. Both are required in replica mode. |
+| `IICP_LOCAL_DIRECTORY_ADVERTISE` | `false` | Opt in to `_iicp-dir._tcp.local.` candidate advertisement. Discovery does not establish trust. |
+| `IICP_LOCAL_DIRECTORY_HOSTNAME` | — | Required `.local.` DNS name when local advertisement is enabled. |
+| `IICP_LOCAL_DIRECTORY_PORT` | `443` | HTTPS descriptor port advertised through DNS-SD. |
+| `IICP_LOCAL_DIRECTORY_INSTANCE` | `IICP Directory` | Display-only DNS-SD instance label; never treated as identity. |
+| `IICP_LOCAL_DIRECTORY_ROLE` | `standalone` or `replica` | Optional `seed`, `replica` or `standalone` hint. The signed descriptor remains authoritative. |
 | `IICP_REPLICA_STATUS_FILE` | platform state directory | Owner-private, non-secret synchronization status and cursor evidence. |
 | `IICP_ALLOW_IN_MEMORY` | `false` | Explicitly allow disposable in-memory state outside production. |
 | `IICP_DEV_ALLOW_INSECURE_TLS` | `false` | Allow invalid probe certificates only in local/testing environments. Never affects production. |

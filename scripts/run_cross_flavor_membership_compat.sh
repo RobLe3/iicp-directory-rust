@@ -78,6 +78,9 @@ revoked=$("${mysql_cmd[@]}" "$IICP_CROSS_FLAVOR_DB_NAME" -e \
 set +e
 mixed_output=$(env "${common_env[@]}" APP_ENV=testing IICP_REPLICA_MODE=true \
   IICP_SEED_URL=https://invalid.example \
+  IICP_SEED_DID=did:web:seed.invalid.example \
+  IICP_REPLICA_DID=did:web:replica.invalid.example \
+  IICP_REPLICA_ENDPOINT=https://replica.invalid.example \
   timeout 15 cargo run --locked --quiet 2>&1)
 mixed_status=$?
 set -e
