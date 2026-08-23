@@ -167,6 +167,30 @@ cutover. A shared PHP/Rust migration must use the authoritative PHP migration
 sequence and disposable rollback evidence; do not run both flavors as writers
 against an unreviewed membership schema.
 
+## Optional local directory advertisement
+
+Local DNS-SD advertisement is disabled by default. To expose this directory as
+a candidate on the local link, configure its stable DID, HTTPS API endpoint and
+signing key, then set:
+
+```text
+IICP_LOCAL_DIRECTORY_ADVERTISE=true
+IICP_LOCAL_DIRECTORY_HOSTNAME=iicp-directory.local.
+IICP_LOCAL_DIRECTORY_PORT=443
+IICP_LOCAL_DIRECTORY_INSTANCE=IICP Directory
+IICP_LOCAL_DIRECTORY_ROLE=standalone
+```
+
+The process publishes `_iicp-dir._tcp.local.` with bounded bootstrap hints and
+serves a signed, five-minute descriptor at
+`/.well-known/iicp-directory.json`. The instance label, SRV address and TXT DID
+are observations, not identity or authorization. A client must still validate
+TLS, the descriptor signature, the DID and its configured trust policy before
+sending credentials. `IICP_OPERATING_MODE=local_only` rejects advertisement,
+and incomplete HTTPS or signing configuration fails startup when advertisement
+is requested. Changing advertisement settings requires a supervised restart;
+graceful shutdown withdraws the service.
+
 ## Hardened container profile
 
 The release image runs as fixed unprivileged identity `10001:10001`. A

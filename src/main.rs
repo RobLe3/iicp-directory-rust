@@ -24,6 +24,7 @@ mod federation_handlers;
 mod health;
 #[cfg(test)]
 mod jcs;
+mod local_directory_discovery;
 mod maintenance;
 mod node_lifecycle;
 mod observability;
@@ -77,6 +78,7 @@ pub(crate) use discovery::{
     SDK_BASELINE_VERSION,
 };
 pub(crate) use federation_handlers::{events, replicas_deregister, replicas_register, snapshot};
+pub(crate) use local_directory_discovery::directory_descriptor;
 #[cfg(test)]
 use observability::sdk_adoption_json;
 pub(crate) use operator::{
@@ -782,6 +784,22 @@ async fn main() {
         restricted_domain,
         replica_ready,
     };
+    let local_advertiser = match local_directory_discovery::LocalDirectoryAdvertisement::from_env(
+        &state,
+        replica_seed_url.is_some(),
+    ) {
+        Ok(config) => match local_directory_discovery::LocalDirectoryAdvertiser::start(config) {
+            Ok(advertiser) => advertiser,
+            Err(error) => {
+                eprintln!("FATAL: local directory advertisement: {error}");
+                std::process::exit(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("FATAL: local directory advertisement: {error}");
+            std::process::exit(1);
+        }
+    };
     let router = match replica_seed_url {
         Some(seed) => app(state).layer(middleware::from_fn_with_state(seed, replica_write_gate)),
         None => app(state),
@@ -802,6 +820,7 @@ async fn main() {
         }
     });
     server.await.expect("serve");
+    drop(local_advertiser);
     #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
     if let Some(handle) = systemd_notifier {
         handle.abort();
