@@ -110,10 +110,11 @@ fi
 api_json="$(cat "$api_file")"
 rm -f "$api_file"
 read -r latest checksum < <(python3 -c '
-import json,sys
+import json,re,sys
 p=json.load(sys.stdin)
-versions=[v for v in p.get("versions",[]) if not v.get("yanked")]
-if not versions: raise SystemExit("no non-yanked release")
+stable=re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)").fullmatch
+versions=[v for v in p.get("versions",[]) if not v.get("yanked") and stable(v.get("num", ""))]
+if not versions: raise SystemExit("no non-yanked stable release")
 def key(v): return tuple(int(x) for x in v["num"].split("."))
 v=max(versions,key=key)
 print(v["num"], v["checksum"])

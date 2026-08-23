@@ -98,6 +98,18 @@ class UpdaterContract(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("binding failed", result.stderr)
 
+    def test_prerelease_candidate_is_not_selected(self):
+        files = self.files()
+        files["api.json"] = json.dumps(
+            {"versions": [{"num": "0.1.12-rc.1", "checksum": "0" * 64, "yanked": False}]}
+        ).encode()
+        with fixture_server(files) as (base, root):
+            env_file = root / "directory.env"
+            env_file.write_text("")
+            result = run_staged(base, env_file)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no non-yanked stable release", result.stderr)
+
     def test_release_manifest_mismatch_fails_closed(self):
         with fixture_server(self.files(manifest_sha="f" * 64)) as (base, root):
             env_file = root / "directory.env"

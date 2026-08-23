@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+python3 scripts/check_dependency_policy.py
 cargo fmt --check
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo test --locked --all-features
