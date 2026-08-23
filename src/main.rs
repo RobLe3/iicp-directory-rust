@@ -724,7 +724,10 @@ async fn main() {
     // signed event log and mirror its state so this instance serves as a replica.
     // Capture the seed URL first: it both drives the sync loop and the write-gate
     // (DIR-FED-18) so the replica 307-redirects writes to the seed.
-    let replica_config = replica::ReplicaConfig::from_env();
+    let replica_config = replica::ReplicaConfig::from_env().unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1)
+    });
     let restricted_config =
         restricted_domain_auth::RestrictedDomainConfig::from_env(replica_config.is_some())
             .unwrap_or_else(|error| {
@@ -744,6 +747,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let replica_ready = replica_config
+        .as_ref()
+        .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let replica_seed_url: Option<String> = match replica_config {
         Some(cfg) => {
             eprintln!(
@@ -751,7 +757,11 @@ async fn main() {
                 cfg.seed_url
             );
             let seed = cfg.seed_url.clone();
-            tokio::spawn(replica::run_replica_sync(Arc::clone(&repo), cfg));
+            tokio::spawn(replica::run_replica_sync(
+                Arc::clone(&repo),
+                cfg,
+                Arc::clone(replica_ready.as_ref().expect("replica readiness")),
+            ));
             Some(seed)
         }
         None => None,
@@ -770,6 +780,7 @@ async fn main() {
         allow_insecure_tls: config::allow_insecure_tls(env),
         skip_liveness_check: config::skip_liveness_check(env),
         restricted_domain,
+        replica_ready,
     };
     let router = match replica_seed_url {
         Some(seed) => app(state).layer(middleware::from_fn_with_state(seed, replica_write_gate)),

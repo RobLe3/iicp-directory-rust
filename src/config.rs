@@ -112,10 +112,12 @@ mod tests {
     fn replica(did: Option<&str>, endpoint: Option<&str>) -> ReplicaConfig {
         ReplicaConfig {
             seed_url: "https://seed.example".to_string(),
+            seed_did: "did:web:seed.example".to_string(),
             poll_interval_secs: 10,
             replica_did: did.map(str::to_string),
             replica_endpoint: endpoint.map(str::to_string),
             verification_required: true,
+            status_path: std::path::PathBuf::from("/tmp/iicp-replica-test-status.json"),
         }
     }
 

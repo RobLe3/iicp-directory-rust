@@ -16,10 +16,14 @@
 use crate::federation;
 use crate::repo::{NodeRecord, NodeRepository};
 use crate::types::Node;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Replica-mode configuration, from env. `None` when the directory runs as a normal
 /// (seed/standalone) instance.
@@ -27,9 +31,11 @@ pub struct ReplicaConfig {
     /// Genesis Seed root URL (e.g. `http://seed-directory:8080`); endpoints are
     /// `{seed_url}/api/v1/events` and `{seed_url}/.well-known/did.json`.
     pub seed_url: String,
+    /// Expected stable identity of the configured seed. Location alone is never trust.
+    pub seed_did: String,
     pub poll_interval_secs: u64,
     /// This replica's DID (e.g. `did:web:replica.example`), from `IICP_REPLICA_DID`.
-    /// Required for the join handshake (DIR-FED-13); if absent the handshake is skipped.
+    /// Required for the join handshake (DIR-FED-13).
     pub replica_did: Option<String>,
     /// This replica's public HTTPS endpoint, from `IICP_REPLICA_ENDPOINT`.
     /// Sent to the seed during the join handshake so the seed can record this replica.
@@ -37,22 +43,32 @@ pub struct ReplicaConfig {
     /// Production replicas never mutate from an unsigned/unverified source.
     /// The bypass is explicit and limited to non-production testbeds.
     pub verification_required: bool,
+    /// Owner-private, non-secret synchronization evidence for restart diagnostics.
+    pub status_path: PathBuf,
 }
 
 impl ReplicaConfig {
     /// Active when `IICP_REPLICA_MODE` is `true`/`1` and `IICP_SEED_URL` is set.
-    pub fn from_env() -> Option<Self> {
-        let mode = std::env::var("IICP_REPLICA_MODE").ok()?;
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let Some(mode) = std::env::var("IICP_REPLICA_MODE").ok() else {
+            return Ok(None);
+        };
         if mode != "true" && mode != "1" {
-            return None;
+            return Ok(None);
         }
-        let seed_url = std::env::var("IICP_SEED_URL").ok()?;
+        let seed_url = std::env::var("IICP_SEED_URL")
+            .map_err(|_| "replica mode requires IICP_SEED_URL".to_string())?;
+        let seed_did = std::env::var("IICP_SEED_DID").map_err(|_| {
+            "replica mode requires IICP_SEED_DID separate from seed location".to_string()
+        })?;
         let poll_interval_secs = std::env::var("IICP_REPLICA_POLL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
-        let replica_did = std::env::var("IICP_REPLICA_DID").ok();
-        let replica_endpoint = std::env::var("IICP_REPLICA_ENDPOINT").ok();
+        let replica_did = std::env::var("IICP_REPLICA_DID")
+            .map_err(|_| "replica mode requires IICP_REPLICA_DID".to_string())?;
+        let replica_endpoint = std::env::var("IICP_REPLICA_ENDPOINT")
+            .map_err(|_| "replica mode requires IICP_REPLICA_ENDPOINT".to_string())?;
         let app_env = std::env::var("APP_ENV").ok();
         let unsigned_requested =
             std::env::var("IICP_DEV_ALLOW_UNSIGNED_EVENTS").is_ok_and(|value| {
@@ -61,14 +77,115 @@ impl ReplicaConfig {
                     "1" | "true" | "yes" | "on"
                 )
             });
-        Some(ReplicaConfig {
+        if !seed_did.starts_with("did:web:") || !replica_did.starts_with("did:web:") {
+            return Err("replica and seed identities must be did:web identifiers".to_string());
+        }
+        if !replica_endpoint.starts_with("https://") {
+            return Err("IICP_REPLICA_ENDPOINT must use HTTPS".to_string());
+        }
+        Ok(Some(ReplicaConfig {
             seed_url: seed_url.trim_end_matches('/').to_string(),
+            seed_did,
             poll_interval_secs,
-            replica_did,
-            replica_endpoint,
+            replica_did: Some(replica_did),
+            replica_endpoint: Some(replica_endpoint),
             verification_required: verification_required(app_env.as_deref(), unsigned_requested),
-        })
+            status_path: replica_status_path(),
+        }))
     }
+}
+
+fn replica_status_path() -> PathBuf {
+    std::env::var_os("IICP_REPLICA_STATUS_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .map(|root| root.join("iicp-directory-rs/replica-status.json"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|root| root.join(".local/state/iicp-directory-rs/replica-status.json"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp/iicp-directory-rs-replica-status.json"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaPhase {
+    Configured,
+    VerifyingSeed,
+    Registering,
+    Snapshotting,
+    Synchronizing,
+    Ready,
+    Degraded,
+    Blocked,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicaStatus {
+    schema_version: &'static str,
+    phase: ReplicaPhase,
+    seed_did: String,
+    snapshot_seq: Option<i64>,
+    cursor: Option<i64>,
+    last_error: Option<String>,
+    updated_at_ms: u64,
+}
+
+fn write_replica_status(
+    cfg: &ReplicaConfig,
+    phase: ReplicaPhase,
+    snapshot_seq: Option<i64>,
+    cursor: Option<i64>,
+    last_error: Option<&str>,
+) {
+    let status = ReplicaStatus {
+        schema_version: "iicp.replica-status.v1",
+        phase,
+        seed_did: cfg.seed_did.clone(),
+        snapshot_seq,
+        cursor,
+        last_error: last_error.map(str::to_string),
+        updated_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    if let Err(error) = write_status_atomic(&cfg.status_path, &status) {
+        eprintln!("[replica] status write failed: {error}");
+    }
+}
+
+fn write_status_atomic(path: &Path, status: &ReplicaStatus) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let staged = path.with_extension(format!("tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(status).map_err(|error| error.to_string())?;
+    std::fs::write(&staged, bytes).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(staged, path).map_err(|error| error.to_string())
+}
+
+fn retry_delay(base_secs: u64, attempt: u32) -> Duration {
+    let exponential = base_secs.max(1).saturating_mul(1u64 << attempt.min(5));
+    let capped = exponential.min(300);
+    let jitter_span = (capped / 5).max(1);
+    let jitter = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        ^ std::process::id() as u64
+        ^ attempt as u64)
+        % (jitter_span + 1);
+    Duration::from_secs((capped - jitter_span / 2).saturating_add(jitter).max(1))
 }
 
 fn verification_required(app_env: Option<&str>, unsigned_requested: bool) -> bool {
@@ -77,10 +194,20 @@ fn verification_required(app_env: Option<&str>, unsigned_requested: bool) -> boo
 
 /// Resolve the seed's Ed25519 pubkey (hex) from its DID document — `None` if the seed
 /// hasn't set its genesis key (unsigned network → events applied without sig check).
-async fn resolve_seed_pubkey(client: &reqwest::Client, seed_url: &str) -> Option<String> {
+async fn resolve_seed_pubkey(
+    client: &reqwest::Client,
+    seed_url: &str,
+    expected_did: &str,
+) -> Option<String> {
     let url = format!("{seed_url}/.well-known/did.json");
     let did: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-    seed_pubkey_hex_from_did(&did)
+    seed_pubkey_hex_from_expected_did(&did, expected_did)
+}
+
+fn seed_pubkey_hex_from_expected_did(did: &Value, expected_did: &str) -> Option<String> {
+    (did.get("id").and_then(Value::as_str) == Some(expected_did))
+        .then(|| seed_pubkey_hex_from_did(did))
+        .flatten()
 }
 
 /// Fetch one page of the seed's event log: `GET /api/v1/events?since_seq=N` (public).
@@ -90,14 +217,29 @@ async fn resolve_seed_pubkey(client: &reqwest::Client, seed_url: &str) -> Option
 /// prefix (`routes/api_public.php` `require`d into `routes/api.php`), and production
 /// `iicp.network` serves it at `/api/v1/events` too. There is no bare `/v1/events`
 /// route — an earlier draft polled `/v1/events` and silently 404'd every tick.
-async fn fetch_events(
-    client: &reqwest::Client,
-    seed_url: &str,
-    since_seq: i64,
-) -> Option<(Vec<FederatedEvent>, i64, bool)> {
+enum EventPage {
+    Events(Vec<FederatedEvent>, i64, bool),
+    SnapshotRequired,
+    Failed,
+}
+
+async fn fetch_events(client: &reqwest::Client, seed_url: &str, since_seq: i64) -> EventPage {
     let url = events_url(seed_url, since_seq);
-    let body: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-    let events: Vec<FederatedEvent> = serde_json::from_value(body.get("events")?.clone()).ok()?;
+    let Ok(response) = client.get(&url).send().await else {
+        return EventPage::Failed;
+    };
+    let Ok(body) = response.json::<Value>().await else {
+        return EventPage::Failed;
+    };
+    if body.pointer("/error/code").and_then(Value::as_str) == Some("IICP-E045") {
+        return EventPage::SnapshotRequired;
+    }
+    let Some(raw_events) = body.get("events") else {
+        return EventPage::Failed;
+    };
+    let Ok(events) = serde_json::from_value(raw_events.clone()) else {
+        return EventPage::Failed;
+    };
     let next_seq = body
         .get("next_seq")
         .and_then(Value::as_i64)
@@ -106,7 +248,7 @@ async fn fetch_events(
         .get("has_more")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    Some((events, next_seq, has_more))
+    EventPage::Events(events, next_seq, has_more)
 }
 
 /// Build the seed event-log poll URL. Extracted so the `/api/v1` prefix is unit-tested
@@ -176,8 +318,7 @@ fn validated_snapshot_seq(snapshot: &Value) -> Option<i64> {
 /// Join handshake (DIR-FED-13 §7): announce this replica to the seed with our DID +
 /// endpoint. The seed records us in its replica registry and emits a REPLICA_REGISTERED
 /// event so other replicas know about us. Returns the handshake `since_seq` on success
-/// (`None` on any network/parse failure — skipping the handshake is non-fatal; the replica
-/// still tails events, just without appearing in the seed's replica list).
+/// (`None` on any network/parse failure; replica bootstrap retries and remains unready).
 struct JoinHandshake {
     since_seq: i64,
     replica_token: String,
@@ -195,6 +336,8 @@ async fn join_handshake(
         .json(&serde_json::json!({ "did": did, "endpoint": endpoint }))
         .send()
         .await
+        .ok()?
+        .error_for_status()
         .ok()?
         .json()
         .await
@@ -217,17 +360,77 @@ async fn join_handshake(
 /// + applying each new event to mirror the seed's state. The join handshake (§7) announces
 ///   this replica to the seed; the snapshot bootstrap (§5.3) primes local state and advances
 ///   `since_seq` so we only tail events newer than the snapshot.
-pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig) {
+async fn bootstrap_replica(
+    client: &reqwest::Client,
+    repo: &dyn NodeRepository,
+    cfg: &ReplicaConfig,
+) -> (JoinHandshake, i64) {
+    let did = cfg.replica_did.as_deref().expect("validated replica DID");
+    let endpoint = cfg
+        .replica_endpoint
+        .as_deref()
+        .expect("validated replica endpoint");
+    let mut attempt = 0;
+    loop {
+        write_replica_status(cfg, ReplicaPhase::Registering, None, None, None);
+        let Some(join) = join_handshake(client, &cfg.seed_url, did, endpoint).await else {
+            write_replica_status(
+                cfg,
+                ReplicaPhase::Degraded,
+                None,
+                None,
+                Some("replica registration failed"),
+            );
+            tokio::time::sleep(retry_delay(cfg.poll_interval_secs, attempt)).await;
+            attempt = attempt.saturating_add(1);
+            continue;
+        };
+        write_replica_status(cfg, ReplicaPhase::Snapshotting, None, None, None);
+        if let Some(seq) =
+            fetch_and_apply_snapshot(client, &cfg.seed_url, &join.replica_token, repo).await
+        {
+            write_replica_status(cfg, ReplicaPhase::Synchronizing, Some(seq), Some(seq), None);
+            return (join, seq);
+        }
+        write_replica_status(
+            cfg,
+            ReplicaPhase::Degraded,
+            None,
+            None,
+            Some("authenticated snapshot unavailable or malformed"),
+        );
+        tokio::time::sleep(retry_delay(cfg.poll_interval_secs, attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+pub async fn run_replica_sync(
+    repo: Arc<dyn NodeRepository>,
+    cfg: ReplicaConfig,
+    ready: Arc<AtomicBool>,
+) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap_or_default();
 
-    let mut pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+    ready.store(false, Ordering::Release);
+    write_replica_status(&cfg, ReplicaPhase::Configured, None, None, None);
+    write_replica_status(&cfg, ReplicaPhase::VerifyingSeed, None, None, None);
+    let mut pubkey = resolve_seed_pubkey(&client, &cfg.seed_url, &cfg.seed_did).await;
+    let mut verify_attempt = 0;
     while cfg.verification_required && pubkey.is_none() {
         eprintln!("[replica] seed verification key unavailable; refusing snapshot/event mutation");
-        tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs)).await;
-        pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+        write_replica_status(
+            &cfg,
+            ReplicaPhase::Blocked,
+            None,
+            None,
+            Some("configured seed identity could not be verified"),
+        );
+        tokio::time::sleep(retry_delay(cfg.poll_interval_secs, verify_attempt)).await;
+        verify_attempt = verify_attempt.saturating_add(1);
+        pubkey = resolve_seed_pubkey(&client, &cfg.seed_url, &cfg.seed_did).await;
     }
     eprintln!(
         "[replica] sync start: seed={} signing-key={}",
@@ -239,44 +442,14 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
         }
     );
 
-    // JOIN HANDSHAKE (DIR-FED-13 §7): announce this replica to the seed.
-    // Requires IICP_REPLICA_DID + IICP_REPLICA_ENDPOINT; skipped (non-fatal) if absent.
-    let handshake = if let (Some(did), Some(endpoint)) = (&cfg.replica_did, &cfg.replica_endpoint) {
-        join_handshake(&client, &cfg.seed_url, did, endpoint).await
-    } else {
-        None
-    };
-
-    // SNAPSHOT BOOTSTRAP (§5.3): Genesis snapshots are authenticated by the
-    // rotating replica bearer and trusted Genesis TLS+DNS boundary (S.13
-    // §5.5/§6.5). `verification_required` applies to the public event tail; it
-    // must not disable the authenticated snapshot that supplies canonical
-    // current state.  A configured replica fails closed and retries rather
-    // than skipping historical state after a transient snapshot failure.
-    let mut since_seq: i64 = match handshake.as_ref() {
-        Some(join) => loop {
-            if let Some(seq) =
-                fetch_and_apply_snapshot(&client, &cfg.seed_url, &join.replica_token, repo.as_ref())
-                    .await
-            {
-                break seq;
-            }
-            eprintln!(
-                "[replica] authenticated snapshot unavailable or malformed; no event mutation"
-            );
-            tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs)).await;
-        },
-        None => {
-            eprintln!("[replica] authenticated snapshot skipped; join token unavailable");
-            0
-        }
-    };
+    let (_, mut since_seq) = bootstrap_replica(&client, repo.as_ref(), &cfg).await;
+    let mut snapshot_seq = since_seq;
 
     let mut interval = tokio::time::interval(Duration::from_secs(cfg.poll_interval_secs));
     loop {
         interval.tick().await;
         if cfg.verification_required && pubkey.is_none() {
-            pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+            pubkey = resolve_seed_pubkey(&client, &cfg.seed_url, &cfg.seed_did).await;
             if pubkey.is_none() {
                 eprintln!("[replica] seed verification key still unavailable; no mutation");
                 continue;
@@ -289,13 +462,47 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
         // cycle skips the continuity check; its own signature is still verified.
         let mut prev_sig: Option<String> = None;
         loop {
-            let Some((events, _next_seq, has_more)) =
-                fetch_events(&client, &cfg.seed_url, since_seq).await
-            else {
-                eprintln!("[replica] events fetch failed (seq={since_seq}); retry next tick");
-                break;
-            };
+            let (events, _next_seq, has_more) =
+                match fetch_events(&client, &cfg.seed_url, since_seq).await {
+                    EventPage::Events(events, next_seq, has_more) => (events, next_seq, has_more),
+                    EventPage::SnapshotRequired => {
+                        ready.store(false, Ordering::Release);
+                        write_replica_status(
+                            &cfg,
+                            ReplicaPhase::Degraded,
+                            Some(snapshot_seq),
+                            Some(since_seq),
+                            Some("event cursor expired; authenticated snapshot required"),
+                        );
+                        let (_, recovered_seq) =
+                            bootstrap_replica(&client, repo.as_ref(), &cfg).await;
+                        since_seq = recovered_seq;
+                        snapshot_seq = recovered_seq;
+                        break;
+                    }
+                    EventPage::Failed => {
+                        eprintln!(
+                            "[replica] events fetch failed (seq={since_seq}); retry next tick"
+                        );
+                        write_replica_status(
+                            &cfg,
+                            ReplicaPhase::Degraded,
+                            Some(snapshot_seq),
+                            Some(since_seq),
+                            Some("event fetch failed"),
+                        );
+                        break;
+                    }
+                };
             if events.is_empty() {
+                ready.store(true, Ordering::Release);
+                write_replica_status(
+                    &cfg,
+                    ReplicaPhase::Ready,
+                    Some(snapshot_seq),
+                    Some(since_seq),
+                    None,
+                );
                 break;
             }
             let mut applied = 0u32;
@@ -333,14 +540,29 @@ pub async fn run_replica_sync(repo: Arc<dyn NodeRepository>, cfg: ReplicaConfig)
             if applied > 0 {
                 eprintln!("[replica] applied {applied} event(s) → seq={since_seq}");
             }
+            write_replica_status(
+                &cfg,
+                ReplicaPhase::Synchronizing,
+                Some(snapshot_seq),
+                Some(since_seq),
+                None,
+            );
             if refresh_key {
-                pubkey = resolve_seed_pubkey(&client, &cfg.seed_url).await;
+                pubkey = resolve_seed_pubkey(&client, &cfg.seed_url, &cfg.seed_did).await;
                 eprintln!(
                     "[replica] signature rejection triggered seed-key refresh; event high-water unchanged"
                 );
                 break;
             }
             if !has_more {
+                ready.store(true, Ordering::Release);
+                write_replica_status(
+                    &cfg,
+                    ReplicaPhase::Ready,
+                    Some(snapshot_seq),
+                    Some(since_seq),
+                    None,
+                );
                 break;
             }
         }
@@ -1374,6 +1596,54 @@ mod tests {
             seed_pubkey_hex_from_did(&did).as_deref(),
             Some("d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737")
         );
+        assert!(seed_pubkey_hex_from_expected_did(&did, "did:web:other.example").is_none());
+        assert!(seed_pubkey_hex_from_expected_did(&did, "did:web:iicp.network").is_some());
+    }
+
+    #[test]
+    fn retry_delay_is_bounded_for_every_attempt() {
+        for attempt in 0..100 {
+            let delay = retry_delay(10, attempt).as_secs();
+            assert!((1..=360).contains(&delay));
+        }
+    }
+
+    #[test]
+    fn replica_status_is_owner_private_and_contains_no_credentials() {
+        let root = std::env::temp_dir().join(format!("iicp-replica-{}", uuid::Uuid::new_v4()));
+        let path = root.join("status.json");
+        let cfg = ReplicaConfig {
+            seed_url: "https://seed.example".into(),
+            seed_did: "did:web:seed.example".into(),
+            poll_interval_secs: 10,
+            replica_did: Some("did:web:replica.example".into()),
+            replica_endpoint: Some("https://replica.example".into()),
+            verification_required: true,
+            status_path: path.clone(),
+        };
+        write_replica_status(
+            &cfg,
+            ReplicaPhase::Synchronizing,
+            Some(40),
+            Some(42),
+            Some("bounded failure"),
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status["phase"], "synchronizing");
+        assert_eq!(status["cursor"], 42);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("token"));
+        assert!(!text.contains("secret"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1422,9 +1692,12 @@ mod tests {
         // Pin that ReplicaConfig::from_env() reads both when present.
         std::env::set_var("IICP_REPLICA_MODE", "1");
         std::env::set_var("IICP_SEED_URL", "http://seed.test");
+        std::env::set_var("IICP_SEED_DID", "did:web:seed.test");
         std::env::set_var("IICP_REPLICA_DID", "did:web:replica.test");
         std::env::set_var("IICP_REPLICA_ENDPOINT", "https://replica.test");
-        let cfg = ReplicaConfig::from_env().expect("config must parse");
+        let cfg = ReplicaConfig::from_env()
+            .expect("config validation")
+            .expect("config must parse");
         assert_eq!(cfg.replica_did.as_deref(), Some("did:web:replica.test"));
         assert_eq!(
             cfg.replica_endpoint.as_deref(),
@@ -1432,6 +1705,7 @@ mod tests {
         );
         std::env::remove_var("IICP_REPLICA_MODE");
         std::env::remove_var("IICP_SEED_URL");
+        std::env::remove_var("IICP_SEED_DID");
         std::env::remove_var("IICP_REPLICA_DID");
         std::env::remove_var("IICP_REPLICA_ENDPOINT");
     }

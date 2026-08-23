@@ -1,7 +1,7 @@
 //! Shared HTTP application state and process-local admission counters.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 use crate::repo::NodeRepository;
 use crate::restricted_domain_auth::RestrictedDomainService;
@@ -33,6 +33,9 @@ pub(crate) struct AppState {
     /// Local tests may disable dial-back; production never does.
     pub(crate) skip_liveness_check: bool,
     pub(crate) restricted_domain: RestrictedDomainService,
+    /// Present only in replica mode. Discovery remains unavailable until a complete,
+    /// verified snapshot and event-tail catch-up have succeeded.
+    pub(crate) replica_ready: Option<Arc<AtomicBool>>,
 }
 
 #[cfg(test)]

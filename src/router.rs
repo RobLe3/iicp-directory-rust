@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use std::sync::atomic::Ordering;
 
 use crate::observability::{health, stats};
 use crate::probe::probe_node;
@@ -134,10 +135,40 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/", get(root_info))
         .layer(middleware::from_fn(json_error_boundary))
         .layer(middleware::from_fn_with_state(
+            middleware_state.clone(),
+            replica_readiness_gate,
+        ))
+        .layer(middleware::from_fn_with_state(
             middleware_state,
             restricted_domain_gate,
         ))
         .with_state(state)
+}
+
+async fn replica_readiness_gate(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let discovery = matches!(req.uri().path(), "/v1/discover" | "/api/v1/discover");
+    let ready = state
+        .replica_ready
+        .as_ref()
+        .is_none_or(|ready| ready.load(Ordering::Acquire));
+    if discovery && !ready {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "10")],
+            Json(serde_json::json!({
+                "error": {
+                    "code": "replica_not_ready",
+                    "message": "replica has not completed verified synchronization"
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Axum extractor rejections otherwise expose plain-text parser details (and

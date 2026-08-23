@@ -127,8 +127,11 @@ For a durable installation, backup and recovery guidance, read
 | `APP_ENV` | `production` | `local`, `testing`, `staging` or `production`; controls fail-closed safety policy. |
 | `APP_KEY` | — | Optional HS256 JWT compatibility key. |
 | `IICP_GENESIS_ED25519_SECRET_KEY` | — | 128-hex libsodium Ed25519 secret key used for event, DID, token and attestation signing. Required in production. |
-| `IICP_REPLICA_MODE` | `false` | When true, unsafe writes redirect to the seed. |
-| `IICP_SEED_URL` | — | Seed URL used by replica write redirection. |
+| `IICP_REPLICA_MODE` | `false` | When true, unsafe writes redirect to the seed and discovery remains unavailable until verified synchronization completes. |
+| `IICP_SEED_URL` | — | Configured seed location. This is not identity or trust evidence. |
+| `IICP_SEED_DID` | — | Expected `did:web` seed identity. Required separately from `IICP_SEED_URL` in replica mode. |
+| `IICP_REPLICA_DID`, `IICP_REPLICA_ENDPOINT` | — | Stable replica identity and HTTPS endpoint. Both are required in replica mode. |
+| `IICP_REPLICA_STATUS_FILE` | platform state directory | Owner-private, non-secret synchronization status and cursor evidence. |
 | `IICP_ALLOW_IN_MEMORY` | `false` | Explicitly allow disposable in-memory state outside production. |
 | `IICP_DEV_ALLOW_INSECURE_TLS` | `false` | Allow invalid probe certificates only in local/testing environments. Never affects production. |
 | `IICP_DEV_ALLOW_UNSIGNED_EVENTS` | `false` | Allow unsigned replica events only in local/testing environments. Never affects production. |

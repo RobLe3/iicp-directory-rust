@@ -119,6 +119,7 @@ fn test_state() -> AppState {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     }
 }
 
@@ -284,6 +285,28 @@ async fn discover_api_v1_contains_live_php_compatibility_fields() {
     assert_eq!(node["privacy_routing_status"], "transitional");
     assert_eq!(node["response_encryption_ready"], false);
     assert_eq!(node["browser_usable"], true);
+}
+
+#[tokio::test]
+async fn replica_discovery_fails_closed_until_verified_sync_is_ready() {
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    let mut state = test_state();
+    state.replica_ready = Some(Arc::new(AtomicBool::new(false)));
+    let resp = app(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "10");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["error"]["code"], "replica_not_ready");
 }
 
 #[tokio::test]
@@ -3083,6 +3106,7 @@ async fn re_register_with_known_id_preserves_reputation() {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     };
     let router = app(st);
     let body = |id: &str| {
@@ -3155,6 +3179,7 @@ async fn re_register_issues_new_token_that_works_for_heartbeat() {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     };
     let router = app(st);
     let body = serde_json::json!({
@@ -3212,6 +3237,7 @@ async fn full_lifecycle_register_discover_heartbeat() {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     };
     let router = app(st);
 
@@ -3403,6 +3429,7 @@ fn strict_e050_http_state() -> AppState {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     }
 }
 
@@ -3990,6 +4017,7 @@ async fn register_invalid_node_id_is_422() {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     };
     for bad_id in &[
         "",
@@ -4008,6 +4036,7 @@ async fn register_invalid_node_id_is_422() {
             allow_insecure_tls: false,
             skip_liveness_check: true,
             restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+            replica_ready: None,
         })
         .oneshot(post_register(serde_json::json!({
             "node_id": bad_id,
@@ -4041,6 +4070,7 @@ async fn register_valid_custom_node_id_accepted() {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     };
     let resp = app(st)
         .oneshot(post_register(serde_json::json!({
@@ -4071,6 +4101,7 @@ async fn register_ack_contains_proxy_token() {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     };
     let resp = app(st)
         .oneshot(post_register(serde_json::json!({
@@ -4154,6 +4185,7 @@ async fn telemetry_rt03_rejects_self_report() {
         allow_insecure_tls: false,
         skip_liveness_check: true,
         restricted_domain: crate::restricted_domain_auth::RestrictedDomainService::public(),
+        replica_ready: None,
     };
     let body = serde_json::json!({
         "node_id": "self-node",
