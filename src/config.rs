@@ -74,8 +74,14 @@ fn directory_identity_from_values(
         let endpoint = replica
             .replica_endpoint
             .as_ref()
-            .filter(|url| url.starts_with("https://"))
-            .ok_or_else(|| "replica mode requires an HTTPS IICP_REPLICA_ENDPOINT".to_string())?;
+            .filter(|url| {
+                url.starts_with("https://")
+                    || (replica.allow_http_did && url.starts_with("http://"))
+            })
+            .ok_or_else(|| {
+                "replica mode requires HTTPS unless the explicit local/testing HTTP testbed flag is active"
+                    .to_string()
+            })?;
         if configured_did.is_some_and(|served| served != *did) {
             return Err(
                 "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID in replica mode".to_string(),
@@ -116,6 +122,7 @@ mod tests {
             poll_interval_secs: 10,
             replica_did: did.map(str::to_string),
             replica_endpoint: endpoint.map(str::to_string),
+            allow_http_did: false,
             verification_required: true,
             status_path: std::path::PathBuf::from("/tmp/iicp-replica-test-status.json"),
         }
@@ -182,6 +189,16 @@ mod tests {
         .expect("replica identity");
         assert_eq!(identity.did, "did:web:replica.example");
         assert_eq!(identity.service_endpoint, "https://replica.example");
+    }
+
+    #[test]
+    fn replica_identity_allows_http_only_for_explicit_testbed_config() {
+        let mut testbed = replica(Some("did:web:replica%3A8090"), Some("http://replica:8090"));
+        assert!(directory_identity_from_values(Some(&testbed), None, None).is_err());
+        testbed.allow_http_did = true;
+        let identity = directory_identity_from_values(Some(&testbed), None, None)
+            .expect("explicit testbed HTTP endpoint");
+        assert_eq!(identity.service_endpoint, "http://replica:8090");
     }
 
     #[test]

@@ -134,6 +134,7 @@ For a durable installation, backup and recovery guidance, read
 | `IICP_REPLICA_STATUS_FILE` | platform state directory | Owner-private, non-secret synchronization status and cursor evidence. |
 | `IICP_ALLOW_IN_MEMORY` | `false` | Explicitly allow disposable in-memory state outside production. |
 | `IICP_DEV_ALLOW_INSECURE_TLS` | `false` | Allow invalid probe certificates only in local/testing environments. Never affects production. |
+| `IICP_DEV_ALLOW_HTTP_DID` | `false` | Allow a plain-HTTP replica endpoint only when `APP_ENV` is `local` or `testing`. Staging/production always require HTTPS. |
 | `IICP_DEV_ALLOW_UNSIGNED_EVENTS` | `false` | Allow unsigned replica events only in local/testing environments. Never affects production. |
 | `IICP_DEPLOYMENT_KIND` | — | `shared_hosting`, `container`, `native` or `other`; required to publish signed deployment provenance. |
 | `IICP_RELEASE_TAG`, `IICP_SOURCE_COMMIT`, `IICP_BUILD_ID`, `IICP_DEPLOYED_AT` | — | Immutable release inputs for `/.well-known/iicp-deployment.json`. |

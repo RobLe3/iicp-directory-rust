@@ -938,7 +938,7 @@ async fn snapshot_returns_nodes_and_capabilities() {
     assert_eq!(resp.status(), 200);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["schema_version"], "v0.3.0");
     let nodes = v["nodes"].as_array().expect("nodes array");
     assert_eq!(nodes.len(), 2);
     assert!(

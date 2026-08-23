@@ -184,7 +184,10 @@ pub(crate) async fn snapshot(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     Json(serde_json::json!({
-        "schema_version": 1,
+        // PHP SnapshotController and the federation specification use this
+        // string value. A numeric `1` made a Rust seed's authenticated
+        // snapshot unusable by the same Rust replica validator.
+        "schema_version": "v0.3.0",
         "snapshot_seq": snapshot_seq,
         "snapshot_ts_ms": ts_ms,
         "genesis_hash": genesis_hash,

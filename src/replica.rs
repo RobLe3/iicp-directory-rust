@@ -40,6 +40,10 @@ pub struct ReplicaConfig {
     /// This replica's public HTTPS endpoint, from `IICP_REPLICA_ENDPOINT`.
     /// Sent to the seed during the join handshake so the seed can record this replica.
     pub replica_endpoint: Option<String>,
+    /// Permit a plain-HTTP replica endpoint only in an explicit local/testing
+    /// testbed. Discovery never weakens transport or identity verification by
+    /// itself, and staging/production always require HTTPS.
+    pub allow_http_did: bool,
     /// Production replicas never mutate from an unsigned/unverified source.
     /// The bypass is explicit and limited to non-production testbeds.
     pub verification_required: bool,
@@ -70,6 +74,14 @@ impl ReplicaConfig {
         let replica_endpoint = std::env::var("IICP_REPLICA_ENDPOINT")
             .map_err(|_| "replica mode requires IICP_REPLICA_ENDPOINT".to_string())?;
         let app_env = std::env::var("APP_ENV").ok();
+        let http_requested = std::env::var("IICP_DEV_ALLOW_HTTP_DID").is_ok_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        let allow_http_did =
+            matches!(app_env.as_deref(), Some("local" | "testing")) && http_requested;
         let unsigned_requested =
             std::env::var("IICP_DEV_ALLOW_UNSIGNED_EVENTS").is_ok_and(|value| {
                 matches!(
@@ -80,8 +92,13 @@ impl ReplicaConfig {
         if !seed_did.starts_with("did:web:") || !replica_did.starts_with("did:web:") {
             return Err("replica and seed identities must be did:web identifiers".to_string());
         }
-        if !replica_endpoint.starts_with("https://") {
-            return Err("IICP_REPLICA_ENDPOINT must use HTTPS".to_string());
+        if !(replica_endpoint.starts_with("https://")
+            || (allow_http_did && replica_endpoint.starts_with("http://")))
+        {
+            return Err(
+                "IICP_REPLICA_ENDPOINT must use HTTPS (plain HTTP requires APP_ENV=local/testing and IICP_DEV_ALLOW_HTTP_DID=true)"
+                    .to_string(),
+            );
         }
         Ok(Some(ReplicaConfig {
             seed_url: seed_url.trim_end_matches('/').to_string(),
@@ -89,6 +106,7 @@ impl ReplicaConfig {
             poll_interval_secs,
             replica_did: Some(replica_did),
             replica_endpoint: Some(replica_endpoint),
+            allow_http_did,
             verification_required: verification_required(app_env.as_deref(), unsigned_requested),
             status_path: replica_status_path(),
         }))
@@ -1618,6 +1636,7 @@ mod tests {
             poll_interval_secs: 10,
             replica_did: Some("did:web:replica.example".into()),
             replica_endpoint: Some("https://replica.example".into()),
+            allow_http_did: false,
             verification_required: true,
             status_path: path.clone(),
         };
