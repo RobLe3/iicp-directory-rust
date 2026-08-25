@@ -21,11 +21,20 @@ pub fn evaluate(context: &Value) -> Value {
     if auth == Some("missing") {
         return json!({"status":401,"reason":"consumer_auth_required"});
     }
-    if !matches!(auth, Some("valid" | "expired")) {
+    if !matches!(auth, Some("valid" | "expired" | "revoked")) {
         return json!({"status":401,"reason":"consumer_auth_invalid"});
     }
     if auth == Some("expired") {
         return json!({"status":401,"reason":"consumer_auth_expired"});
+    }
+    if auth == Some("revoked") {
+        return json!({"status":401,"reason":"consumer_auth_revoked"});
+    }
+    match context["dispatch_ticket"].as_str() {
+        Some("expired") => return json!({"status":401,"reason":"dispatch_ticket_expired"}),
+        Some("revoked") => return json!({"status":401,"reason":"dispatch_ticket_revoked"}),
+        Some("valid") | None => {}
+        _ => return json!({"status":401,"reason":"dispatch_ticket_invalid"}),
     }
     if context["disclosure_allowed"].as_bool() != Some(true) {
         return json!({"status":403,"reason":"disclosure_forbidden"});
