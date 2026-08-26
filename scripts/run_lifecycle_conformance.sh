@@ -4,6 +4,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label directory-lifecycle -- "$0" "$@"
+fi
 SPEC_REPO="${IICP_SPEC_REPO:-$ROOT/../IICP}"
 CONFORMANCE_REF="${IICP_CONFORMANCE_REF:-v1.10.8}"
 MYSQL_IMAGE="${IICP_MYSQL_IMAGE:-mysql@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b}"
@@ -83,7 +86,7 @@ MYSQL_PORT="$(docker port "$CONTAINER" 3306/tcp | awk -F: 'NR == 1 {print $NF}')
 
 export APP_ENV=testing IICP_SKIP_LIVENESS_CHECK=true
 export DATABASE_URL="mysql://root:$MYSQL_PASSWORD@127.0.0.1:$MYSQL_PORT/iicp?ssl-mode=DISABLED"
-./target/debug/iicp-directory-rs >"$TMP/server.log" 2>&1 &
+"${CARGO_TARGET_DIR:?missing disposable Cargo target}/debug/iicp-directory-rs" >"$TMP/server.log" 2>&1 &
 SERVER_PID=$!
 
 server_ready=false

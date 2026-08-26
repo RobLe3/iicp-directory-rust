@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label directory-quality -- "$0" "$@"
+fi
+cd "$ROOT"
+
 python3 scripts/check_dependency_policy.py
 cargo fmt --check
 cargo clippy --locked --all-features --all-targets -- -D warnings

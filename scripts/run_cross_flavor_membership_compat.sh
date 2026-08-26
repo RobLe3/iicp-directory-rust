@@ -3,6 +3,12 @@
 # The database must be disposable. Credential output is consumed, never logged.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label cross-flavor-membership -- "$0" "$@"
+fi
+cd "$ROOT"
+
 : "${PHP_DIRECTORY_ROOT:?set PHP_DIRECTORY_ROOT to the reviewed PHP directory checkout}"
 : "${IICP_CROSS_FLAVOR_DATABASE_URL:?set the Rust URL for the disposable MySQL database}"
 : "${IICP_CROSS_FLAVOR_DB_NAME:?set the disposable database name}"

@@ -3,6 +3,11 @@
 # Isolated, content-free systemd manager recovery evidence.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label systemd-watchdog -- "$0" "$@"
+fi
+
 if [[ "$(uname -s)" != "Linux" ]] || ! command -v systemd-run >/dev/null; then
   echo "ERROR: Linux with systemd-run is required" >&2
   exit 2

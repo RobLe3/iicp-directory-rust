@@ -22,6 +22,11 @@ cargo fmt --check
 cargo test --locked
 ```
 
+Release, coverage, conformance and operator-evidence scripts use isolated Cargo
+targets with incremental compilation disabled. They remove only their own
+successful run output. Set `IICP_KEEP_FAILED_CARGO_TARGET=1` to preserve a
+failed run for diagnosis. Interactive Cargo commands continue to use `target/`.
+
 Run the cross-directory parity gates from the IICP integration workspace when
 changing public fields, lifecycle behavior, persistence or migrations. Do not
 include production configuration or real operator data.

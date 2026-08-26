@@ -3,6 +3,11 @@
 # Content-free Rust runtime-health evidence lane for Linux/ARM operators.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label runtime-health-arm -- "$0" "$@"
+fi
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "ERROR: this evidence lane requires Linux" >&2
   exit 2
