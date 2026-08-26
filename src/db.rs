@@ -814,6 +814,19 @@ async fn capability_records(
 
 // ── MySqlRepo ─────────────────────────────────────────────────────────────────
 
+#[derive(sqlx::FromRow)]
+struct OperatorRotationSource {
+    display_name: Option<String>,
+    attested_created_at: Option<String>,
+    operator_integrity_hash: Option<String>,
+    first_seen_ms: Option<u64>,
+    ordinal: Option<u64>,
+    tier: Option<String>,
+    badge: Option<String>,
+    provenance: Option<String>,
+    rotation_epoch: Option<u32>,
+}
+
 pub struct MySqlRepo {
     pool: Pool<MySql>,
     signing_key: Option<String>,
@@ -3282,25 +3295,25 @@ impl NodeRepository for MySqlRepo {
             .begin()
             .await
             .map_err(|_| OperatorLifecycleError::Storage)?;
-        let old: Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<String>, Option<u32>)> = sqlx::query_as(
-            "SELECT display_name, attested_created_at, operator_integrity_hash, first_seen_ms, ordinal, tier, badge, provenance, rotation_epoch \
+        let old: Option<OperatorRotationSource> = sqlx::query_as(
+            "SELECT display_name, attested_created_at, operator_integrity_hash, first_seen_ms, ordinal, tier, badge, CAST(provenance AS CHAR) AS provenance, rotation_epoch \
              FROM operators WHERE operator_pubkey = ? AND identity_status = 'active' FOR UPDATE",
         )
         .bind(old_operator_pubkey)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| OperatorLifecycleError::Storage)?;
-        let Some((
+        let Some(OperatorRotationSource {
             display_name,
             attested_created_at,
-            integrity_hash,
+            operator_integrity_hash: integrity_hash,
             first_seen_ms,
             ordinal,
             tier,
             badge,
             provenance,
-            prior_epoch,
-        )) = old
+            rotation_epoch: prior_epoch,
+        }) = old
         else {
             let exists: Option<(i64,)> =
                 sqlx::query_as("SELECT 1 FROM operators WHERE operator_pubkey = ? LIMIT 1")
@@ -4189,6 +4202,62 @@ mod tests {
     fn test_signing_key() -> String {
         let public_key = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
         format!("{}{}", "11".repeat(32), public_key)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty disposable MySQL database in IICP_TEST_DATABASE_URL"]
+    async fn operator_rotation_decodes_unsigned_lifecycle_fields() {
+        use ct_codecs::{Base64, Encoder};
+
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify an empty disposable database");
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        let repo = MySqlRepo::new(pool.clone());
+        let old = Base64::encode_to_string([61; 32]).unwrap();
+        let successor = Base64::encode_to_string([62; 32]).unwrap();
+        repo.upsert_operator(
+            &old,
+            Some("Rotation test"),
+            Some("2026-01-01T00:00:00Z"),
+            Some(&"ab".repeat(32)),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE operators SET ordinal = 7, provenance = JSON_OBJECT('source', 'test') \
+             WHERE operator_pubkey = ?",
+        )
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .expect("seed unsigned lifecycle metadata");
+        sqlx::query(
+            "INSERT INTO nodes \
+             (id, endpoint, region, node_token_hash, max_concurrent, tokens_per_min, \
+              operator_pubkey, operator_verified) \
+             VALUES ('rotation-node', 'https://example.invalid/v1', 'test', 'x', 1, 1, ?, 1)",
+        )
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .expect("seed linked node");
+
+        let result = repo
+            .rotate_operator_identity(&old, &successor, None, "operator_rotation")
+            .await
+            .expect("MySQL rotation must accept unsigned lifecycle fields");
+        assert_eq!(result.linked_nodes, 1);
+        assert_eq!(result.rotation_epoch, Some(1));
+        assert_eq!(repo.operator_identity_active(&old).await, Some(false));
+        assert_eq!(repo.operator_identity_active(&successor).await, Some(true));
+        let linked: String =
+            sqlx::query_scalar("SELECT operator_pubkey FROM nodes WHERE id = 'rotation-node'")
+                .fetch_one(&pool)
+                .await
+                .expect("read linked successor");
+        assert_eq!(linked, successor);
     }
 
     #[tokio::test]
