@@ -10,7 +10,7 @@ concurrency:
 
 env:
   CARGO_INCREMENTAL: "0"
-  CARGO_TARGET_DIR: ${{ runner.temp }}/iicp-directory-rust
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../.iicp-ci-target/rust-directory
 
 jobs:
   test:

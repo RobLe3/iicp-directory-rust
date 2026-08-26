@@ -27,6 +27,15 @@ targets with incremental compilation disabled. They remove only their own
 successful run output. Set `IICP_KEEP_FAILED_CARGO_TARGET=1` to preserve a
 failed run for diagnosis. Interactive Cargo commands continue to use `target/`.
 
+Before committing a GitHub Actions change, run:
+
+```bash
+./scripts/check_ci_workflows.sh
+```
+
+The check uses a pinned semantic workflow linter. A workflow that produces no
+jobs is a failure, not an empty green check set.
+
 Run the cross-directory parity gates from the IICP integration workspace when
 changing public fields, lifecycle behavior, persistence or migrations. Do not
 include production configuration or real operator data.
