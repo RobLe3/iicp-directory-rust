@@ -19,7 +19,7 @@ CANDIDATE_METRICS=""
 
 cleanup() {
   [[ -z "$SERVICE" ]] || docker rm -f "$SERVICE" >/dev/null 2>&1 || true
-  docker rm -f "$DB" >/dev/null 2>&1 || true
+  docker rm -fv "$DB" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   [[ -z "$BASELINE_TREE" ]] || find "$BASELINE_TREE" -depth -delete 2>/dev/null || true
   [[ -z "$BASELINE_METRICS" ]] || find "$BASELINE_METRICS" -delete 2>/dev/null || true
@@ -43,6 +43,7 @@ candidate_digest="$(docker image inspect "$CANDIDATE_IMAGE" --format '{{.Id}}')"
 
 docker network create "$NET" >/dev/null
 docker run -d --name "$DB" --network "$NET" \
+  --label local.docker.lifecycle=ephemeral --label local.docker.owner=iicp-directory-rust/run_distribution_evidence \
   -e MYSQL_DATABASE=iicp -e MYSQL_USER=iicp -e MYSQL_PASSWORD=iicp \
   -e MYSQL_ROOT_PASSWORD=root mysql:8.0 >/dev/null
 deadline=$((SECONDS + 90))
