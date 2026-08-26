@@ -4,6 +4,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label directory-coverage -- "$0" "$@"
+fi
 MYSQL_IMAGE="${IICP_MYSQL_IMAGE:-mysql@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b}"
 CONTAINER=""
 

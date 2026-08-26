@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label directory-release -- "$0" "$@"
+fi
 VERSION="${1:-}"
 ALLOW_UNTAGGED=0
 [[ "${2:-}" == "--allow-untagged" ]] && ALLOW_UNTAGGED=1
@@ -46,7 +49,7 @@ CRATE="$OUT/iicp-directory-rs-$VERSION.crate"
 git -C "$ROOT" archive --format=tar.gz --prefix="iicp-directory-rust-$TAG/" \
   -o "$ARCHIVE" "$COMMIT"
 ARCHIVE_SHA="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
-cp "$ROOT/target/package/iicp-directory-rs-$VERSION.crate" "$CRATE"
+cp "${CARGO_TARGET_DIR:?missing disposable Cargo target}/package/iicp-directory-rs-$VERSION.crate" "$CRATE"
 CRATE_SHA="$(shasum -a 256 "$CRATE" | awk '{print $1}')"
 COMPAT_SHA="$(shasum -a 256 "$ROOT/compatibility/$TAG.json" | awk '{print $1}')"
 
