@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import sys
 subprocess.run(
-    ["docker", "container", "rm", sys.argv[1]],
+    ["docker", "container", "rm", "--volumes", sys.argv[1]],
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
 )
@@ -64,6 +64,7 @@ MYSQL_ROOT_PASSWORD=$MYSQL_PASSWORD
 MYSQL_DATABASE=iicp
 EOF
 docker run --detach --name "$CONTAINER" --env-file "$TMP/mysql.env" \
+  --label local.docker.lifecycle=ephemeral --label local.docker.owner=iicp-directory-rust/run_lifecycle_conformance \
   --publish 127.0.0.1::3306 "$MYSQL_IMAGE" >/dev/null
 
 mysql_ready=false

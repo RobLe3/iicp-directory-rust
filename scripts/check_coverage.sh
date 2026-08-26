@@ -10,7 +10,7 @@ CONTAINER=""
 cleanup() {
   if [[ -n "$CONTAINER" ]]; then
     docker stop "$CONTAINER" >/dev/null 2>&1 || true
-    docker container rm "$CONTAINER" >/dev/null 2>&1 || true
+    docker container rm --volumes "$CONTAINER" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -32,6 +32,7 @@ if [[ -z "${IICP_TEST_DATABASE_URL:-}" ]]; then
   CONTAINER="iicp-coverage-$RANDOM-$$"
   password="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
   docker run --detach --name "$CONTAINER" \
+    --label local.docker.lifecycle=ephemeral --label local.docker.owner=iicp-directory-rust/check_coverage \
     --env "MYSQL_ROOT_PASSWORD=$password" --env MYSQL_DATABASE=iicp \
     --publish 127.0.0.1::3306 "$MYSQL_IMAGE" >/dev/null
   ready=false
