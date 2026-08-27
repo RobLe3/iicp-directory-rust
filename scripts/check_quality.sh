@@ -8,6 +8,7 @@ fi
 cd "$ROOT"
 
 python3 scripts/check_dependency_policy.py
+python3 scripts/check_package_manifest.py
 cargo fmt --check
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo test --locked --all-features
