@@ -416,7 +416,10 @@ fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-pub fn write_snapshot_atomic(path: &Path, snapshot: &HealthSnapshot) -> std::io::Result<()> {
+fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let create_parent = !parent.exists();
         fs::create_dir_all(parent)?;
@@ -434,11 +437,23 @@ pub fn write_snapshot_atomic(path: &Path, snapshot: &HealthSnapshot) -> std::io:
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&tmp)?;
-    serde_json::to_writer_pretty(&mut f, snapshot)?;
-    f.write_all(b"\n")?;
-    f.sync_all()?;
-    fs::rename(tmp, path)
+    let result = (|| {
+        let mut file = opts.open(&tmp)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+pub fn write_snapshot_atomic(path: &Path, snapshot: &HealthSnapshot) -> std::io::Result<()> {
+    write_atomic_with(path, |file| {
+        serde_json::to_writer_pretty(&mut *file, snapshot)?;
+        file.write_all(b"\n")
+    })
 }
 
 #[cfg(test)]
@@ -495,6 +510,67 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn seeded_snapshot() -> (std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("iicp-health-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("health.json");
+        let health = RuntimeHealth::new(false);
+        write_snapshot_atomic(&path, &health.snapshot()).unwrap();
+        let verified = fs::read(&path).unwrap();
+        (dir, path, verified)
+    }
+
+    #[test]
+    fn atomic_snapshot_permission_denied_preserves_private_verified_state() {
+        let (dir, path, verified) = seeded_snapshot();
+        let error = write_atomic_with(&path, |_file| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), verified);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_snapshot_disk_full_preserves_last_verified_state() {
+        let (dir, path, verified) = seeded_snapshot();
+        let error = write_atomic_with(&path, |file| {
+            file.write_all(b"{\"partial\":true")?;
+            Err(std::io::Error::from_raw_os_error(28))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(28));
+        assert_eq!(fs::read(&path).unwrap(), verified);
+        assert!(!path
+            .with_extension(format!("tmp-{}", std::process::id()))
+            .exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_snapshot_interruption_rejects_partial_generation() {
+        let (dir, path, verified) = seeded_snapshot();
+        let error = write_atomic_with(&path, |file| {
+            file.write_all(b"{\"partial\":true")?;
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(&path).unwrap(), verified);
+        assert!(!path
+            .with_extension(format!("tmp-{}", std::process::id()))
+            .exists());
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
