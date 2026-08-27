@@ -1,0 +1,168 @@
+{
+  "component": "directory-rust",
+  "evidence_policy": "digest-only",
+  "network_policy": "isolated-fixtures-only",
+  "non_authorizing": true,
+  "scenario_commands": {
+    "backup-restore": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "directory_state_semantics_fixture"
+    ],
+    "config-malformed": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "http_contract_fixture"
+    ],
+    "config-missing": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "http_contract_fixture"
+    ],
+    "config-permission-denied": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "control_plane_contract"
+    ],
+    "credential-expired": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "replica_token_contract_fixture"
+    ],
+    "credential-missing": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "replica_token_contract_fixture"
+    ],
+    "credential-replayed": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "replica_lifecycle_contract_fixture"
+    ],
+    "credential-rotated": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "replica_lifecycle_contract_fixture"
+    ],
+    "cross-flavor-equivalence": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "behavior_contract_fixture"
+    ],
+    "disk-full": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "directory_state_semantics_fixture"
+    ],
+    "duplicate-registration": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "control_plane_contract"
+    ],
+    "interrupted-write": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "directory_state_semantics_fixture"
+    ],
+    "migration-interrupted": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "directory_state_semantics_fixture"
+    ],
+    "minimum-version": [
+      "@python",
+      "scripts/test_check_release_compatibility.py"
+    ],
+    "no-dual-authority": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "control_plane_contract"
+    ],
+    "offline-locked-install": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "control_plane_contract"
+    ],
+    "package-version-self-report": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "control_plane_contract"
+    ],
+    "process-crash-restart": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "replica_lifecycle_contract_fixture"
+    ],
+    "rate-limit": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "reputation_hourly_velocity_fixture"
+    ],
+    "rollback-last-supported": [
+      "@python",
+      "scripts/test_check_release_compatibility.py"
+    ],
+    "signature-mismatch": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "replica_token_contract_fixture"
+    ],
+    "stale-pid-or-lock": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "control_plane_contract"
+    ],
+    "unsupported-version": [
+      "@python",
+      "scripts/test_check_release_compatibility.py"
+    ]
+  },
+  "schema": "iicp.pre1-component-case-map.v1",
+  "support_command": [
+    "@cargo",
+    "test",
+    "--locked",
+    "--test",
+    "behavior_contract_fixture"
+  ]
+}
