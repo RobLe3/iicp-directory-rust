@@ -48,6 +48,15 @@ class DriverContractTests(unittest.TestCase):
                 if token.startswith(("tests/", "scripts/")) and "." in Path(token).name:
                     self.assertTrue((ROOT / token).is_file(), token)
 
+    def test_stable_runtime_is_exactly_bound_to_candidate(self) -> None:
+        manifest = {"toolchains": {"rust_stable": "1.98.0"}}
+        self.assertEqual(
+            module.expected_runtime_version("rust-1.98.0", manifest), "1.98.0"
+        )
+        manifest["toolchains"]["rust_stable"] = "1.99.0"
+        with self.assertRaises(ValueError):
+            module.expected_runtime_version("rust-1.98.0", manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

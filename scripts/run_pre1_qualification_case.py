@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = 'directory-rust'
-RUNTIMES = ['msrv-1.88', 'candidate-stable-pinned']
+RUNTIMES = ['msrv-1.88', 'rust-1.98.0']
 TARGETS = ['linux-x86_64', 'linux-aarch64']
 DIRECTORIES = ['rust']
 MODES = ['public', 'restricted', 'local-only']
@@ -142,8 +142,11 @@ def validate_context(cell: str, scenario: str | None) -> tuple[str, dict, dict]:
 def expected_runtime_version(runtime: str, manifest: dict) -> str:
     if runtime.startswith("cpython-") or runtime.startswith("node-") or runtime.startswith("php-"):
         return runtime.split("-", 1)[1]
-    if runtime == "candidate-stable-pinned":
-        return str(manifest["toolchains"]["rust_stable"])
+    if runtime.startswith("rust-"):
+        expected = str(manifest["toolchains"]["rust_stable"])
+        if runtime != f"rust-{expected}":
+            raise ValueError("qualification stable Rust runtime differs from the candidate")
+        return expected
     field = {"client-rust": "rust_client_msrv", "directory-rust": "rust_directory_msrv", "management": "management_msrv"}[COMPONENT]
     return str(manifest["toolchains"][field])
 
