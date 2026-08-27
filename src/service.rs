@@ -267,4 +267,20 @@ mod tests {
         assert_eq!(fs::read(&unit.path).unwrap(), first);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn systemd_ownership_avoids_stale_pid_or_lock_authority() {
+        let unit = render_unit(
+            Path::new("/usr/local/bin/iicp-directory-rs"),
+            Path::new("/etc/iicp/directory.env"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(unit.content.contains("StartLimitIntervalSec=600"));
+        assert!(unit.content.contains("StartLimitBurst=5"));
+        assert!(unit.content.contains("Restart=always"));
+        assert!(!unit.content.contains("PIDFile="));
+        assert!(!unit.content.contains("lockfile"));
+    }
 }

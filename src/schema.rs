@@ -468,4 +468,23 @@ mod tests {
         );
         assert_eq!(normalize_default("current_timestamp"), "current_timestamp");
     }
+
+    #[test]
+    fn partial_schema_generation_is_rejected_without_repair() {
+        let contract: Contract = serde_json::from_str(CONTRACT_JSON).unwrap();
+        let mut incomplete = BTreeMap::new();
+        incomplete.insert("nodes".to_string(), ActualTable::default());
+        let problems = compare_contract(contract, &incomplete);
+        assert!(problems
+            .iter()
+            .any(|problem| problem == "missing table capabilities"));
+        assert!(problems
+            .iter()
+            .any(|problem| problem.starts_with("missing column nodes.")));
+        assert_eq!(
+            incomplete.len(),
+            1,
+            "verification must not repair partial state"
+        );
+    }
 }

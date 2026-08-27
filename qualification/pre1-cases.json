@@ -3,166 +3,287 @@
   "evidence_policy": "digest-only",
   "network_policy": "isolated-fixtures-only",
   "non_authorizing": true,
-  "scenario_commands": {
-    "backup-restore": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "directory_state_semantics_fixture"
-    ],
-    "config-malformed": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "http_contract_fixture"
-    ],
-    "config-missing": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "http_contract_fixture"
-    ],
-    "config-permission-denied": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "control_plane_contract"
-    ],
-    "credential-expired": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "replica_token_contract_fixture"
-    ],
-    "credential-missing": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "replica_token_contract_fixture"
-    ],
-    "credential-replayed": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "replica_lifecycle_contract_fixture"
-    ],
-    "credential-rotated": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "replica_lifecycle_contract_fixture"
-    ],
-    "cross-flavor-equivalence": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "behavior_contract_fixture"
-    ],
-    "disk-full": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "directory_state_semantics_fixture"
-    ],
-    "duplicate-registration": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "control_plane_contract"
-    ],
-    "interrupted-write": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "directory_state_semantics_fixture"
-    ],
-    "migration-interrupted": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "directory_state_semantics_fixture"
-    ],
-    "minimum-version": [
-      "@python",
-      "scripts/test_check_release_compatibility.py"
-    ],
-    "no-dual-authority": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "control_plane_contract"
-    ],
-    "offline-locked-install": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "control_plane_contract"
-    ],
-    "package-version-self-report": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "control_plane_contract"
-    ],
-    "process-crash-restart": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "replica_lifecycle_contract_fixture"
-    ],
-    "rate-limit": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "reputation_hourly_velocity_fixture"
-    ],
-    "rollback-last-supported": [
-      "@python",
-      "scripts/test_check_release_compatibility.py"
-    ],
-    "signature-mismatch": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "replica_token_contract_fixture"
-    ],
-    "stale-pid-or-lock": [
-      "@cargo",
-      "test",
-      "--locked",
-      "--test",
-      "control_plane_contract"
-    ],
-    "unsupported-version": [
-      "@python",
-      "scripts/test_check_release_compatibility.py"
-    ]
+  "scenarios": {
+    "backup-restore": {
+      "assertion": "canonical_directory_state_fixture_is_pinned_and_rust_parity_is_current",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "--test",
+        "directory_state_semantics_fixture",
+        "canonical_directory_state_fixture_is_pinned_and_rust_parity_is_current",
+        "--",
+        "--exact"
+      ]
+    },
+    "config-malformed": {
+      "assertion": "config::tests::replica_identity_requires_did_endpoint_and_matching_served_did",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "config::tests::replica_identity_requires_did_endpoint_and_matching_served_did",
+        "--",
+        "--exact"
+      ]
+    },
+    "config-missing": {
+      "assertion": "runtime::tests::in_memory_requires_non_production_and_explicit_truthy_value",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "runtime::tests::in_memory_requires_non_production_and_explicit_truthy_value",
+        "--",
+        "--exact"
+      ]
+    },
+    "config-permission-denied": {
+      "assertion": "runtime_health::tests::atomic_snapshot_permission_denied_preserves_private_verified_state",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "runtime_health::tests::atomic_snapshot_permission_denied_preserves_private_verified_state",
+        "--",
+        "--exact"
+      ]
+    },
+    "credential-expired": {
+      "assertion": "auth::tests::expired_replica_token_is_distinguished",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "auth::tests::expired_replica_token_is_distinguished",
+        "--",
+        "--exact"
+      ]
+    },
+    "credential-missing": {
+      "assertion": "tests::peers_requires_token",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "tests::peers_requires_token",
+        "--",
+        "--exact"
+      ]
+    },
+    "credential-replayed": {
+      "assertion": "tests::heartbeat_challenge_is_single_use_and_rotates_after_replay",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "tests::heartbeat_challenge_is_single_use_and_rotates_after_replay",
+        "--",
+        "--exact"
+      ]
+    },
+    "credential-rotated": {
+      "assertion": "auth::tests::replica_profile_round_trip_and_rotation",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "auth::tests::replica_profile_round_trip_and_rotation",
+        "--",
+        "--exact"
+      ]
+    },
+    "cross-flavor-equivalence": {
+      "assertion": "rust_policy_primitives_execute_the_php_behavior_fixture",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "--test",
+        "behavior_contract_fixture",
+        "rust_policy_primitives_execute_the_php_behavior_fixture",
+        "--",
+        "--exact"
+      ]
+    },
+    "disk-full": {
+      "assertion": "runtime_health::tests::atomic_snapshot_disk_full_preserves_last_verified_state",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "runtime_health::tests::atomic_snapshot_disk_full_preserves_last_verified_state",
+        "--",
+        "--exact"
+      ]
+    },
+    "duplicate-registration": {
+      "assertion": "tests::re_register_with_known_id_preserves_reputation",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "tests::re_register_with_known_id_preserves_reputation",
+        "--",
+        "--exact"
+      ]
+    },
+    "interrupted-write": {
+      "assertion": "runtime_health::tests::atomic_snapshot_interruption_rejects_partial_generation",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "runtime_health::tests::atomic_snapshot_interruption_rejects_partial_generation",
+        "--",
+        "--exact"
+      ]
+    },
+    "migration-interrupted": {
+      "assertion": "schema::tests::partial_schema_generation_is_rejected_without_repair",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "schema::tests::partial_schema_generation_is_rejected_without_repair",
+        "--",
+        "--exact"
+      ]
+    },
+    "minimum-version": {
+      "assertion": "minimum_rust_version_is_declared_and_candidate_remains_pre1",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "--test",
+        "pre1_release_boundaries",
+        "minimum_rust_version_is_declared_and_candidate_remains_pre1",
+        "--",
+        "--exact"
+      ]
+    },
+    "no-dual-authority": {
+      "assertion": "preview_contract_never_authorizes_dual_genesis",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "--test",
+        "pre1_release_boundaries",
+        "preview_contract_never_authorizes_dual_genesis",
+        "--",
+        "--exact"
+      ]
+    },
+    "offline-locked-install": {
+      "assertion": "offline_candidate_contract_pins_every_release_input",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "--test",
+        "pre1_release_boundaries",
+        "offline_candidate_contract_pins_every_release_input",
+        "--",
+        "--exact"
+      ]
+    },
+    "package-version-self-report": {
+      "assertion": "package_version_self_report_matches_candidate_contract",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "--test",
+        "pre1_release_boundaries",
+        "package_version_self_report_matches_candidate_contract",
+        "--",
+        "--exact"
+      ]
+    },
+    "process-crash-restart": {
+      "assertion": "systemd_notify::tests::stale_runtime_withholds_watchdog_even_when_process_and_timer_exist",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "systemd_notify::tests::stale_runtime_withholds_watchdog_even_when_process_and_timer_exist",
+        "--",
+        "--exact"
+      ]
+    },
+    "rate-limit": {
+      "assertion": "tests::register_rate_step_increments_in_window_and_resets_after_ttl",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "tests::register_rate_step_increments_in_window_and_resets_after_ttl",
+        "--",
+        "--exact"
+      ]
+    },
+    "rollback-last-supported": {
+      "assertion": "last_supported_generation_is_pinned_for_bounded_rollback",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "--test",
+        "pre1_release_boundaries",
+        "last_supported_generation_is_pinned_for_bounded_rollback",
+        "--",
+        "--exact"
+      ]
+    },
+    "signature-mismatch": {
+      "assertion": "replica::tests::bad_signature_is_rejected_and_seq_not_advanced",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "replica::tests::bad_signature_is_rejected_and_seq_not_advanced",
+        "--",
+        "--exact"
+      ]
+    },
+    "stale-pid-or-lock": {
+      "assertion": "service::tests::systemd_ownership_avoids_stale_pid_or_lock_authority",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "service::tests::systemd_ownership_avoids_stale_pid_or_lock_authority",
+        "--",
+        "--exact"
+      ]
+    },
+    "unsupported-version": {
+      "assertion": "tests::registration_rejects_conflicting_sdk_version_axes",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "tests::registration_rejects_conflicting_sdk_version_axes",
+        "--",
+        "--exact"
+      ]
+    }
   },
-  "schema": "iicp.pre1-component-case-map.v1",
-  "support_command": [
-    "@cargo",
-    "test",
-    "--locked",
-    "--test",
-    "behavior_contract_fixture"
-  ]
+  "schema": "iicp.pre1-component-case-map.v2",
+  "support": {
+    "assertion": "v1_10_80_manifest_pins_both_shared_fixtures",
+    "command": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "behavior_contract_fixture",
+      "v1_10_80_manifest_pins_both_shared_fixtures",
+      "--",
+      "--exact"
+    ]
+  }
 }
