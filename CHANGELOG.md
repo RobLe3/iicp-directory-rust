@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.15 — 2026-08-27
+
+- Persist the canonical `cx_public_key` during MySQL-backed registration and
+  re-registration so Rust Directory discovery retains the same fail-closed
+  confidentiality evidence as the PHP flavor.
+- Keep PHP Genesis authority, deployment and publication unchanged; this source
+  candidate remains an operator preview pending the guarded release decision.
+
 ## 0.1.14 — 2026-08-20
 
 - Add disabled-by-default restricted trust-domain membership persistence,
