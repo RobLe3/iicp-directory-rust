@@ -45,8 +45,8 @@ async fn upsert_node(
               operator_pubkey, operator_verified, operator_trust_tier, backend,
               sdk_language, implementation_name, implementation_version, sdk_compatibility_version, sdk_version,
               supported_receipt_profiles, public_listing, operator_url, policy_manifest,
-              credit_cost_multiplier, pricing_model)
-           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              cx_public_key, credit_cost_multiplier, pricing_model)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE
              endpoint = VALUES(endpoint), region = VALUES(region), available = 1,
              relay_capable = VALUES(relay_capable), status = 'active',
@@ -66,6 +66,7 @@ async fn upsert_node(
              public_listing = VALUES(public_listing),
              operator_url = VALUES(operator_url),
              policy_manifest = VALUES(policy_manifest),
+             cx_public_key = VALUES(cx_public_key),
              credit_cost_multiplier = VALUES(credit_cost_multiplier),
              pricing_model = VALUES(pricing_model)
              -- reputation_score intentionally NOT updated (ADR-026 anti-laundering)"#,
@@ -100,6 +101,12 @@ async fn upsert_node(
     .bind(
         rec.node
             .policy_manifest
+            .as_ref()
+            .map(serde_json::Value::to_string),
+    )
+    .bind(
+        rec.node
+            .public_key
             .as_ref()
             .map(serde_json::Value::to_string),
     )
