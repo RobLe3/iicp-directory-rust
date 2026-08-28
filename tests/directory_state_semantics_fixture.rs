@@ -2,7 +2,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const BYTES: &[u8] = include_bytes!("../parity/directory-state-semantics-v1.json");
-const EXPECTED_SHA256: &str = "586c242f2ddee13b81def73743f1dd47658359e8d35c09d99327e8f7dabd38e5";
+const EXPECTED_SHA256: &str = "45c5328611249b5346924e8603803b08db26db0af1fafba15d0a1774454db030";
 
 #[test]
 fn canonical_directory_state_fixture_is_pinned_and_rust_parity_is_current() {
@@ -19,6 +19,7 @@ fn canonical_directory_state_fixture_is_pinned_and_rust_parity_is_current() {
         "heartbeat_recovery",
         "confirmed_active_probe_failure",
         "valid_but_offline",
+        "external_tunnel_created_not_serving",
     ] {
         assert!(
             scenarios

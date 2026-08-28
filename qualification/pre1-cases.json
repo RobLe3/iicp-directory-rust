@@ -129,6 +129,17 @@
         "--exact"
       ]
     },
+    "dynamic-public-route-readiness": {
+      "assertion": "validate::tests::external_tunnel_requires_active_public_probe",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "validate::tests::external_tunnel_requires_active_public_probe",
+        "--",
+        "--exact"
+      ]
+    },
     "interrupted-write": {
       "assertion": "runtime_health::tests::atomic_snapshot_interruption_rejects_partial_generation",
       "command": [

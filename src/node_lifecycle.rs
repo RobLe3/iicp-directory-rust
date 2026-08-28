@@ -826,8 +826,8 @@ async fn operator_display_name_rejection(
 
 /// `POST /v1/register` (iicp-dir §3.1). Validates the endpoint routability invariant
 /// (IICP-E035) and every capability intent URN before issuing a token. The RT-04 guard
-/// (`is_declared_reachable`) decides whether a liveness probe would be skipped — the
-/// network probe itself lands with the deployment wiring (foundation: validation only).
+/// (`is_declared_reachable`) decides whether a liveness probe may be skipped. Dynamic
+/// external tunnels never bypass the dial-back merely because a URL was allocated.
 pub(crate) async fn register(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
