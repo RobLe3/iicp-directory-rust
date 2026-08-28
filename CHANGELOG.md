@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add component-owned Linux x86_64 and arm64 candidate artifact builders with
+  locked Cargo tests, vendored offline installation and bounded disposable
+  build storage. This does not change Genesis authority or deployment state.
+
 ## 0.1.15 — 2026-08-27
 
 - Persist the canonical `cx_public_key` during MySQL-backed registration and
