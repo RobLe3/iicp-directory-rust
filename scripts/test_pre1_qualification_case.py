@@ -25,6 +25,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(value["scenarios"], sorted(module.SCENARIO_COMMANDS))
         self.assertTrue(value["commands_sha256"].startswith("sha256:"))
         self.assertTrue(value["semantic_binding"]["exact_assertion_per_scenario"])
+        self.assertTrue(value["semantic_binding"]["exact_assertion_discovery_required"])
         self.assertEqual(
             set(value["semantic_binding"]["cell_dimensions_consumed"]),
             {
@@ -70,6 +71,20 @@ class DriverContractTests(unittest.TestCase):
             self.assertTrue(source.is_file(), source)
             self.assertIn(f"fn {assertion.rsplit('::', 1)[-1]}()", source.read_text())
             self.assertEqual(command[-2:], ["--", "--exact"])
+
+    def test_exact_discovery_refuses_zero_or_ambiguous_matches(self) -> None:
+        assertion = "module::tests::exact_case"
+        self.assertTrue(
+            module.exact_assertion_is_listed(f"{assertion}: test\n", assertion)
+        )
+        self.assertFalse(
+            module.exact_assertion_is_listed("0 tests, 0 benchmarks\n", assertion)
+        )
+        self.assertFalse(
+            module.exact_assertion_is_listed(
+                f"{assertion}: test\n{assertion}: test\n", assertion
+            )
+        )
 
     def test_every_scenario_has_one_unique_exact_assertion(self) -> None:
         self.assertEqual(set(module.SCENARIO_CASES), set(module.SCENARIO_COMMANDS))
