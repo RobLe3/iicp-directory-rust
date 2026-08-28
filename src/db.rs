@@ -559,6 +559,8 @@ struct HeartbeatStateRow {
 
 #[derive(sqlx::FromRow)]
 struct CapabilityRow {
+    #[sqlx(default)]
+    node_id: Option<String>,
     intent: String,
     capability_version: Option<String>,
     capability_phase: Option<u32>,
@@ -812,6 +814,59 @@ async fn capability_records(
     rows.into_iter().map(Into::into).collect()
 }
 
+fn capability_records_batch_query<'a>(
+    node_ids: &'a [String],
+    intent: &'a str,
+) -> QueryBuilder<'a, MySql> {
+    let mut query = QueryBuilder::new(
+        r#"SELECT node_id, intent, capability_version, capability_phase, variant_id,
+                  CAST(models AS CHAR) AS models, max_tokens,
+                  CAST(input_modalities AS CHAR) AS input_modalities,
+                  CAST(output_modalities AS CHAR) AS output_modalities,
+                  CAST(features AS CHAR) AS features,
+                  CAST(execution_capabilities AS CHAR) AS execution_capabilities,
+                  CAST(capability_limits AS CHAR) AS capability_limits,
+                  CAST(supported_profiles AS CHAR) AS supported_profiles,
+                  CAST(claim_provenance AS CHAR) AS claim_provenance,
+                  CAST(extensions AS CHAR) AS extensions,
+                  quantization, inference_engine
+           FROM capabilities WHERE intent = "#,
+    );
+    query.push_bind(intent).push(" AND node_id IN (");
+    let mut separated = query.separated(", ");
+    for node_id in node_ids {
+        separated.push_bind(node_id);
+    }
+    separated.push_unseparated(") ORDER BY node_id ASC, id ASC");
+    query
+}
+
+async fn capability_records_for_nodes(
+    pool: &Pool<MySql>,
+    node_ids: &[String],
+    intent: &str,
+) -> Result<std::collections::HashMap<String, Vec<crate::types::EffectiveCapability>>, sqlx::Error>
+{
+    if node_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<CapabilityRow> = capability_records_batch_query(node_ids, intent)
+        .build_query_as()
+        .fetch_all(pool)
+        .await?;
+    let mut grouped = std::collections::HashMap::new();
+    for mut row in rows {
+        let Some(node_id) = row.node_id.take() else {
+            continue;
+        };
+        grouped
+            .entry(node_id)
+            .or_insert_with(Vec::new)
+            .push(row.into());
+    }
+    Ok(grouped)
+}
+
 // ── MySqlRepo ─────────────────────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]
@@ -967,8 +1022,19 @@ impl MySqlRepo {
 /// Initialise a connection pool from `DATABASE_URL`. Schema bootstrap and
 /// compatibility verification are handled separately by `schema::ensure_schema`.
 pub async fn init_pool(url: &str) -> Result<Pool<MySql>, sqlx::Error> {
+    let config = crate::config::database_pool_config().map_err(|error| {
+        sqlx::Error::Configuration(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error,
+        )))
+    })?;
     MySqlPoolOptions::new()
-        .max_connections(10)
+        .max_connections(config.max_connections)
+        .min_connections(config.min_connections)
+        .acquire_timeout(std::time::Duration::from_millis(config.acquire_timeout_ms))
+        .idle_timeout(Some(std::time::Duration::from_millis(
+            config.idle_timeout_ms,
+        )))
         .connect(url)
         .await
 }
@@ -1641,12 +1707,20 @@ impl NodeRepository for MySqlRepo {
         let mut nodes = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for row in rows {
-            let mut node = Node::from(row);
+            let node = Node::from(row);
             if !seen.insert(node.node_id.clone()) {
                 continue;
             }
-            node.capabilities =
-                capability_records(&self.pool, &node.node_id, Some(&q.intent)).await;
+            nodes.push(node);
+        }
+        let node_ids: Vec<String> = nodes.iter().map(|node| node.node_id.clone()).collect();
+        let Ok(mut capabilities) =
+            capability_records_for_nodes(&self.pool, &node_ids, &q.intent).await
+        else {
+            return Vec::new();
+        };
+        for node in &mut nodes {
+            node.capabilities = capabilities.remove(&node.node_id).unwrap_or_default();
             node.models = node
                 .capabilities
                 .iter()
@@ -1661,7 +1735,6 @@ impl NodeRepository for MySqlRepo {
                 .collect();
             node.supported_profiles.sort();
             node.supported_profiles.dedup();
-            nodes.push(node);
         }
         nodes
     }
@@ -4167,7 +4240,10 @@ impl NodeRepository for MySqlRepo {
 
 #[cfg(test)]
 mod tests {
-    use super::{capability_records, credit_ttl_idle, init_pool, median_outlier_weight, MySqlRepo};
+    use super::{
+        capability_records, capability_records_batch_query, credit_ttl_idle, init_pool,
+        median_outlier_weight, MySqlRepo,
+    };
     use crate::repo::{DiscoverQuery, NodeRepository, ProbeRouteTransition};
     use serde_json::Value;
     use sqlx::mysql::MySqlPoolOptions;
@@ -4176,6 +4252,19 @@ mod tests {
 
     fn s(vals: &[f64]) -> Vec<(f64,)> {
         vals.iter().map(|&v| (v,)).collect()
+    }
+
+    #[test]
+    fn discovery_capability_query_is_batched_for_the_candidate_set() {
+        let node_ids = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ];
+        let query = capability_records_batch_query(&node_ids, "urn:iicp:intent:llm:chat:v1");
+        assert_eq!(query.sql().matches('?').count(), 1 + node_ids.len());
+        assert_eq!(query.sql().matches("FROM capabilities").count(), 1);
+        assert!(query.sql().contains("node_id IN (?, ?, ?)"));
     }
 
     fn reputation_hourly_velocity_fixture() -> Value {
