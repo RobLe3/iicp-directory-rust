@@ -26,6 +26,7 @@ def describe() -> dict:
     return {
         "schema": "iicp.pre1-artifact-builder-description.v1",
         "component": COMPONENT,
+        "targets": sorted(TARGETS),
         "target_artifact": "release-artifact",
         "portable_artifacts_on": PRIMARY_TARGET,
         "portable_artifacts": ["release-manifest"],
