@@ -12,7 +12,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-
 GATES = {
     "locked_build": "PASS",
     "online_exact_install": "PASS",
@@ -22,9 +21,7 @@ GATES = {
 
 
 def canonical_sha256(value: object) -> str:
-    body = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode()
+    body = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return "sha256:" + hashlib.sha256(body).hexdigest()
 
 
@@ -67,11 +64,7 @@ def tree_sha256(root: Path) -> str:
 def detected_target() -> str:
     system = platform.system().lower()
     machine = platform.machine().lower()
-    arch = (
-        "x86_64"
-        if machine in {"x86_64", "amd64"}
-        else "arm64" if machine in {"arm64", "aarch64"} else None
-    )
+    arch = "x86_64" if machine in {"x86_64", "amd64"} else "arm64" if machine in {"arm64", "aarch64"} else None
     if arch is None:
         raise ValueError("unsupported build architecture")
     target = {
@@ -97,9 +90,7 @@ def require_target(requested: str | None, allowed: set[str]) -> str:
 def require_clean_source(root: Path) -> str:
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=root).returncode:
         raise ValueError("artifact build requires a clean tracked worktree")
-    if subprocess.run(
-        ["git", "diff", "--cached", "--quiet", "HEAD", "--"], cwd=root
-    ).returncode:
+    if subprocess.run(["git", "diff", "--cached", "--quiet", "HEAD", "--"], cwd=root).returncode:
         raise ValueError("artifact build requires a clean index")
     status = subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=normal"],
@@ -108,9 +99,7 @@ def require_clean_source(root: Path) -> str:
     ).strip()
     if status:
         raise ValueError("artifact build requires a clean worktree, including untracked files")
-    commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=root, text=True
-    ).strip()
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
         raise ValueError("artifact build source commit is invalid")
     return commit
@@ -133,9 +122,7 @@ def run(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
 
 
 def output(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
-    return subprocess.check_output(
-        argv, cwd=cwd, env=env, text=True, stderr=subprocess.STDOUT
-    ).strip()
+    return subprocess.check_output(argv, cwd=cwd, env=env, text=True, stderr=subprocess.STDOUT).strip()
 
 
 def artifact(kind: str, target: str, path: Path) -> dict:
@@ -168,9 +155,7 @@ def emit_fragment(
         "source_commit": source_commit,
         "source_version": source_version,
         "build_target": build_target,
-        "artifacts": sorted(
-            artifacts, key=lambda row: (row["kind"], row["target"], row["name"])
-        ),
+        "artifacts": sorted(artifacts, key=lambda row: (row["kind"], row["target"], row["name"])),
         "gates": dict(GATES),
         "inputs": {
             "lock_inputs_sha256": lock_inputs_sha256,
