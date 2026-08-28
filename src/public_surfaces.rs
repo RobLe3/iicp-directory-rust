@@ -7,13 +7,14 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::repo::ConformanceBadge;
+use crate::repo::DbPoolMetrics;
 use crate::state::AppState;
 use crate::VERSION;
 
 /// `GET /v1/metrics` — Prometheus text exposition (iicp-dir §3.9c).
 pub(crate) async fn metrics(State(st): State<AppState>) -> (StatusCode, axum::response::Response) {
     let active = st.repo.active_count().await;
-    let body = format!(
+    let mut body = format!(
         "# HELP iicp_active_nodes Number of currently active IICP directory nodes\n\
          # TYPE iicp_active_nodes gauge\n\
          iicp_active_nodes {active}\n\
@@ -21,12 +22,90 @@ pub(crate) async fn metrics(State(st): State<AppState>) -> (StatusCode, axum::re
          # TYPE iicp_directory_info gauge\n\
          iicp_directory_info{{version=\"{VERSION}\"}} 1\n"
     );
+    if let Some(pool) = st.repo.db_pool_metrics().await {
+        body.push_str(&render_db_pool_metrics(pool));
+    }
     let response = axum::response::Response::builder()
         .status(200)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
         .body(axum::body::Body::from(body))
         .unwrap();
     (StatusCode::OK, response)
+}
+
+fn render_db_pool_metrics(pool: DbPoolMetrics) -> String {
+    format!(
+        "# HELP iicp_db_pool_connections Current SQL connection count by state\n\
+         # TYPE iicp_db_pool_connections gauge\n\
+         iicp_db_pool_connections{{state=\"open\"}} {}\n\
+         iicp_db_pool_connections{{state=\"idle\"}} {}\n\
+         iicp_db_pool_connections{{state=\"in_use\"}} {}\n\
+         # HELP iicp_db_pool_max_connections Configured SQL pool maximum\n\
+         # TYPE iicp_db_pool_max_connections gauge\n\
+         iicp_db_pool_max_connections {}\n\
+         # HELP iicp_db_pool_min_connections Configured SQL pool minimum\n\
+         # TYPE iicp_db_pool_min_connections gauge\n\
+         iicp_db_pool_min_connections {}\n\
+         # HELP iicp_db_pool_utilization_ratio In-use connections divided by configured maximum\n\
+         # TYPE iicp_db_pool_utilization_ratio gauge\n\
+         iicp_db_pool_utilization_ratio {:.6}\n\
+         # HELP iicp_db_pool_acquire_probe_seconds Time spent by the bounded acquisition probe\n\
+         # TYPE iicp_db_pool_acquire_probe_seconds gauge\n\
+         iicp_db_pool_acquire_probe_seconds {:.6}\n\
+         # HELP iicp_db_pool_acquire_probe_success Whether the bounded acquisition probe obtained a connection\n\
+         # TYPE iicp_db_pool_acquire_probe_success gauge\n\
+         iicp_db_pool_acquire_probe_success {}\n\
+         # HELP iicp_db_pool_acquire_probe_timeout_seconds Acquisition probe timeout bound\n\
+         # TYPE iicp_db_pool_acquire_probe_timeout_seconds gauge\n\
+         iicp_db_pool_acquire_probe_timeout_seconds {:.6}\n",
+        pool.open_connections,
+        pool.idle_connections,
+        pool.in_use_connections,
+        pool.max_connections,
+        pool.min_connections,
+        pool.utilization_ratio,
+        pool.acquire_probe_seconds,
+        u8::from(pool.acquire_probe_success),
+        pool.acquire_probe_timeout_seconds,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_db_pool_metrics;
+    use crate::repo::DbPoolMetrics;
+
+    #[test]
+    fn db_pool_metrics_are_content_free_and_bounded() {
+        let body = render_db_pool_metrics(DbPoolMetrics {
+            max_connections: 10,
+            min_connections: 1,
+            open_connections: 7,
+            idle_connections: 2,
+            in_use_connections: 5,
+            utilization_ratio: 0.5,
+            acquire_probe_seconds: 0.012_345,
+            acquire_probe_success: true,
+            acquire_probe_timeout_seconds: 0.25,
+        });
+
+        for expected in [
+            "iicp_db_pool_connections{state=\"open\"} 7",
+            "iicp_db_pool_connections{state=\"idle\"} 2",
+            "iicp_db_pool_connections{state=\"in_use\"} 5",
+            "iicp_db_pool_max_connections 10",
+            "iicp_db_pool_min_connections 1",
+            "iicp_db_pool_utilization_ratio 0.500000",
+            "iicp_db_pool_acquire_probe_seconds 0.012345",
+            "iicp_db_pool_acquire_probe_success 1",
+            "iicp_db_pool_acquire_probe_timeout_seconds 0.250000",
+        ] {
+            assert!(body.contains(expected), "missing metric: {expected}");
+        }
+        for forbidden in ["node_id", "endpoint", "intent", "payload", "credential"] {
+            assert!(!body.contains(forbidden), "metric leaked {forbidden}");
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

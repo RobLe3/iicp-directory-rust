@@ -87,6 +87,24 @@ pub enum ProbeRouteTransition {
     Restored,
 }
 
+/// Content-free database-pool snapshot for control-plane qualification.
+///
+/// Implementations without a database pool return `None`.  The values expose
+/// only process capacity and acquisition behavior; they contain no query,
+/// caller, node, endpoint, or topology data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DbPoolMetrics {
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub open_connections: u32,
+    pub idle_connections: u32,
+    pub in_use_connections: u32,
+    pub utilization_ratio: f64,
+    pub acquire_probe_seconds: f64,
+    pub acquire_probe_success: bool,
+    pub acquire_probe_timeout_seconds: f64,
+}
+
 impl std::fmt::Display for RepoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "repository persistence failed")
@@ -147,6 +165,13 @@ pub struct HeartbeatOutcome {
 
 #[async_trait]
 pub trait NodeRepository: Send + Sync {
+    /// Return a bounded, content-free database-pool snapshot when available.
+    /// The acquisition probe must not wait for the pool's full configured
+    /// timeout, so observability remains responsive during saturation.
+    async fn db_pool_metrics(&self) -> Option<DbPoolMetrics> {
+        None
+    }
+
     /// Return scored, filtered nodes for a discovery query (iicp-dir §3.3/§3.4).
     /// Excludes unavailable nodes and nodes below score 0.1, sorts by score desc,
     /// truncates to `limit` (default 10, max 50).

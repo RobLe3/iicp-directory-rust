@@ -157,6 +157,13 @@ For a durable installation, backup and recovery guidance, read
 | `IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH` | `1` | Minimum accepted credential generation; increasing it invalidates older credentials. |
 | `IICP_TRUST_DOMAIN_MAX_CREDENTIAL_TTL` | `86400` | Maximum membership lifetime in seconds, with a minimum of 60. |
 
+`GET /v1/metrics` exposes content-free SQL pool capacity, open/idle/in-use
+connections, utilization, and a 250 ms bounded acquisition probe when MySQL is
+active. These measurements contain no query text, node identifiers, endpoints,
+credentials, payloads, or private topology and are suitable for isolated
+qualification receipts. They are observations, not a production capacity
+claim.
+
 In production mode, `POST /v1/register` and `POST /api/v1/register` reject private/loopback endpoints. Use `APP_ENV=local` for local endpoint tests.
 The deployment-provenance endpoint returns 503 until every required release
 input and the signing key are present.
