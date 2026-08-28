@@ -101,6 +101,13 @@ def require_clean_source(root: Path) -> str:
         ["git", "diff", "--cached", "--quiet", "HEAD", "--"], cwd=root
     ).returncode:
         raise ValueError("artifact build requires a clean index")
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=root,
+        text=True,
+    ).strip()
+    if status:
+        raise ValueError("artifact build requires a clean worktree, including untracked files")
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=root, text=True
     ).strip()
