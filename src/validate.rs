@@ -184,10 +184,12 @@ fn ensure_host_dns_is_public(host: &str) -> Result<(), EndpointReject> {
 
 /// RT-04 (#378): does the registration carry a trustworthy reachability declaration that
 /// lets the directory skip the liveness probe? `unknown` is NOT trustworthy — it falls
-/// through to a probe. Only a concrete topology + a transport method bypasses.
+/// through to a probe. A newly created external tunnel is also only a candidate route:
+/// it must pass the directory dial-back after the provider listener exists.
 pub fn is_declared_reachable(nat_type: Option<&str>, transport_method: Option<&str>) -> bool {
     let nat_ok = matches!(nat_type, Some(n) if !n.is_empty() && n != "none" && n != "unknown");
-    let transport_ok = matches!(transport_method, Some(t) if !t.is_empty());
+    let transport_ok =
+        matches!(transport_method, Some(t) if !t.is_empty() && t != "external_tunnel");
     nat_ok && transport_ok
 }
 
@@ -296,6 +298,20 @@ mod tests {
         assert!(!is_declared_reachable(Some("none"), Some("direct")));
         assert!(!is_declared_reachable(None, Some("direct")));
         assert!(!is_declared_reachable(Some("full_cone"), None));
+        // A tunnel URL being allocated is not evidence that the provider is
+        // listening or that the public route can serve /iicp/health.
+        assert!(!is_declared_reachable(
+            Some("symmetric"),
+            Some("external_tunnel")
+        ));
+    }
+
+    #[test]
+    fn external_tunnel_requires_active_public_probe() {
+        assert!(!is_declared_reachable(
+            Some("symmetric"),
+            Some("external_tunnel")
+        ));
     }
 
     #[test]
