@@ -49,6 +49,16 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Discovery population and result-count matrix
+        run: >-
+          cargo test --locked
+          discovery_scale_matrix_is_bounded_across_population_and_result_counts
+          -- --ignored --nocapture
+      - name: Bounded pool saturation and recovery metrics
+        run: >-
+          cargo test --locked
+          db_pool_metrics_report_bounded_saturation_and_recovery
+          -- --ignored
       - run: >-
           cargo test --locked
           concurrent_signed_event_appends_are_gap_free_and_chain_correct

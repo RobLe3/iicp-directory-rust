@@ -1653,6 +1653,42 @@ const MAX_LIMIT: u32 = 50;
 
 #[async_trait]
 impl NodeRepository for MySqlRepo {
+    async fn db_pool_metrics(&self) -> Option<crate::repo::DbPoolMetrics> {
+        const ACQUIRE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+        // Snapshot utilization before probing so the probe cannot count its own
+        // temporary connection as application work.
+        let open_connections = self.pool.size();
+        let idle_connections = u32::try_from(self.pool.num_idle())
+            .unwrap_or(u32::MAX)
+            .min(open_connections);
+        let in_use_connections = open_connections.saturating_sub(idle_connections);
+        let max_connections = self.pool.options().get_max_connections();
+        let min_connections = self.pool.options().get_min_connections();
+        let utilization_ratio = if max_connections == 0 {
+            0.0
+        } else {
+            f64::from(in_use_connections) / f64::from(max_connections)
+        };
+        let started = std::time::Instant::now();
+        let acquired = tokio::time::timeout(ACQUIRE_PROBE_TIMEOUT, self.pool.acquire()).await;
+        let acquire_probe_seconds = started.elapsed().as_secs_f64();
+        let acquire_probe_success = matches!(acquired, Ok(Ok(_)));
+        drop(acquired);
+
+        Some(crate::repo::DbPoolMetrics {
+            max_connections,
+            min_connections,
+            open_connections,
+            idle_connections,
+            in_use_connections,
+            utilization_ratio,
+            acquire_probe_seconds,
+            acquire_probe_success,
+            acquire_probe_timeout_seconds: ACQUIRE_PROBE_TIMEOUT.as_secs_f64(),
+        })
+    }
+
     /// Discovery: JOIN nodes + capabilities, filter, sort by reputation DESC, truncate.
     /// Mirrors InMemoryRepo::discover + PHP NodeRegistry::discover.
     async fn discover(&self, q: &DiscoverQuery) -> Vec<Node> {
@@ -4246,7 +4282,9 @@ mod tests {
     };
     use crate::repo::{DiscoverQuery, NodeRepository, ProbeRouteTransition};
     use serde_json::Value;
-    use sqlx::mysql::MySqlPoolOptions;
+    use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+    use sqlx::{MySql, QueryBuilder};
+    use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -4265,6 +4303,191 @@ mod tests {
         assert_eq!(query.sql().matches('?').count(), 1 + node_ids.len());
         assert_eq!(query.sql().matches("FROM capabilities").count(), 1);
         assert!(query.sql().contains("node_id IN (?, ?, ?)"));
+    }
+
+    fn require_loopback_disposable_database(raw_url: &str) {
+        let parsed =
+            MySqlConnectOptions::from_str(raw_url).expect("test database URL must be valid MySQL");
+        let host = parsed.get_host();
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        assert!(
+            loopback,
+            "scale qualification refuses a non-loopback database"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable MySQL in IICP_TEST_DATABASE_URL"]
+    async fn db_pool_metrics_report_bounded_saturation_and_recovery() {
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify a disposable database");
+        require_loopback_disposable_database(&url);
+        let pool = MySqlPoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect(&url)
+            .await
+            .expect("connect one-slot disposable pool");
+        let repo = MySqlRepo::new(pool.clone());
+        let held = pool.acquire().await.expect("saturate disposable pool");
+
+        let saturated = repo.db_pool_metrics().await.expect("MySQL pool metrics");
+        assert!(!saturated.acquire_probe_success);
+        assert_eq!(saturated.max_connections, 1);
+        assert_eq!(saturated.open_connections, 1);
+        assert_eq!(saturated.in_use_connections, 1);
+        assert_eq!(saturated.utilization_ratio, 1.0);
+        assert!(
+            saturated.acquire_probe_seconds >= 0.20 && saturated.acquire_probe_seconds < 1.0,
+            "probe must observe its 250 ms bound rather than the one-second pool timeout: {}",
+            saturated.acquire_probe_seconds
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.num_idle() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("released pool slot must become idle");
+        let recovered = repo
+            .db_pool_metrics()
+            .await
+            .expect("recovered pool metrics");
+        assert!(recovered.acquire_probe_success);
+        assert_eq!(recovered.in_use_connections, 0);
+        assert_eq!(recovered.utilization_ratio, 0.0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable MySQL in IICP_TEST_DATABASE_URL"]
+    async fn discovery_scale_matrix_is_bounded_across_population_and_result_counts() {
+        const INTENT: &str = "urn:iicp:intent:pre1:discovery-scale:v1";
+        const POPULATIONS: [usize; 3] = [10, 100, 1_000];
+        const RESULT_COUNTS: [usize; 5] = [1, 5, 10, 25, 50];
+        const SAMPLES: usize = 5;
+
+        let url = std::env::var("IICP_TEST_DATABASE_URL")
+            .expect("IICP_TEST_DATABASE_URL must identify a disposable database");
+        require_loopback_disposable_database(&url);
+        let pool = init_pool(&url).await.expect("connect disposable database");
+        crate::schema::ensure_schema(&pool)
+            .await
+            .expect("bootstrap disposable schema");
+        let existing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE id LIKE 'pre1-bench-%'")
+                .fetch_one(&pool)
+                .await
+                .expect("count prior synthetic nodes");
+        assert_eq!(
+            existing, 0,
+            "scale matrix refuses to overwrite prior synthetic evidence"
+        );
+
+        let repo = MySqlRepo::new(pool.clone());
+        let mut results = Vec::new();
+        for population in POPULATIONS {
+            sqlx::query("DELETE FROM capabilities WHERE node_id LIKE 'pre1-bench-%'")
+                .execute(&pool)
+                .await
+                .expect("clear synthetic capabilities");
+            sqlx::query("DELETE FROM nodes WHERE id LIKE 'pre1-bench-%'")
+                .execute(&pool)
+                .await
+                .expect("clear synthetic nodes");
+
+            let now = chrono::Utc::now().naive_utc();
+            let mut nodes = QueryBuilder::<MySql>::new(
+                "INSERT INTO nodes (id, endpoint, region, node_token_hash, available, last_seen, reputation_score, public_reachable, max_concurrent, tokens_per_min) ",
+            );
+            nodes.push_values(0..population, |mut row, index| {
+                row.push_bind(format!("pre1-bench-{index:025}"))
+                    .push_bind(format!("https://synthetic-{index}.invalid"))
+                    .push_bind("synthetic")
+                    .push_bind("synthetic-disposable-token-hash")
+                    .push_bind(true)
+                    .push_bind(now)
+                    .push_bind(0.9_f32)
+                    .push_bind(true)
+                    .push_bind(100_u32)
+                    .push_bind(1_000_u32);
+            });
+            nodes
+                .build()
+                .execute(&pool)
+                .await
+                .expect("insert synthetic nodes");
+
+            let mut capabilities = QueryBuilder::<MySql>::new(
+                "INSERT INTO capabilities (node_id, intent, models, max_tokens) ",
+            );
+            capabilities.push_values(0..population, |mut row, index| {
+                row.push_bind(format!("pre1-bench-{index:025}"))
+                    .push_bind(INTENT)
+                    .push_bind(sqlx::types::Json(vec!["synthetic-model"]))
+                    .push_bind(16_384_u32);
+            });
+            capabilities
+                .build()
+                .execute(&pool)
+                .await
+                .expect("insert synthetic capabilities");
+
+            for result_count in RESULT_COUNTS {
+                let mut durations_us = Vec::with_capacity(SAMPLES);
+                let expected_count = population.min(result_count);
+                for _ in 0..SAMPLES {
+                    let started = std::time::Instant::now();
+                    let discovered = repo
+                        .discover(&DiscoverQuery {
+                            intent: INTENT.into(),
+                            region: None,
+                            limit: result_count,
+                            min_reputation: None,
+                        })
+                        .await;
+                    durations_us.push(started.elapsed().as_micros() as u64);
+                    assert_eq!(
+                        discovered.len(),
+                        expected_count,
+                        "population={population} result_count={result_count}"
+                    );
+                }
+                durations_us.sort_unstable();
+                results.push(serde_json::json!({
+                    "population": population,
+                    "requested_result_count": result_count,
+                    "returned_result_count": expected_count,
+                    "samples": SAMPLES,
+                    "latency_p50_us": durations_us[SAMPLES / 2],
+                    "latency_max_us": durations_us[SAMPLES - 1],
+                }));
+            }
+        }
+
+        sqlx::query("DELETE FROM capabilities WHERE node_id LIKE 'pre1-bench-%'")
+            .execute(&pool)
+            .await
+            .expect("remove synthetic capabilities");
+        sqlx::query("DELETE FROM nodes WHERE id LIKE 'pre1-bench-%'")
+            .execute(&pool)
+            .await
+            .expect("remove synthetic nodes");
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "iicp.directory-discovery-scale.v1",
+                "content_free": true,
+                "loopback_database_required": true,
+                "cache_used": false,
+                "results": results,
+            })
+        );
     }
 
     fn reputation_hourly_velocity_fixture() -> Value {
