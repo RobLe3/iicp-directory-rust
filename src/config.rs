@@ -5,6 +5,19 @@ use crate::validate::Env;
 
 pub(crate) const DEFAULT_DIRECTORY_DID: &str = "did:web:iicp.network";
 
+const DEFAULT_DATABASE_POOL_MAX_CONNECTIONS: u32 = 10;
+const DEFAULT_DATABASE_POOL_MIN_CONNECTIONS: u32 = 0;
+const DEFAULT_DATABASE_POOL_ACQUIRE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_DATABASE_POOL_IDLE_TIMEOUT_MS: u64 = 600_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DatabasePoolConfig {
+    pub(crate) max_connections: u32,
+    pub(crate) min_connections: u32,
+    pub(crate) acquire_timeout_ms: u64,
+    pub(crate) idle_timeout_ms: u64,
+}
+
 pub(crate) struct DirectoryIdentity {
     pub(crate) did: String,
     pub(crate) service_endpoint: String,
@@ -26,6 +39,15 @@ pub(crate) fn directory_identity(
 
 pub(crate) fn signing_key(env: Env) -> Result<Option<String>, String> {
     signing_key_from_value(env, std::env::var("IICP_GENESIS_ED25519_SECRET_KEY").ok())
+}
+
+pub(crate) fn database_pool_config() -> Result<DatabasePoolConfig, String> {
+    database_pool_config_from_values(
+        std::env::var("IICP_DB_POOL_MAX_CONNECTIONS").ok(),
+        std::env::var("IICP_DB_POOL_MIN_CONNECTIONS").ok(),
+        std::env::var("IICP_DB_POOL_ACQUIRE_TIMEOUT_MS").ok(),
+        std::env::var("IICP_DB_POOL_IDLE_TIMEOUT_MS").ok(),
+    )
 }
 
 pub(crate) fn strict_e050_secured() -> bool {
@@ -109,6 +131,65 @@ fn signing_key_from_value(env: Env, value: Option<String>) -> Result<Option<Stri
         );
     }
     Ok(key)
+}
+
+fn database_pool_config_from_values(
+    max_connections: Option<String>,
+    min_connections: Option<String>,
+    acquire_timeout_ms: Option<String>,
+    idle_timeout_ms: Option<String>,
+) -> Result<DatabasePoolConfig, String> {
+    fn parse_u32(name: &str, value: Option<String>, default: u32) -> Result<u32, String> {
+        value.map_or(Ok(default), |raw| {
+            raw.parse::<u32>()
+                .map_err(|_| format!("{name} must be an unsigned integer"))
+        })
+    }
+
+    fn parse_u64(name: &str, value: Option<String>, default: u64) -> Result<u64, String> {
+        value.map_or(Ok(default), |raw| {
+            raw.parse::<u64>()
+                .map_err(|_| format!("{name} must be an unsigned integer"))
+        })
+    }
+
+    let config = DatabasePoolConfig {
+        max_connections: parse_u32(
+            "IICP_DB_POOL_MAX_CONNECTIONS",
+            max_connections,
+            DEFAULT_DATABASE_POOL_MAX_CONNECTIONS,
+        )?,
+        min_connections: parse_u32(
+            "IICP_DB_POOL_MIN_CONNECTIONS",
+            min_connections,
+            DEFAULT_DATABASE_POOL_MIN_CONNECTIONS,
+        )?,
+        acquire_timeout_ms: parse_u64(
+            "IICP_DB_POOL_ACQUIRE_TIMEOUT_MS",
+            acquire_timeout_ms,
+            DEFAULT_DATABASE_POOL_ACQUIRE_TIMEOUT_MS,
+        )?,
+        idle_timeout_ms: parse_u64(
+            "IICP_DB_POOL_IDLE_TIMEOUT_MS",
+            idle_timeout_ms,
+            DEFAULT_DATABASE_POOL_IDLE_TIMEOUT_MS,
+        )?,
+    };
+    if !(1..=1024).contains(&config.max_connections) {
+        return Err("IICP_DB_POOL_MAX_CONNECTIONS must be between 1 and 1024".to_string());
+    }
+    if config.min_connections > config.max_connections {
+        return Err(
+            "IICP_DB_POOL_MIN_CONNECTIONS must not exceed IICP_DB_POOL_MAX_CONNECTIONS".to_string(),
+        );
+    }
+    if config.acquire_timeout_ms == 0 {
+        return Err("IICP_DB_POOL_ACQUIRE_TIMEOUT_MS must be greater than zero".to_string());
+    }
+    if config.idle_timeout_ms == 0 {
+        return Err("IICP_DB_POOL_IDLE_TIMEOUT_MS must be greater than zero".to_string());
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -211,5 +292,40 @@ mod tests {
             signing_key_from_value(Env::Production, Some(key.clone())).unwrap(),
             Some(key)
         );
+    }
+
+    #[test]
+    fn database_pool_defaults_preserve_the_existing_capacity() {
+        assert_eq!(
+            database_pool_config_from_values(None, None, None, None).unwrap(),
+            DatabasePoolConfig {
+                max_connections: 10,
+                min_connections: 0,
+                acquire_timeout_ms: 30_000,
+                idle_timeout_ms: 600_000,
+            }
+        );
+    }
+
+    #[test]
+    fn database_pool_configuration_is_bounded_and_consistent() {
+        let configured = database_pool_config_from_values(
+            Some("64".into()),
+            Some("4".into()),
+            Some("5000".into()),
+            Some("120000".into()),
+        )
+        .unwrap();
+        assert_eq!(configured.max_connections, 64);
+        assert_eq!(configured.min_connections, 4);
+        assert_eq!(configured.acquire_timeout_ms, 5000);
+        assert_eq!(configured.idle_timeout_ms, 120000);
+
+        assert!(database_pool_config_from_values(Some("0".into()), None, None, None).is_err());
+        assert!(
+            database_pool_config_from_values(Some("4".into()), Some("5".into()), None, None)
+                .is_err()
+        );
+        assert!(database_pool_config_from_values(None, None, Some("0".into()), None).is_err());
     }
 }

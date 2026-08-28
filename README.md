@@ -124,6 +124,10 @@ For a durable installation, backup and recovery guidance, read
 | Variable | Default | Description |
 |---|---:|---|
 | `DATABASE_URL` | — | MySQL DSN. Required in production. |
+| `IICP_DB_POOL_MAX_CONNECTIONS` | `10` | Maximum MySQL pool size. Must be between 1 and 1024. Tune from measured deployment load rather than increasing it to hide saturation. |
+| `IICP_DB_POOL_MIN_CONNECTIONS` | `0` | Minimum idle MySQL connections. Must not exceed the configured maximum. |
+| `IICP_DB_POOL_ACQUIRE_TIMEOUT_MS` | `30000` | Maximum wait for a pool connection before an explicit failure. Must be greater than zero. |
+| `IICP_DB_POOL_IDLE_TIMEOUT_MS` | `600000` | Idle connection lifetime in milliseconds. Must be greater than zero. |
 | `APP_ENV` | `production` | `local`, `testing`, `staging` or `production`; controls fail-closed safety policy. |
 | `APP_KEY` | — | Optional HS256 JWT compatibility key. |
 | `IICP_GENESIS_ED25519_SECRET_KEY` | — | 128-hex libsodium Ed25519 secret key used for event, DID, token and attestation signing. Required in production. |
