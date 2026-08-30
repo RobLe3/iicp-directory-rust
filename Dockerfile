@@ -10,6 +10,7 @@ WORKDIR /build
 # never replayed at runtime.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY examples ./examples
 COPY migrations ./migrations
 COPY schema ./schema
 # Compile-time taxonomy fixtures are part of the directory's policy contract.

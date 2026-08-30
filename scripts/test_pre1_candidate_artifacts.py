@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/build_pre1_candidate_artifacts.py"
+DOCKERFILE = ROOT / "Dockerfile"
 
 
 class Pre1CandidateArtifactBuilderTest(unittest.TestCase):
@@ -33,6 +34,7 @@ class Pre1CandidateArtifactBuilderTest(unittest.TestCase):
             fixture["required-features"],
             ["systemd-notify", "runtime-health-fault-injection"],
         )
+        self.assertIn("COPY examples ./examples", DOCKERFILE.read_text().splitlines())
 
 
 if __name__ == "__main__":
