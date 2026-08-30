@@ -70,6 +70,10 @@ default = ["systemd-notify"]
 systemd-notify = ["dep:sd-notify"]
 runtime-health-fault-injection = []
 
+[[example]]
+name = "systemd_watchdog_fixture"
+required-features = ["systemd-notify", "runtime-health-fault-injection"]
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
