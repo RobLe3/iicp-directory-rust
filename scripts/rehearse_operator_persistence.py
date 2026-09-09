@@ -27,7 +27,9 @@ SELECT = "SELECT id,endpoint,region,max_concurrent,tokens_per_min FROM nodes ORD
 
 
 def output_directory(path):
-    path = admission.safe_path(path)
+    path = admission.safe_path(path).resolve()
+    if "," in str(path):
+        raise RehearsalError("mount_delimiter_in_output_path")
     source = Path(__file__).resolve().parents[1]
     if path == source or source in path.parents or path.exists():
         raise RehearsalError("new_output_outside_source_required")
