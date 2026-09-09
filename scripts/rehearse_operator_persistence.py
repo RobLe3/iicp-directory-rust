@@ -134,7 +134,7 @@ class Runtime:
         if not current or current != expected:
             raise RehearsalError("persistent_rows_differ")
         value = self.api("/v1/node/" + NODE)
-        if value.get("id") != NODE or value.get("region") != "test-region":
+        if value.get("node_id") != NODE or value.get("region") != "test-region":
             raise RehearsalError("persisted_node_api_differs")
         return hashlib.sha256(current).hexdigest()
 

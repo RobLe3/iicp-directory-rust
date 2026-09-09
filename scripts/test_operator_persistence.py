@@ -132,9 +132,16 @@ class SafetyTests(unittest.TestCase):
 
     def test_node_api_disagreement_rejects_sql_only_success(self):
         runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
-        with patch.object(runtime, "sql", return_value=b"row"), patch.object(runtime, "api", return_value={"id": ops.NODE, "region": "wrong"}):
+        with patch.object(runtime, "sql", return_value=b"row"), patch.object(runtime, "api", return_value={"node_id": ops.NODE, "region": "wrong"}):
             with self.assertRaisesRegex(io.RehearsalError, "node_api_differs"):
                 runtime.verify_rows(b"row")
+
+    def test_node_api_uses_wire_identity_not_sql_column_name(self):
+        runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
+        source = (Path(ops.__file__).resolve().parents[1] / "src/types.rs").read_text()
+        self.assertIn("pub node_id: String", source)
+        with patch.object(runtime, "sql", return_value=b"row"), patch.object(runtime, "api", return_value={"node_id": ops.NODE, "region": "test-region"}):
+            self.assertEqual(runtime.verify_rows(b"row"), ops.hashlib.sha256(b"row").hexdigest())
 
     def test_existing_public_workflow_retains_evidence_without_new_job(self):
         root = Path(ops.__file__).resolve().parents[1]
