@@ -40,6 +40,18 @@ class SafetyTests(unittest.TestCase):
         code, out, err = io.capture([sys.executable, "-c", "import sys;print('out');print('err',file=sys.stderr);sys.exit(7)"])
         self.assertEqual((code, out, err), (7, b"out\n", b"err\n"))
 
+    def test_parent_traversal_cannot_bypass_checkout_guard(self):
+        source = Path(ops.__file__).resolve().parents[1]
+        path = source / "scripts" / ".." / "unsafe-output"
+        with patch.object(Path, "mkdir") as mkdir:
+            with self.assertRaisesRegex(io.RehearsalError, "outside_source"):
+                ops.output_directory(path)
+        mkdir.assert_not_called()
+
+    def test_docker_mount_delimiter_is_refused(self):
+        with self.assertRaisesRegex(io.RehearsalError, "mount_delimiter"):
+            ops.output_directory(self.root / "output,readonly")
+
     def test_output_overflow_refuses_instead_of_passing(self):
         with self.assertRaisesRegex(io.RehearsalError, "output_limit"):
             io.capture([sys.executable, "-c", f"print('x'*{io.LIMIT+1})"])
