@@ -268,3 +268,22 @@ reviewed `migrations/022_add_effective_capability_fields.sql` change. Startup
 then verifies the complete embedded schema contract and fails closed if the
 upgrade is missing or partial. A shared PHP/Rust deployment must use the
 authoritative PHP migration sequence rather than replaying this standalone SQL.
+
+### Prebuilt artifact admission (Linux rehearsal preparation)
+
+`python3 scripts/prepare_operator_artifact.py --fragment <artifact-fragment.json>
+--fragment-sha256 <pinned-fragment-digest> --source-commit <reviewed-commit>
+--target <linux-x86_64|linux-aarch64>` verifies the native target, build gates,
+fragment binding, ELF machine, binary size and digest without building or
+starting anything. Supply `--install-to <new-private-path>` to copy the verified
+binary into an owned, non-shared directory with mode 0500. The fragment's mode
+0600 source binary remains unchanged. Existing files and symlink paths are
+rejected. Obtain the expected digest and source commit from the reviewed test
+inputs, not from an untrusted fragment alone.
+
+This is an artifact admission step, not an operations runner or qualification
+receipt. It does not verify an entire six-component candidate or execute the
+binary. Database recovery, backup/restore, upgrade/rollback and cross-client
+operations remain under #102. A later runner must isolate the fixed 8090 listener,
+use synthetic persistent data and preserve failure evidence before cleanup.
+Local process health must not be relabeled as database readiness.
