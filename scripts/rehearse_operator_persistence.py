@@ -112,12 +112,20 @@ class Runtime:
         for _ in range(60):
             try:
                 health = self.api("/health")
-                if health.get("ok") is True and health.get("version") == self.version:
-                    # /health is process health, not a database readiness check.
+            except (RehearsalError, ValueError, subprocess.TimeoutExpired):
+                time.sleep(1)
+                continue
+            # The maintained HTTP identity differs intentionally from package
+            # metadata: src/main.rs VERSION is v<CARGO_PKG_VERSION>-rs.
+            if not isinstance(health, dict) or health.get("version") != f"v{self.version}-rs":
+                raise RehearsalError("runtime_health_version_mismatch")
+            if health.get("ok") is True:
+                try:
+                    # Process health alone does not establish database readiness.
                     self.docker.call("exec", self.app, "/iicp/directory", "db-maintenance-status", "--json")
                     return
-            except (RehearsalError, ValueError, subprocess.TimeoutExpired):
-                pass
+                except (RehearsalError, subprocess.TimeoutExpired):
+                    pass
             time.sleep(1)
         raise RehearsalError("installed_runtime_not_ready")
 
@@ -244,6 +252,8 @@ def rehearse(args):
             (root / "installed/directory").unlink(missing_ok=True)
             (root / "installed").rmdir()
         (root / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        if result["status"] != "PASS":
+            docker.console_failure()
     return result
 
 

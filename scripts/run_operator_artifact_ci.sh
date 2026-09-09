@@ -10,6 +10,7 @@ output=$1
 [[ ! -e "$output" && ! -L "$output" ]] || { echo 'output already exists' >&2; exit 2; }
 mkdir -m 700 -- "$output"
 output=$(cd "$output" && pwd -P)
+printf 'output=%s\n' "$output" >> "$GITHUB_OUTPUT"
 runtime='python:3.12-slim-trixie@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea'
 database='mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b'
 [[ $(rustc --version) == 'rustc 1.98.0 '* ]] || { echo 'exact artifact toolchain required' >&2; exit 2; }

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -80,6 +81,7 @@ class Docker:
         self.owned = []
         self.secrets = []
         self.log_bytes = 0
+        self.console_tail = b""
 
     def log(self, raw):
         text = raw.decode("utf-8", "replace")
@@ -87,9 +89,15 @@ class Docker:
             text = text.replace(secret, "[REDACTED]")
         text = re.sub(r"mysql://[^\s]+", "mysql://[REDACTED]", text)
         retained = text.encode()[:max(0, 16 * LIMIT - self.log_bytes)]
+        self.console_tail = (self.console_tail + retained)[-32768:]
         with (self.output / "diagnostics.log").open("ab") as stream:
             stream.write(retained)
         self.log_bytes += len(retained)
+
+    def console_failure(self):
+        # Independent of artifact upload: retain a bounded, already-redacted
+        # diagnostic tail in the CI log even if its upload step fails.
+        sys.stderr.write("REHEARSAL_DIAGNOSTIC_TAIL\n" + self.console_tail.decode("utf-8", "replace") + "\n")
 
     def call(self, *args, data=None, timeout=60, allow_failure=False):
         code, out, error = capture(["docker", *args], data=data, timeout=timeout)
