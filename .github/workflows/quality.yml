@@ -3,6 +3,11 @@ name: Rust directory quality
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      operator_artifact:
+        description: Build and retain a native x86-64 fragment and persistence rehearsal (reviewed main only)
+        type: boolean
+        default: false
 
 concurrency:
   group: rust-directory-quality-${{ github.ref }}
@@ -14,12 +19,14 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - run: python3 scripts/test_disposable_cargo_target.py
       - run: python3 scripts/test_pre1_candidate_artifacts.py
+      - run: python3 scripts/test_operator_persistence.py
       - run: python3 scripts/check_dependency_policy.py
       - run: python3 scripts/check_package_manifest.py
       - run: cargo fmt --check
@@ -29,6 +36,26 @@ jobs:
       - run: python3 scripts/test_directory_self_update.py
       - run: docker build --pull -t iicp-directory-rust:quality .
       - run: test "$(docker image inspect iicp-directory-rust:quality --format '{{.Config.User}}')" = "10001:10001"
+      - name: Install exact artifact toolchain
+        if: github.event_name == 'workflow_dispatch' && inputs.operator_artifact && github.ref == 'refs/heads/main'
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Native installed-artifact persistence rehearsal
+        if: github.event_name == 'workflow_dispatch' && inputs.operator_artifact && github.ref == 'refs/heads/main'
+        env:
+          RUSTUP_TOOLCHAIN: "1.98.0"
+        run: bash scripts/run_operator_artifact_ci.sh "$GITHUB_WORKSPACE/../iicp-operator-artifact"
+      - name: Retain exact fragment and bounded rehearsal evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.operator_artifact && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: directory-rust-linux-x86_64-${{ github.sha }}
+          path: |
+            ${{ github.workspace }}/../iicp-operator-artifact/fragment/
+            ${{ github.workspace }}/../iicp-operator-artifact/rehearsal/result.json
+            ${{ github.workspace }}/../iicp-operator-artifact/rehearsal/events.jsonl
+            ${{ github.workspace }}/../iicp-operator-artifact/rehearsal/diagnostics.log
+          retention-days: 3
+          if-no-files-found: error
 
   event-log-concurrency:
     runs-on: ubuntu-latest
