@@ -200,7 +200,7 @@ def rehearse(args):
     identity = admission.prepare(args.fragment, args.fragment_sha256, args.source_commit, args.target)
     root = output_directory(args.output)
     docker = Docker("iicp-rust-ops-" + uuid.uuid4().hex[:16], root)
-    result = {"schema": "iicp.directory-rust.persistence-rehearsal.v1", "artifact": identity,
+    result = {"schema": "iicp.directory-rust.persistence-rehearsal.v1", "artifact": identity, "run_id": docker.run_id,
               "status": "FAIL", "qualification_credit": 0, "non_authorizing": True,
               "runtime_image": args.runtime_image, "mysql_image": args.mysql_image,
               "limitations": ["testing environment; no production authority", "no upgrade/rollback or credential recovery",

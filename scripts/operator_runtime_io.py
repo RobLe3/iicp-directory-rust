@@ -99,7 +99,7 @@ class Docker:
         return code, out
 
     def event(self, step, state, **extra):
-        row = {"step": step, "state": state, "timestamp": time.time(), **extra}
+        row = {"run_id": self.run_id, "step": step, "state": state, "timestamp": time.time(), **extra}
         self.events.append(row)
         with (self.output / "events.jsonl").open("a") as stream:
             stream.write(json.dumps(row, sort_keys=True) + "\n")
