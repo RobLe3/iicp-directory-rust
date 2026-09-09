@@ -287,3 +287,34 @@ binary. Database recovery, backup/restore, upgrade/rollback and cross-client
 operations remain under #102. A later runner must isolate the fixed 8090 listener,
 use synthetic persistent data and preserve failure evidence before cleanup.
 Local process health must not be relabeled as database readiness.
+
+### Installed persistence rehearsal
+
+`scripts/rehearse_operator_persistence.py` consumes the same pinned fragment,
+source and native Linux target arguments, plus `--runtime-image`, `--mysql-image`
+and a new private `--output` directory outside the checkout. Both images must
+already be present by immutable digest. The runtime must provide Python 3 and
+a glibc version compatible with the binary; the database must be MySQL 8.0.
+The runner never compiles, pulls, publishes or installs a host service.
+
+It creates a labelled internal Docker network, private database volume and
+bounded containers, without host ports or production credentials. It exercises
+the installed binary's empty bootstrap, persisted node HTTP response, process
+restart, database outage/recovery, backup into a fresh database with an installed
+runtime readback, and rejection of a deliberately incomplete schema. `/health`
+alone is not database readiness: the operational schema command must pass too.
+
+The output contains a non-authorizing result, phase events and bounded redacted
+diagnostics. Failure capture precedes label-verified resource removal; failed
+cleanup cannot produce PASS. Successful runs return the copied binary and backup;
+failed runs retain these private diagnostic inputs. Source artifacts and unrelated
+Docker resources are never removed. The source map and prior failure history stay
+unchanged. This first slice does not prove upgrade/rollback, credential recovery,
+cross-SDK behavior, production supervision or final qualification; #102 stays open.
+
+The existing `quality.yml` workflow has an opt-in `operator_artifact` dispatch
+input restricted to `main`. It uses Rust 1.98.0 on Ubuntu 24.04, the component
+builder, then this rehearsal, retaining fragments and bounded diagnostics for
+three days. Download and verify them against the reviewed workflow SHA before
+expiry. Default PR checks run the portable safety suite, not the expensive
+artifact lane. An artifact upload or green source check is not a rehearsal PASS.
