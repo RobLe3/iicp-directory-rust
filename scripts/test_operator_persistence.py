@@ -1,5 +1,7 @@
 """Portable safety/negative tests; mocks never grant runtime qualification."""
 import argparse
+import contextlib
+import io as streams
 import json
 import os
 from pathlib import Path
@@ -130,9 +132,16 @@ class SafetyTests(unittest.TestCase):
 
     def test_node_api_disagreement_rejects_sql_only_success(self):
         runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
-        with patch.object(runtime, "sql", return_value=b"row"), patch.object(runtime, "api", return_value={"id": ops.NODE, "region": "wrong"}):
+        with patch.object(runtime, "sql", return_value=b"row"), patch.object(runtime, "api", return_value={"node_id": ops.NODE, "region": "wrong"}):
             with self.assertRaisesRegex(io.RehearsalError, "node_api_differs"):
                 runtime.verify_rows(b"row")
+
+    def test_node_api_uses_wire_identity_not_sql_column_name(self):
+        runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
+        source = (Path(ops.__file__).resolve().parents[1] / "src/types.rs").read_text()
+        self.assertIn("pub node_id: String", source)
+        with patch.object(runtime, "sql", return_value=b"row"), patch.object(runtime, "api", return_value={"node_id": ops.NODE, "region": "test-region"}):
+            self.assertEqual(runtime.verify_rows(b"row"), ops.hashlib.sha256(b"row").hexdigest())
 
     def test_existing_public_workflow_retains_evidence_without_new_job(self):
         root = Path(ops.__file__).resolve().parents[1]
@@ -143,6 +152,37 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("retention-days: 3", workflow)
         self.assertNotIn("rehearsal/backup.sql", workflow)
         self.assertNotIn("rehearsal/app.env", workflow)
+        upload = workflow.split("      - name: Retain exact fragment", 1)[1].split("\n  event-log-concurrency:", 1)[0]
+        self.assertNotIn("/../", upload)
+        self.assertIn("${{ steps.operator.outputs.output }}/fragment/", upload)
+        self.assertIn("printf 'output=%s\\n'", (root / "scripts/run_operator_artifact_ci.sh").read_text())
+
+    def test_readiness_uses_actual_http_version_and_schema_check(self):
+        docker = io.Docker("owned", self.root)
+        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15")
+        source = (Path(ops.__file__).resolve().parents[1] / "src/main.rs").read_text()
+        self.assertIn('concat!("v", env!("CARGO_PKG_VERSION"), "-rs")', source)
+        with patch.object(runtime, "api", return_value={"ok": True, "version": "v0.1.15-rs"}), patch.object(docker, "call") as call:
+            runtime.ready()
+        self.assertIn("db-maintenance-status", call.call_args.args)
+
+    def test_incompatible_health_version_fails_immediately(self):
+        runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
+        with patch.object(runtime, "api", return_value={"ok": True, "version": "0.1.15"}), patch.object(ops.time, "sleep") as sleep:
+            with self.assertRaisesRegex(io.RehearsalError, "health_version_mismatch"):
+                runtime.ready()
+        sleep.assert_not_called()
+
+    def test_upload_independent_console_evidence_is_redacted(self):
+        docker = io.Docker("owned", self.root)
+        docker.secrets = ["private-password"]
+        docker.log(b"x" * 40000 + b"private-password")
+        stream = streams.StringIO()
+        with contextlib.redirect_stderr(stream):
+            docker.console_failure()
+        self.assertNotIn("private-password", stream.getvalue())
+        self.assertIn("[REDACTED]", stream.getvalue())
+        self.assertLess(len(stream.getvalue()), 33000)
 
     def arguments(self):
         return argparse.Namespace(fragment=self.root / "fragment.json", fragment_sha256="sha256:" + "b"*64,
