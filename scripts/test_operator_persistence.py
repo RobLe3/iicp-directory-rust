@@ -130,6 +130,41 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn("--publish", args)
         self.assertNotIn("--privileged", args)
 
+    def test_sdk_probe_is_owned_isolated_and_bounded(self):
+        docker = io.Docker("owned", self.root)
+        image = "sha256:" + "a" * 64
+        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", image)
+        value = {"schema": "iicp.directory-sdk-probe.v1", "status": "PASS",
+                 "non_authorizing": True, "qualification_credit": 0, "matrix": {"rows": [{}]*18}}
+        with patch.object(docker, "create") as create, patch.object(docker, "call", side_effect=[(0,b"0"), (0,json.dumps(value).encode())]) as call:
+            runtime.sdk_probe()
+        args = create.call_args.args[2]
+        self.assertIn("container:owned-app", args)
+        self.assertIn("--pull=never", args)
+        self.assertIn("--read-only", args)
+        self.assertNotIn("--mount", args)
+        self.assertNotIn("--privileged", args)
+        self.assertEqual(call.call_args_list[0].kwargs["timeout"], 1800)
+        self.assertTrue((self.root / "sdk-probe.json").exists())
+
+    def test_sdk_probe_partial_evidence_and_timeout_fail(self):
+        docker = io.Docker("owned", self.root)
+        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", "sha256:"+"a"*64)
+        with patch.object(docker, "create"), patch.object(docker, "call", side_effect=[(0,b"0"), (0,b'{"status":"PASS"}')]):
+            with self.assertRaises(io.RehearsalError):
+                runtime.sdk_probe()
+        with patch.object(docker, "create"), patch.object(docker, "call", side_effect=subprocess.TimeoutExpired("wait",1800)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                runtime.sdk_probe()
+
+    def test_probe_is_optional_and_precedes_schema_destruction(self):
+        runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
+        with patch.object(runtime.docker, "create") as create:
+            runtime.sdk_probe()
+        create.assert_not_called()
+        source = Path(ops.__file__).read_text()
+        self.assertLess(source.index('self.sdk_probe()'), source.index('self.sql("ALTER TABLE nodes'))
+
     def test_node_api_disagreement_rejects_sql_only_success(self):
         runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
         with patch.object(runtime, "sql", return_value=b"row"), patch.object(runtime, "api", return_value={"node_id": ops.NODE, "region": "wrong"}):
@@ -194,6 +229,16 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ops.rehearse(self.arguments())
         call.assert_not_called()
+
+    def test_sdk_mutable_image_or_wrong_target_never_allocates(self):
+        for image, target in (("probe:latest", "linux-x86_64"), ("sha256:"+"a"*64, "linux-aarch64")):
+            args = self.arguments()
+            args.sdk_probe_image, args.target = image, target
+            with patch.object(ops.admission, "prepare") as prepare, patch.object(io.Docker, "call") as call:
+                with self.assertRaises(io.RehearsalError):
+                    ops.rehearse(args)
+            prepare.assert_not_called()
+            call.assert_not_called()
 
     def run_outcome(self, exercise_error=None, cleanup=None):
         args = self.arguments()
