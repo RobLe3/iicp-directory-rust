@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import subprocess
@@ -41,7 +42,7 @@ def output_directory(path):
 
 
 class Runtime:
-    def __init__(self, docker, root, runtime_image, mysql_image, version):
+    def __init__(self, docker, root, runtime_image, mysql_image, version, sdk_probe_image=None):
         self.docker, self.root = docker, root
         self.runtime_image, self.mysql_image = runtime_image, mysql_image
         self.version = version
@@ -49,6 +50,38 @@ class Runtime:
         self.db, self.app = docker.run_id + "-db", docker.run_id + "-app"
         self.volume = docker.run_id + "-data"
         self.label = f"{LABEL}={docker.run_id}"
+        self.sdk_probe_image = sdk_probe_image
+
+    def sdk_probe(self):
+        """Run prebuilt SDKs in the app namespace while its owned DB is live."""
+        if not self.sdk_probe_image:
+            return
+        d, name = self.docker, self.docker.run_id + "-sdk"
+        d.event("sdk_compatibility", "STARTED", image=self.sdk_probe_image)
+        # Track before creating: timeout/interruption still reaches owner cleanup.
+        d.create("container", name, ["run", "-d", "--pull=never", "--name", name,
+            "--label", self.label, "--network", "container:" + self.app,
+            "--memory", "768m", "--cpus", "1", "--pids-limit", "128",
+            "--read-only", "--cap-drop=ALL", "--security-opt", "no-new-privileges",
+            "--user", "65534:65534", "--tmpfs", "/tmp:rw,nosuid,size=64m",
+            "--log-opt", "max-size=1m", "--log-opt", "max-file=2",
+            "--entrypoint", "python3", self.sdk_probe_image,
+            "/probe/scripts/pre1_directory_probe.py", "--directory", "http://127.0.0.1:8090/api"])
+        _, status = d.call("wait", name, timeout=1800)
+        _, raw = d.call("logs", "--tail", "1000", name)
+        # The image validates detailed matrix semantics. Final cross-component
+        # acceptance independently revalidates this retained nested evidence.
+        if len(raw) > 65536:
+            raise RehearsalError("sdk_probe_result_limit")
+        (self.root / "sdk-probe.json").write_bytes(raw)
+        value = json.loads(raw)
+        if (status.strip() != b"0" or value.get("schema") != "iicp.directory-sdk-probe.v1"
+                or value.get("status") != "PASS" or value.get("non_authorizing") is not True
+                or type(value.get("qualification_credit")) is not int or value["qualification_credit"] != 0
+                or len(value.get("matrix", {}).get("rows", [])) != 18):
+            raise RehearsalError("sdk_probe_failed_or_incomplete")
+        d.event("sdk_compatibility", "PASS", image=self.sdk_probe_image,
+                result_sha256=hashlib.sha256(raw).hexdigest())
 
     def start_database(self):
         d = self.docker
@@ -184,6 +217,13 @@ class Runtime:
         self.docker.call("stop", "-t", "10", self.app)
         self.app = original_app
         self.docker.event("fresh_database_backup_restore", "PASS", backup_sha256=hashlib.sha256(backup).hexdigest())
+        if self.sdk_probe_image:
+            # Run after persistence comparisons, before destructive schema test.
+            # The original container retains its original database environment.
+            self.docker.call("start", self.app)
+            self.ready()
+            self.sdk_probe()
+            self.docker.call("stop", "-t", "10", self.app)
         # Mutate only this run's database to prove verify-only startup rejects a
         # partial schema rather than silently falling back to memory or repairing.
         self.docker.event("partial_schema_fail_closed", "STARTED")
@@ -204,6 +244,9 @@ class Runtime:
 
 
 def rehearse(args):
+    probe_image = getattr(args, "sdk_probe_image", None)
+    if probe_image and (args.target != "linux-x86_64" or not re.fullmatch(r"sha256:[0-9a-f]{64}", probe_image)):
+        raise RehearsalError("sdk_probe_linux_x64_image_id_required")
     for image in (args.runtime_image, args.mysql_image):
         image_reference(image)
     # Verify artifact before creating output or touching Docker.
@@ -213,19 +256,22 @@ def rehearse(args):
     result = {"schema": "iicp.directory-rust.persistence-rehearsal.v1", "artifact": identity, "run_id": docker.run_id,
               "status": "FAIL", "qualification_credit": 0, "non_authorizing": True,
               "runtime_image": args.runtime_image, "mysql_image": args.mysql_image,
+              "sdk_probe_image": probe_image, "sdk_probe_requested": bool(probe_image),
               "limitations": ["testing environment; no production authority", "no upgrade/rollback or credential recovery",
                               "no cross-SDK conformance or final qualification"]}
     try:
         expected_arch = "amd64" if args.target == "linux-x86_64" else "arm64"
-        for image in (args.runtime_image, args.mysql_image):
+        for image in (args.runtime_image, args.mysql_image, *([probe_image] if probe_image else [])):
             _, raw = docker.call("image", "inspect", image)
             inspected = json.loads(raw)[0]
             if inspected.get("Os") != "linux" or inspected.get("Architecture") != expected_arch:
                 raise RehearsalError("runtime_image_target_differs")
+            if image == probe_image and inspected.get("Id") != probe_image:
+                raise RehearsalError("sdk_probe_image_identity_differs")
         installed = root / "installed"
         installed.mkdir(mode=0o700)
         admission.prepare(args.fragment, args.fragment_sha256, args.source_commit, args.target, installed / "directory")
-        Runtime(docker, root, args.runtime_image, args.mysql_image, identity["source_version"]).exercise()
+        Runtime(docker, root, args.runtime_image, args.mysql_image, identity["source_version"], probe_image).exercise()
         result["status"] = "PASS"
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         result["reason"] = str(error) if isinstance(error, RehearsalError) else type(error).__name__
@@ -266,6 +312,7 @@ def main():
     parser.add_argument("--runtime-image", required=True, help="preloaded digest-pinned Python 3/glibc runtime")
     parser.add_argument("--mysql-image", required=True, help="preloaded digest-pinned MySQL 8.0 image")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--sdk-probe-image", help="opt-in preloaded Linux x64 SDK workload image sha256:ID")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
