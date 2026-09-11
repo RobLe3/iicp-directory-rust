@@ -30,7 +30,7 @@ class Owner:
             raise ValueError('container_identity')
         fields = {'id': '.Id', 'image': '.Image', 'running': '.State.Running',
                   'paused': '.State.Paused', 'network': '.HostConfig.NetworkMode',
-                  'owner': 'index .Config.Labels "' + self.key + '"'}
+                  'owner': '(index .Config.Labels "' + self.key + '")'}
         template = '{' + ','.join('"'+key+'":{{json '+value+'}}' for key, value in fields.items()) + '}'
         raw = self.call(['inspect', '--format', template, container], 10)
         if len(raw) > 4096:

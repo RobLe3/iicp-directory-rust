@@ -296,6 +296,7 @@ class OutageOwnerTests(unittest.TestCase):
     def call(self, args, timeout):
         self.commands.append(args)
         if args[0] == 'inspect':
+            self.assertIn('{{json (index .Config.Labels', args[2])
             probe = args[-1] == 'a'*64
             return json.dumps({'id': args[-1], 'image': 'sha256:'+'d'*64,
                 'owner': self.owner_label, 'running': True,
