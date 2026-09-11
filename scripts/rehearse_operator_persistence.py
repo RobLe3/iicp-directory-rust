@@ -19,6 +19,7 @@ import time
 import uuid
 
 import prepare_operator_artifact as admission
+from operator_directory_outage import Owner
 from operator_runtime_io import Docker, LABEL, RehearsalError, image_reference
 
 NODE = "00000000-0000-4000-8000-000000000001"
@@ -66,7 +67,13 @@ class Runtime:
             "--user", "65534:65534", "--tmpfs", "/tmp:rw,nosuid,size=64m",
             "--log-opt", "max-size=1m", "--log-opt", "max-file=2",
             "--entrypoint", "python3", self.sdk_probe_image,
-            "/probe/scripts/pre1_directory_probe.py", "--directory", "http://127.0.0.1:8090/api"])
+            "/probe/scripts/pre1_directory_probe.py", "--directory", "http://127.0.0.1:8090/api", "--directory-outage"])
+        controller = Owner(lambda args, timeout: d.call(*args, timeout=timeout)[1],
+                           name, self.app, LABEL, d.run_id, self.sdk_probe_image)
+        try:
+            owner = controller.run()
+        finally:
+            (self.root / "directory-outage-control.json").write_text(json.dumps(controller.snapshot(), sort_keys=True))
         _, status = d.call("wait", name, timeout=1800)
         _, raw = d.call("logs", "--tail", "1000", name)
         # The image validates detailed matrix semantics. Final cross-component
@@ -80,6 +87,10 @@ class Runtime:
                 or type(value.get("qualification_credit")) is not int or value["qualification_credit"] != 0
                 or len(value.get("matrix", {}).get("rows", [])) != 18):
             raise RehearsalError("sdk_probe_failed_or_incomplete")
+        if value.get("outage_nonce") != owner["nonce"]:
+            raise RehearsalError("outage_nonce_differs")
+        owner["probe_sha256"] = hashlib.sha256(raw).hexdigest()
+        (self.root / "directory-outage.json").write_text(json.dumps(owner, sort_keys=True))
         d.event("sdk_compatibility", "PASS", image=self.sdk_probe_image,
                 result_sha256=hashlib.sha256(raw).hexdigest())
 

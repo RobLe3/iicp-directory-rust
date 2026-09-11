@@ -130,12 +130,15 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn("--publish", args)
         self.assertNotIn("--privileged", args)
 
-    def test_sdk_probe_is_owned_isolated_and_bounded(self):
+    @patch.object(ops, "Owner")
+    def test_sdk_probe_is_owned_isolated_and_bounded(self, owner):
+        owner.return_value.run.return_value = {"nonce": "a"*32}
+        owner.return_value.snapshot.return_value = {}
         docker = io.Docker("owned", self.root)
         image = "sha256:" + "a" * 64
         runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", image)
         value = {"schema": "iicp.directory-sdk-probe.v1", "status": "PASS",
-                 "non_authorizing": True, "qualification_credit": 0, "matrix": {"rows": [{}]*18}}
+                 "non_authorizing": True, "qualification_credit": 0, "matrix": {"rows": [{}]*18}, "outage_nonce": "a"*32}
         with patch.object(docker, "create") as create, patch.object(docker, "call", side_effect=[(0,b"0"), (0,json.dumps(value).encode())]) as call:
             runtime.sdk_probe()
         args = create.call_args.args[2]
@@ -147,7 +150,10 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(call.call_args_list[0].kwargs["timeout"], 1800)
         self.assertTrue((self.root / "sdk-probe.json").exists())
 
-    def test_sdk_probe_partial_evidence_and_timeout_fail(self):
+    @patch.object(ops, "Owner")
+    def test_sdk_probe_partial_evidence_and_timeout_fail(self, owner):
+        owner.return_value.run.return_value = {"nonce": "a"*32}
+        owner.return_value.snapshot.return_value = {}
         docker = io.Docker("owned", self.root)
         runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", "sha256:"+"a"*64)
         with patch.object(docker, "create"), patch.object(docker, "call", side_effect=[(0,b"0"), (0,b'{"status":"PASS"}')]):
@@ -273,6 +279,95 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertFalse(result["resources_absent"])
 
+
+
+import operator_directory_outage as outage
+
+
+class OutageOwnerTests(unittest.TestCase):
+    def setUp(self):
+        self.paused = False
+        self.commands = []
+        self.pause_error = False
+        self.nonce = 'c'*32
+        self.owner_label = 'owned'
+        self.network = 'container:'+'b'*64
+
+    def call(self, args, timeout):
+        self.commands.append(args)
+        if args[0] == 'inspect':
+            self.assertIn('{{json (index .Config.Labels', args[2])
+            probe = args[-1] == 'a'*64
+            return json.dumps({'id': args[-1], 'image': 'sha256:'+'d'*64,
+                'owner': self.owner_label, 'running': True,
+                'paused': False if probe else self.paused,
+                'network': self.network if probe else 'bridge'}).encode()
+        if args[0] in ('pause', 'unpause'):
+            self.paused = args[0] == 'pause'
+            if self.paused and self.pause_error:
+                raise subprocess.TimeoutExpired('pause', 10)
+            return b''
+        if args[0] == 'exec' and args[4] == 'read':
+            seq = int(args[5])
+            return json.dumps({'schema': outage.SCHEMA, 'nonce': self.nonce,
+                'sequence': seq, 'action': {1:'pause', 2:'resume'}[seq]}).encode()
+        return b''
+
+    def owner(self):
+        return outage.Owner(self.call, 'a'*64, 'b'*64, 'owner', 'owned', 'sha256:'+'d'*64)
+
+    def test_owner_pause_resume_and_bound_receipt(self):
+        result = self.owner().run()
+        self.assertEqual(result['observed'], ['pause', 'resume'])
+        self.assertEqual(result['nonce'], self.nonce)
+        self.assertFalse(self.paused)
+        self.assertEqual([a[0] for a in self.commands if a[0] in ('pause', 'unpause')], ['pause','unpause'])
+        self.assertFalse(any('stop' in a or 'restart' in a for a in self.commands))
+
+    def test_ambiguous_pause_timeout_always_unpauses(self):
+        self.pause_error = True
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.owner().run()
+        self.assertFalse(self.paused)
+        self.assertIn(['unpause', 'b'*64], self.commands)
+
+    def test_namespace_and_ownership_rejected_before_pause(self):
+        for attribute, value in [('network', 'host'), ('owner_label', 'unrelated')]:
+            self.setUp()
+            setattr(self, attribute, value)
+            with self.assertRaises(ValueError):
+                self.owner()
+            self.assertFalse(any(a[0] == 'pause' for a in self.commands))
+
+    def test_malformed_request_cannot_control_container(self):
+        self.nonce = '--arbitrary-command'
+        with self.assertRaises(ValueError):
+            self.owner().run()
+        self.assertFalse(any(a[0] == 'pause' for a in self.commands))
+
+    def test_ack_failure_after_pause_recovers(self):
+        original = self.call
+        def call(args, timeout):
+            if args[0] == 'exec' and args[4:6] == ['ack', '1']:
+                raise ValueError('ack unavailable')
+            return original(args, timeout)
+        owner = self.owner()
+        owner.call = call
+        with self.assertRaises(ValueError):
+            owner.run()
+        self.assertFalse(self.paused)
+
+    def test_unobserved_pause_refuses_ack(self):
+        original = self.call
+        def call(args, timeout):
+            if args[0] == 'pause':
+                return b''
+            return original(args, timeout)
+        owner = self.owner()
+        owner.call = call
+        with self.assertRaises(ValueError):
+            owner.run()
+        self.assertFalse(any(a[0] == 'exec' and a[4] == 'ack' for a in self.commands))
 
 if __name__ == "__main__":
     unittest.main()
