@@ -135,8 +135,9 @@ class SafetyTests(unittest.TestCase):
         owner.return_value.run.return_value = {"nonce": "a"*32}
         owner.return_value.snapshot.return_value = {}
         docker = io.Docker("owned", self.root)
-        image = "sha256:" + "a" * 64
-        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", image)
+        image_id = "sha256:" + "a" * 64
+        image_ref = "iicp-pre1-directory-probe:" + "a" * 64
+        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", image_ref, image_id)
         value = {"schema": "iicp.directory-sdk-probe.v1", "status": "PASS",
                  "non_authorizing": True, "qualification_credit": 0, "matrix": {"rows": [{}]*18}, "outage_nonce": "a"*32}
         with patch.object(docker, "create") as create, patch.object(docker, "call", side_effect=[(0,b"0"), (0,json.dumps(value).encode())]) as call:
@@ -155,7 +156,8 @@ class SafetyTests(unittest.TestCase):
         owner.return_value.run.return_value = {"nonce": "a"*32}
         owner.return_value.snapshot.return_value = {}
         docker = io.Docker("owned", self.root)
-        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", "sha256:"+"a"*64)
+        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15",
+                              "iicp-pre1-directory-probe:"+"a"*64, "sha256:"+"a"*64)
         with patch.object(docker, "create"), patch.object(docker, "call", side_effect=[(0,b"0"), (0,b'{"status":"PASS"}')]):
             with self.assertRaises(io.RehearsalError):
                 runtime.sdk_probe()
@@ -228,7 +230,8 @@ class SafetyTests(unittest.TestCase):
     def arguments(self):
         return argparse.Namespace(fragment=self.root / "fragment.json", fragment_sha256="sha256:" + "b"*64,
                                   source_commit="a"*40, target="linux-x86_64", runtime_image="python@sha256:"+"a"*64,
-                                  mysql_image="mysql@sha256:"+"b"*64, output=self.root / "output")
+                                  mysql_image="mysql@sha256:"+"b"*64, output=self.root / "output",
+                                  sdk_probe_image_ref=None, sdk_probe_image_id=None)
 
     def test_wrong_artifact_touches_no_docker(self):
         with patch.object(ops.admission, "prepare", side_effect=ValueError("wrong artifact")), patch.object(io.Docker, "call") as call:
@@ -237,9 +240,11 @@ class SafetyTests(unittest.TestCase):
         call.assert_not_called()
 
     def test_sdk_mutable_image_or_wrong_target_never_allocates(self):
-        for image, target in (("probe:latest", "linux-x86_64"), ("sha256:"+"a"*64, "linux-aarch64")):
+        for image_ref, image_id, target in (("probe:latest", "sha256:"+"a"*64, "linux-x86_64"),
+                                             ("iicp-pre1-directory-probe:"+"a"*64,
+                                              "sha256:"+"a"*64, "linux-aarch64")):
             args = self.arguments()
-            args.sdk_probe_image, args.target = image, target
+            args.sdk_probe_image_ref, args.sdk_probe_image_id, args.target = image_ref, image_id, target
             with patch.object(ops.admission, "prepare") as prepare, patch.object(io.Docker, "call") as call:
                 with self.assertRaises(io.RehearsalError):
                     ops.rehearse(args)
