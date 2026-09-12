@@ -71,6 +71,24 @@ class Runtime:
             "--log-opt", "max-size=1m", "--log-opt", "max-file=2",
             "--entrypoint", "python3", self.sdk_probe_image_ref,
             "/probe/scripts/pre1_directory_probe.py", "--directory", "http://127.0.0.1:8090/api", "--directory-outage"])
+        # App-side readiness and a newly joined container are different
+        # observations. Prove loopback from the probe namespace before the SDK
+        # matrix starts so a namespace/startup race is not reported as an SDK
+        # semantic failure.
+        namespace_preflight = (
+            "import time,urllib.request\n"
+            "for attempt in range(30):\n"
+            " try:\n"
+            "  with urllib.request.urlopen('http://127.0.0.1:8090/health',timeout=2) as r:\n"
+            "   if r.status == 200: raise SystemExit(0)\n"
+            " except Exception:\n"
+            "  if attempt == 29: raise\n"
+            " time.sleep(1)\n"
+            "raise SystemExit(1)\n"
+        )
+        d.call("exec", name, "python3", "-c", namespace_preflight, timeout=65)
+        d.event("sdk_namespace_preflight", "PASS", image_ref=self.sdk_probe_image_ref,
+                image_id=self.sdk_probe_image_id)
         controller = Owner(lambda args, timeout: d.call(*args, timeout=timeout)[1],
                            name, self.app, LABEL, d.run_id, self.sdk_probe_image_id)
         try:
