@@ -140,7 +140,9 @@ class SafetyTests(unittest.TestCase):
         runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15", image_ref, image_id)
         value = {"schema": "iicp.directory-sdk-probe.v1", "status": "PASS",
                  "non_authorizing": True, "qualification_credit": 0, "matrix": {"rows": [{}]*18}, "outage_nonce": "a"*32}
-        with patch.object(docker, "create") as create, patch.object(docker, "call", side_effect=[(0,b"0"), (0,json.dumps(value).encode())]) as call:
+        with patch.object(docker, "create") as create, patch.object(
+            docker, "call", side_effect=[(0, b""), (0, b"0"), (0, json.dumps(value).encode())]
+        ) as call:
             runtime.sdk_probe()
         args = create.call_args.args[2]
         self.assertIn("container:owned-app", args)
@@ -148,7 +150,8 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("--read-only", args)
         self.assertNotIn("--mount", args)
         self.assertNotIn("--privileged", args)
-        self.assertEqual(call.call_args_list[0].kwargs["timeout"], 1800)
+        self.assertEqual(call.call_args_list[0].kwargs["timeout"], 65)
+        self.assertEqual(call.call_args_list[1].kwargs["timeout"], 1800)
         self.assertTrue((self.root / "sdk-probe.json").exists())
 
     @patch.object(ops, "Owner")
@@ -158,10 +161,14 @@ class SafetyTests(unittest.TestCase):
         docker = io.Docker("owned", self.root)
         runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15",
                               "iicp-pre1-directory-probe:"+"a"*64, "sha256:"+"a"*64)
-        with patch.object(docker, "create"), patch.object(docker, "call", side_effect=[(0,b"0"), (0,b'{"status":"PASS"}')]):
+        with patch.object(docker, "create"), patch.object(
+            docker, "call", side_effect=[(0, b""), (0, b"0"), (0, b'{"status":"PASS"}')]
+        ):
             with self.assertRaises(io.RehearsalError):
                 runtime.sdk_probe()
-        with patch.object(docker, "create"), patch.object(docker, "call", side_effect=subprocess.TimeoutExpired("wait",1800)):
+        with patch.object(docker, "create"), patch.object(
+            docker, "call", side_effect=[(0, b""), subprocess.TimeoutExpired("wait", 1800)]
+        ):
             with self.assertRaises(subprocess.TimeoutExpired):
                 runtime.sdk_probe()
 
