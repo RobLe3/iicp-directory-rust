@@ -91,8 +91,15 @@ class Runtime:
                 image_id=self.sdk_probe_image_id)
         controller = Owner(lambda args, timeout: d.call(*args, timeout=timeout)[1],
                            name, self.app, LABEL, d.run_id, self.sdk_probe_image_id)
+        owner = None
+        owner_error = None
         try:
-            owner = controller.run()
+            try:
+                owner = controller.run()
+            except Exception as error:
+                # A fast probe failure can race the independent outage owner.
+                # Capture the bounded probe result before preserving that error.
+                owner_error = error
         finally:
             (self.root / "directory-outage-control.json").write_text(json.dumps(controller.snapshot(), sort_keys=True))
         _, status = d.call("wait", name, timeout=1800)
@@ -103,6 +110,8 @@ class Runtime:
             raise RehearsalError("sdk_probe_result_limit")
         (self.root / "sdk-probe.json").write_bytes(raw)
         value = json.loads(raw)
+        if owner_error is not None:
+            raise owner_error
         if (status.strip() != b"0" or value.get("schema") != "iicp.directory-sdk-probe.v1"
                 or value.get("status") != "PASS" or value.get("non_authorizing") is not True
                 or type(value.get("qualification_credit")) is not int or value["qualification_credit"] != 0
