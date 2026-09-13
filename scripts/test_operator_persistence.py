@@ -172,6 +172,24 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 runtime.sdk_probe()
 
+    @patch.object(ops, "Owner")
+    def test_sdk_probe_owner_failure_still_captures_probe_result(self, owner):
+        owner.return_value.run.side_effect = ValueError("probe_not_running")
+        owner.return_value.snapshot.return_value = {}
+        docker = io.Docker("owned", self.root)
+        runtime = ops.Runtime(docker, self.root, "runtime", "mysql", "0.1.15",
+                              "iicp-pre1-directory-probe:"+"a"*64, "sha256:"+"a"*64)
+        value = {"schema": "iicp.directory-sdk-probe.v1", "status": "FAIL",
+                 "non_authorizing": True, "qualification_credit": 0,
+                 "matrix": {"rows": []}}
+        with patch.object(docker, "create"), patch.object(
+            docker, "call", side_effect=[(0, b""), (0, b"1"), (0, json.dumps(value).encode())]
+        ):
+            with self.assertRaisesRegex(ValueError, "probe_not_running"):
+                runtime.sdk_probe()
+        self.assertTrue((self.root / "sdk-probe.json").exists())
+        self.assertTrue((self.root / "directory-outage-control.json").exists())
+
     def test_probe_is_optional_and_precedes_schema_destruction(self):
         runtime = ops.Runtime(io.Docker("owned", self.root), self.root, "runtime", "mysql", "0.1.15")
         with patch.object(runtime.docker, "create") as create:
