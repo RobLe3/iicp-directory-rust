@@ -17,6 +17,8 @@ TOOL_ONLY_PATHS = frozenset({
     "scripts/test_pre1_qualification_case.py",
     "scripts/pre1_harness_binding.py",
     "scripts/pre1_environment_contract.py",
+    "scripts/pre1_package_execution.py",
+    "scripts/test_pre1_package_execution.py",
 })
 
 
