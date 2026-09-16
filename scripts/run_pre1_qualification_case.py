@@ -13,6 +13,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pre1_harness_binding import harness_identity, validate_harness_source
+from pre1_environment_contract import validate_modern_environment
+
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = 'directory-rust'
 RUNTIMES = ['msrv-1.88', 'rust-1.98.0']
@@ -83,6 +88,12 @@ def description() -> dict:
         "evidence_policy": "digest-only",
         "artifact_consumption": "verified-candidate-root",
         "source_commit_binding": True,
+        "supported_environment_schemas": [
+            "iicp.pre1-qualification-environment.v1",
+            "iicp.pre1-qualification-environment.v2",
+            "iicp.pre1-qualification-environment.v3",
+        ],
+        **harness_identity(ROOT),
         "semantic_binding": {
             "contract": "iicp.pre1-semantic-assertion-binding.v1",
             "exact_assertion_per_scenario": True,
@@ -245,7 +256,11 @@ def _validate_environment_manifest(
     runtime_map_digest: str,
 ) -> str:
     if (
-        value.get("schema") != "iicp.pre1-qualification-environment.v1"
+        value.get("schema") not in {
+            "iicp.pre1-qualification-environment.v1",
+            "iicp.pre1-qualification-environment.v2",
+            "iicp.pre1-qualification-environment.v3",
+        }
         or value.get("status") != "READY"
         or value.get("target") != target
         or value.get("content_free") is not True
@@ -281,6 +296,8 @@ def _validate_environment_manifest(
     copy["environment_sha256"] = None
     if not valid_digest(claimed) or claimed != canonical_sha256(copy):
         raise ValueError("qualification environment digest differs")
+    if value.get("schema") != "iicp.pre1-qualification-environment.v1":
+        validate_modern_environment(value, target=target, bindings=expected)
     return str(claimed)
 
 
@@ -312,9 +329,13 @@ def validate_context(cell: str, scenario: str | None) -> tuple[str, dict, dict, 
     component = next((row for row in manifest.get("components", []) if row.get("id") == COMPONENT), None)
     if not isinstance(component, dict) or component.get("state") != "BUILT":
         raise ValueError("qualification component artifact set is not built")
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    if head != component.get("source_commit"):
-        raise ValueError("qualification source commit differs from the candidate")
+    harness_text = os.environ.get("IICP_PRE1_HARNESS_BINDING")
+    if harness_text is not None:
+        validate_harness_source(ROOT, component.get("source_commit"), json.loads(harness_text))
+    else:
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        if head != component.get("source_commit"):
+            raise ValueError("qualification source commit differs from the candidate")
 
     artifact_root = Path(os.environ.get("IICP_PRE1_ARTIFACT_ROOT", ""))
     component_root = artifact_root / COMPONENT
@@ -425,6 +446,8 @@ def command_environment(runtime_row: dict, runtime: str) -> dict[str, str]:
         "IICP_PRE1_CONTEXT_SHA256",
     ):
         env[name] = os.environ[name]
+    if "IICP_PRE1_HARNESS_BINDING" in os.environ:
+        env["IICP_PRE1_HARNESS_BINDING"] = os.environ["IICP_PRE1_HARNESS_BINDING"]
     env.update(runtime_row.get("env", {}))
     cache = Path(env["IICP_HOME"]) / "qualification-cache" / COMPONENT / runtime
     cache.mkdir(parents=True, exist_ok=True)

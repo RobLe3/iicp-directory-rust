@@ -196,5 +196,70 @@ class DriverContractTests(unittest.TestCase):
             module.expected_runtime_version("rust-1.98.0", manifest)
 
 
+
+class ModernEnvironmentTests(unittest.TestCase):
+    def fixture(self):
+        runtime = module.RUNTIMES[0]
+        value = {
+            "schema": "iicp.pre1-qualification-environment.v3",
+            "status": "READY", "target": "linux-x86_64",
+            "bindings": {key: "sha256:" + char * 64 for key, char in (
+                ("candidate_manifest_sha256", "a"),
+                ("artifact_materialization_sha256", "b"),
+                ("runtime_map_sha256", "c"))},
+            "network": {"preparation_egress": "dependency-download-only",
+                        "qualification_egress": "disabled", "loopback_fixtures": True},
+            "source_state": {"clean_checkout": True, "empty_volatile_caches_at_start": True,
+                             "product_artifacts_separate": True},
+            "execution": {"execution_kind": "native", "evidence_scope": "functional-and-performance",
+                          "host_architecture": "x86_64", "guest_architecture": "x86_64",
+                          "container_engine": None, "container_engine_version": None,
+                          "emulation_mechanism": None, "image_digest": None},
+            "isolation": {"kind": "isolated-fixture", "identity": "test-only",
+                          "evidence_sha256": "sha256:" + "d" * 64},
+            "runtimes": {runtime: {
+                "lock_inputs_sha256": "sha256:" + "e" * 64,
+                "dependency_cache_sha256": "sha256:" + "f" * 64,
+                "online_prepare_status": "PASS", "offline_install_status": "PASS",
+                "package_artifact_smoke_status": "PASS", "egress_disabled_during_offline": True,
+                "empty_volatile_cache_at_start": True}},
+            "content_free": True, "secrets_present": False, "non_authorizing": True,
+            "environment_sha256": None,
+        }
+        return runtime, value
+
+    def check(self, value, runtime):
+        value["environment_sha256"] = None
+        value["environment_sha256"] = module.canonical_sha256(value)
+        return module._validate_environment_manifest(
+            value, target="linux-x86_64", runtime=runtime,
+            candidate_digest="sha256:" + "a" * 64,
+            materialization_digest="sha256:" + "b" * 64,
+            runtime_map_digest="sha256:" + "c" * 64)
+
+    def test_v3_preserves_provenance_and_package_gates(self):
+        runtime, value = self.fixture()
+        self.assertEqual(self.check(value, runtime), value["environment_sha256"])
+
+    def test_rehashed_invalid_provenance_is_not_accepted(self):
+        mutations = [("execution", "guest_architecture", "aarch64"),
+                     ("execution", "evidence_scope", "functional-only"),
+                     ("execution", "image_digest", "sha256:" + "0" * 64),
+                     ("isolation", "evidence_sha256", "invalid"),
+                     ("network", "qualification_egress", "enabled"),
+                     ("source_state", "product_artifacts_separate", False)]
+        for section, key, replacement in mutations:
+            runtime, value = self.fixture()
+            value[section][key] = replacement
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.check(value, runtime)
+
+    def test_rehashed_invalid_dependency_hash_is_not_accepted(self):
+        runtime, value = self.fixture()
+        value["runtimes"][runtime]["dependency_cache_sha256"] = "missing"
+        with self.assertRaises(ValueError):
+            self.check(value, runtime)
+
+
 if __name__ == "__main__":
     unittest.main()
