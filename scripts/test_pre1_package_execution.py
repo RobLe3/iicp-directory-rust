@@ -39,7 +39,7 @@ class PackageExecutionTests(unittest.TestCase):
         return artifact
 
     def test_management_manifest_bridge_requires_actual_candidate_and_retains_legacy(self):
-        source = '    let Some(path) = env::var_os("IICP_RELEASE_MANIFEST") else {\n        return;\n    };\n    let manifest: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();\nassert_eq!(manifest["authorizes_deployment"], false);' 
+        source = '    let Some(path) = env::var_os("IICP_RELEASE_MANIFEST") else {\n        return;\n    };\n    let manifest: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();\nassert_eq!(manifest["authorizes_deployment"], false);'
         staged = adapter.management_assertions("tests/release_manifest.rs", source)
         self.assertIn('component["source_commit"]', staged)
         self.assertIn('expect("release manifest required")', staged)
