@@ -1,0 +1,881 @@
+"""Bind staged assertions to byte-verified installed frozen SDK payloads.
+
+Preparation never installs dependencies or grants qualification credit. The
+caller owns network isolation, runtime selection and workspace lifetime.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import tarfile
+import tempfile
+import zipfile
+from pathlib import Path
+
+SCHEMA = "iicp.pre1-package-execution.v1"
+BINDINGS = (
+    "candidate_manifest_sha256", "artifact_materialization_sha256",
+    "runtime_map_sha256", "qualification_environment_sha256",
+)
+PYTHON_GUARD = '''import os, sys
+from pathlib import Path
+import pytest
+
+def check_origin():
+    import iicp_client
+    root = Path(os.environ["IICP_PRE1_INSTALLED_PACKAGE"]).resolve()
+    for name, module in tuple(sys.modules.items()):
+        if name == "iicp_client" or name.startswith("iicp_client."):
+            origin = getattr(module, "__file__", None)
+            if origin is None or not Path(origin).resolve().is_relative_to(root):
+                raise RuntimeError("packaged Python import origin differs")
+
+def pytest_sessionstart(session):
+    check_origin()
+
+reports = []
+
+def pytest_runtest_logreport(report):
+    reports.append(report)
+
+def pytest_sessionfinish(session, exitstatus):
+    calls = [report for report in reports if report.when == "call"]
+    if len(calls) != 1 or any(not r.passed or hasattr(r, "wasxfail") for r in reports):
+        session.exitstatus = 2
+    check_origin()
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    check_origin()
+    yield
+    check_origin()
+'''
+
+
+def digest(value: object) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode()).hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def safe_path(path: Path) -> Path:
+    if not path.is_absolute() or not path.exists():
+        raise ValueError("package execution path must exist and be absolute")
+    if any(unsafe_link(p) for p in (path, *path.parents)):
+        raise ValueError("package execution path contains a symlink")
+    return path.resolve()
+
+
+def unsafe_link(path: Path) -> bool:
+    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    return path.is_symlink() or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def tree(path: Path) -> dict[str, str]:
+    safe_path(path)
+    result = {}
+    for item in sorted(path.rglob("*")):
+        if unsafe_link(item):
+            raise ValueError("package execution tree contains a symlink")
+        if item.is_file():
+            if "__pycache__" in item.parts or item.suffix == ".pyc":
+                continue
+            result[item.relative_to(path).as_posix()] = file_digest(item)
+        elif not item.is_dir():
+            raise ValueError("package execution tree contains a special file")
+    return result
+
+
+def installed_payload(artifact: Path, installed: Path, component: str) -> dict[str, str]:
+    """Require exact package-file equality, not a self-reported install receipt."""
+    safe_path(artifact)
+    readers = {"client-python": wheel_payload, "client-typescript": tarball_payload}
+    if component not in readers:
+        raise ValueError("no packaged adapter for this component")
+    expected = readers[component](artifact)
+    if not expected or any(
+        Path(name).is_absolute() or ".." in Path(name).parts for name in expected
+    ) or tree(installed) != expected:
+        raise ValueError("installed SDK differs from the frozen package payload")
+    return expected
+
+
+
+def wheel_payload(artifact: Path) -> dict[str, str]:
+    expected = {}
+    with zipfile.ZipFile(artifact, "r") as archive:
+        for row in archive.infolist():
+            if row.filename.startswith("iicp_client/") and not row.is_dir():
+                name = row.filename.removeprefix("iicp_client/")
+                expected[name] = "sha256:" + hashlib.sha256(archive.read(row)).hexdigest()
+    return expected
+
+
+def tarball_payload(artifact: Path) -> dict[str, str]:
+    expected = {}
+    with tarfile.open(artifact, "r:gz") as archive:
+        for row in archive.getmembers():
+            if row.isfile() and row.name.startswith("package/"):
+                name = row.name.removeprefix("package/")
+                handle = archive.extractfile(row)
+                if handle is None:
+                    raise ValueError("package archive file is unavailable")
+                expected[name] = "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+            elif row.issym() or row.islnk():
+                raise ValueError("package archive contains a link")
+    return expected
+
+
+def dependencies(workspace: Path, installed: Path, component: str) -> dict[str, str]:
+    base = installed.parent if component == "client-python" else workspace / "node_modules"
+    rows = {}
+    safe_path(base)
+    for item in sorted(base.rglob("*")):
+        name = item.relative_to(base).as_posix()
+        if "__pycache__" in item.parts or item.suffix == ".pyc":
+            continue
+        if unsafe_link(item):
+            if not item.is_symlink() or component != "client-typescript" or not name.startswith(".bin/") or not item.resolve().is_relative_to(base):
+                raise ValueError("test dependency contains an unsafe link")
+            rows[name] = digest({"link": os.readlink(item), "target_sha256": file_digest(item.resolve())})
+        elif item.is_file():
+            rows[name] = file_digest(item)
+        elif not item.is_dir():
+            raise ValueError("test dependency contains a special file")
+    return rows
+
+
+def rewrite_typescript(text: str) -> str:
+    """Redirect literal runtime/worker paths only; leave assertions unchanged."""
+    def replace(match):
+        prefix, name = match.groups()
+        if ".." in Path(name).parts:
+            raise ValueError("unsafe TypeScript source reference")
+        name = re.sub(r"\.ts$", ".js", name)
+        if not Path(name).suffix:
+            name += ".js"
+        return f"{prefix}node_modules/@iicp/client/dist/{name}"
+    return re.sub(r"(\.{1,2}/)src/([A-Za-z0-9_./-]+)", replace, text)
+
+
+def packaged_assertions(name: str, text: str) -> str:
+    """Strengthen three reviewed source fixtures without changing their vectors.
+
+    Crypto cases use the same canonical runtime API already exercised by each
+    SDK's runtime-verifier suite. No test-local eligibility engine survives.
+    Version qualification observes the compiled CLI, not its source spelling.
+    These substitutions are fixture-digest and harness-commit bound.
+    """
+    if name == "tests/test_dispatch_ticket_trust_crypto.py":
+        start = text.index("def _decision(vector: dict,")
+        end = text.index("def _assert_fixture_decision", start)
+        replacement = '''from iicp_client.dispatch_ticket_trust import (
+    LocalReplayCache, TicketBindings, TrustBundle, verify_dispatch_ticket_v2,
+)
+
+def _decision(vector: dict, keys: dict[str, dict], signature_valid: bool) -> str:
+    claims = vector["claims"]
+    bundle = TrustBundle.from_dict({
+        "bundle_version": 4,
+        "keys": [keys[key_id] for key_id in vector["trust_bundle_key_ids"]],
+    })
+    replay = LocalReplayCache()
+    if vector["jti_seen"]:
+        replay.remember(claims["jti"], claims["expires_at"])
+    return verify_dispatch_ticket_v2(
+        claims, vector["signature_b64url"], bundle,
+        TicketBindings(claims["issuer"], claims["provider_id"], claims["intent"], claims["constraints_digest"]),
+        now=vector["now"], minimum_bundle_version=4, replay_cache=replay,
+    ).code
+
+
+'''
+        return text[:start] + replacement + text[end:]
+    if name == "tests/dispatch_ticket_trust_crypto.test.ts":
+        start = text.index("function decision(vector: any,")
+        end = text.index("function assertFixtureDecision", start)
+        replacement = '''import { LocalDispatchReplayCache, verifyDispatchTicketV2 } from "../node_modules/@iicp/client/dist/dispatch_ticket_trust.js";
+
+function decision(vector: any, keys: Map<string, any>, signatureValid: boolean): string {
+  const replayCache = new LocalDispatchReplayCache();
+  if (vector.jti_seen) replayCache.remember(vector.claims.jti, vector.claims.expires_at);
+  return verifyDispatchTicketV2(
+    vector.claims, vector.signature_b64url,
+    { bundle_version: 4, keys: vector.trust_bundle_key_ids.map((id: string) => keys.get(id)) },
+    { issuer: vector.claims.issuer, provider_id: vector.claims.provider_id,
+      intent: vector.claims.intent, constraints_digest: vector.claims.constraints_digest },
+    { now: vector.now, minimumBundleVersion: 4, replayCache },
+  ).code;
+}
+
+'''
+        return text[:start] + replacement + text[end:]
+    if name == "tests/test_service_lifecycle.py":
+        source_override = '    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")}'
+        if text.count(source_override) != 1:
+            raise ValueError("reviewed lifecycle subprocess fixture shape differs")
+        return text.replace(source_override, "    env = dict(os.environ)")
+    if name == "tests/pre1_release_boundaries.test.ts":
+        lines = text.splitlines()
+        source_check = [line for line in lines if "assert.match(cli," in line]
+        source_read = [line for line in lines if line.startswith("const cli = ")]
+        if len(source_check) != 1 or len(source_read) != 1:
+            raise ValueError("reviewed CLI source fixture shape differs")
+        text = text.replace(source_read[0], 'import { spawnSync } from "node:child_process";\nimport { fileURLToPath } from "node:url";')
+        return text.replace(source_check[0], '''  const version = spawnSync(process.execPath, [fileURLToPath(new URL("../node_modules/@iicp/client/dist/cli.js", import.meta.url)), "--version"], { encoding: "utf8" });
+  assert.equal(version.status, 0);
+  assert.equal(version.stdout.trim(), `iicp-node ${pkg.version}`);''')
+    return text
+
+
+def fixture_tree(workspace: Path) -> dict[str, str]:
+    rows = {}
+    for name in ("tests", "parity", "scripts", ".github"):
+        if (workspace / name).exists():
+            rows.update({f"{name}/{p}": h for p, h in tree(workspace / name).items()})
+    for name in ("package.json", "package-lock.json", "pyproject.toml", "uv.lock", "pre1_origin_guard.py"):
+        if (workspace / name).exists():
+            safe_path(workspace / name)
+            rows[name] = file_digest(workspace / name)
+    if (workspace / "src").exists() or (workspace / "iicp_client").exists():
+        raise ValueError("staged workspace contains checkout runtime source")
+    return rows
+
+
+def assertion_files(root: Path, component: str) -> dict[str, bytes]:
+    metadata = {"pyproject.toml", "uv.lock", "package.json", "package-lock.json",
+                "scripts/run_sdk_quality.py", "scripts/run-sdk-quality.mjs",
+                ".github/workflows/release.yml"}
+    result = {}
+    files = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).decode().split("\0")
+    for name in filter(None, files):
+        if not (name.startswith(("tests/", "parity/")) or name in metadata):
+            continue
+        source = safe_path(root / name)
+        if component == "client-typescript" and name.endswith(".ts"):
+            result[name] = packaged_assertions(name, rewrite_typescript(source.read_text())).encode()
+        elif component == "client-python" and name.endswith(".py"):
+            result[name] = packaged_assertions(name, source.read_text()).encode()
+        else:
+            result[name] = source.read_bytes()
+    if component == "client-python":
+        result["pre1_origin_guard.py"] = PYTHON_GUARD.encode()
+    return result
+
+
+def stage(root: Path, workspace: Path, component: str) -> dict[str, str]:
+    """Copy only Git-bound fixtures/metadata; never copy SDK runtime sources."""
+    root, workspace = safe_path(root), safe_path(workspace)
+    if workspace == root or workspace.is_relative_to(root):
+        raise ValueError("package workspace must be outside the checkout")
+    if fixture_tree(workspace):
+        raise ValueError("package assertion staging is not empty")
+    for name, data in assertion_files(root, component).items():
+        dest = workspace / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    return fixture_tree(workspace)
+
+
+
+def validate_immutable_bindings(bindings: dict) -> None:
+    if set(bindings) != set(BINDINGS) or any(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", str(v)) is None for v in bindings.values()
+    ):
+        raise ValueError("package execution immutable bindings differ")
+
+def create_binding(root: Path, workspace: Path, installed: Path, artifact: Path,
+                   component: str, runtime: str, target: str, bindings: dict,
+                   vendor_artifact: Path | None = None) -> dict:
+    if component == "management":
+        return create_management_binding(root, workspace, installed, artifact, runtime, target, bindings)
+    if component == "client-rust":
+        return create_rust_binding(root, workspace, installed, artifact, runtime, target, bindings, vendor_artifact)
+    validate_immutable_bindings(bindings)
+    if not safe_path(installed).is_relative_to(safe_path(workspace)):
+        raise ValueError("installed package must be in the run workspace")
+    payload = installed_payload(artifact, installed, component)
+    fixtures = fixture_tree(workspace) or stage(root, workspace, component)
+    expected_fixtures = {name: "sha256:" + hashlib.sha256(data).hexdigest()
+                         for name, data in assertion_files(root, component).items()}
+    if fixtures != expected_fixtures:
+        raise ValueError("staged assertions differ from the reviewed source mapping")
+    value = {
+        "schema": SCHEMA, "component": component, "runtime": runtime, "target": target,
+        "bindings": bindings, "workspace": str(workspace), "installed_package": str(installed),
+        "artifact_sha256": file_digest(artifact), "installed_payload_sha256": digest(payload),
+        "fixtures_sha256": digest(fixtures), "binding_sha256": None,
+        "test_dependencies_sha256": digest(dependencies(workspace, installed, component)),
+        "assertion_adapter": "canonical-runtime-verifier-and-cli.v1",
+        "non_authorizing": True, "qualification_credit": False,
+    }
+    value["binding_sha256"] = digest(value)
+    return value
+
+
+
+def validate_binding_identity(value: dict) -> None:
+    copy = dict(value)
+    copy["binding_sha256"] = None
+    if value.get("schema") != SCHEMA or value.get("binding_sha256") != digest(copy):
+        raise ValueError("package execution binding digest differs")
+    if value.get("non_authorizing") is not True or value.get("qualification_credit") is not False:
+        raise ValueError("package execution binding cannot authorize or grant credit")
+    if value.get("assertion_adapter") != "canonical-runtime-verifier-and-cli.v1":
+        raise ValueError("package assertion adapter binding differs")
+
+
+def validate_binding_context(value: dict, context: dict) -> None:
+    if any(value.get(k) != context[k] for k in ("component", "runtime", "target")) or value.get("bindings") != {k: context[k] for k in BINDINGS}:
+        raise ValueError("package execution candidate/environment/runtime binding differs")
+
+def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
+                     vendor_artifact: Path | None = None) -> Path:
+    if context["component"] == "management":
+        return validate_management_binding(value, context, artifact, root)
+    if context["component"] == "client-rust":
+        return validate_rust_binding(value, context, artifact, root, vendor_artifact)
+    validate_binding_identity(value)
+    validate_binding_context(value, context)
+    workspace = safe_path(Path(value["workspace"]))
+    home = safe_path(Path(os.environ["HOME"]))
+    installed = safe_path(Path(value["installed_package"]))
+    validate_workspace_boundary(workspace, home, installed, root)
+    if value["artifact_sha256"] != file_digest(artifact) or value["installed_payload_sha256"] != digest(installed_payload(artifact, installed, context["component"])):
+        raise ValueError("package execution installed artifact binding differs")
+    if value["fixtures_sha256"] != digest(fixture_tree(workspace)):
+        raise ValueError("package assertion fixtures changed")
+    expected = {name: "sha256:" + hashlib.sha256(data).hexdigest()
+                for name, data in assertion_files(root, context["component"]).items()}
+    if fixture_tree(workspace) != expected:
+        raise ValueError("package assertions differ from the reviewed source mapping")
+    if value["test_dependencies_sha256"] != digest(dependencies(workspace, installed, context["component"])):
+        raise ValueError("package test dependencies changed")
+    return workspace
+
+
+
+def validate_workspace_boundary(workspace: Path, home: Path, installed: Path, root: Path) -> None:
+    if not workspace.is_relative_to(home) or workspace == home or workspace.is_relative_to(root.resolve()) or not installed.is_relative_to(workspace):
+        raise ValueError("package execution workspace is not run-isolated")
+
+def package_command(root: Path, context: dict, component_manifest: dict,
+                    artifact_root: Path, argv: list[str], env: dict) -> tuple[list[str], dict, Path, dict]:
+    path = safe_path(Path(os.environ["IICP_PRE1_PACKAGE_EXECUTION_BINDING"]))
+    value = json.loads(path.read_text())
+    if value.get("binding_sha256") != os.environ.get("IICP_PRE1_PACKAGE_EXECUTION_SHA256"):
+        raise ValueError("package execution binding pin differs")
+    if context["component"] == "client-rust":
+        return rust_package_command(root, context, component_manifest, artifact_root, argv, env, value)
+    if context["component"] == "management":
+        rows = [r for r in component_manifest["artifacts"] if r["kind"] == "crate"]
+        if len(rows) != 1:
+            raise ValueError("Management candidate crate is ambiguous")
+        artifact = safe_path(artifact_root / "management" / rows[0]["name"])
+        if file_digest(artifact) != rows[0]["sha256"]:
+            raise ValueError("Management candidate crate digest differs")
+        consumer = validate_management_binding(value, context, artifact, root)
+        home = safe_path(Path(env["HOME"]))
+        cargo_home = home / "rust-cargo-home"
+        cargo_home.mkdir(mode=0o700, exist_ok=True)
+        reject_inherited_cargo_config(home, safe_path(cargo_home))
+        env = {**env, "CARGO_HOME": str(cargo_home), "CARGO_NET_OFFLINE": "true", "CARGO_INCREMENTAL": "0"}
+        argv = [*argv[:3], "--offline", *argv[3:]]
+        return argv, env, consumer, {"value": value, "artifact": artifact, "vendor_artifact": None}
+    kind = "wheel" if context["component"] == "client-python" else "npm-tarball"
+    artifacts = [r for r in component_manifest["artifacts"] if r["kind"] == kind]
+    if len(artifacts) != 1:
+        raise ValueError("candidate SDK install artifact is ambiguous")
+    artifact = artifact_root / context["component"] / artifacts[0]["name"]
+    workspace = validate_binding(value, context, artifact, root)
+    if context["component"] == "client-python":
+        argv = [*argv[:3], "-p", "pre1_origin_guard", *argv[3:]]
+        env["PYTHONPATH"] = os.pathsep.join((str(Path(value["installed_package"]).parent), str(workspace)))
+        env["IICP_PRE1_INSTALLED_PACKAGE"] = value["installed_package"]
+        env["PYTHONNOUSERSITE"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+    else:
+        expected = workspace / "node_modules/@iicp/client"
+        if Path(value["installed_package"]) != expected:
+            raise ValueError("TypeScript installed module path differs")
+    return argv, env, workspace, {"value": value, "artifact": artifact}
+
+
+def execution_summary(value: dict) -> dict:
+    """Portable evidence; private execution paths never enter a receipt."""
+    keys = ("component", "runtime", "target", "bindings", "artifact_sha256",
+            "installed_payload_sha256", "fixtures_sha256", "test_dependencies_sha256")
+    return {"schema": "iicp.pre1-package-execution-summary.v1",
+            **{key: value[key] for key in keys},
+            "package_execution_sha256": value["binding_sha256"],
+            "non_authorizing": True}
+
+
+def make_case_proof(value: dict, context: dict, assertion: str, exit_code: int,
+                    run_id: str) -> dict:
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        raise ValueError("case proof exit code is invalid")
+    if not isinstance(run_id, str) or not re.fullmatch(r"[a-zA-Z0-9._-]+", run_id):
+        raise ValueError("case proof run identifier is invalid")
+    if not isinstance(assertion, str) or not assertion:
+        raise ValueError("case proof assertion is missing")
+    result = {"schema": "iicp.pre1-packaged-case-proof.v2", "run_id": run_id,
+              "execution": execution_summary(value), "context": context,
+              "assertion": assertion, "exit_code": exit_code,
+              "non_authorizing": True, "proof_sha256": None}
+    result["proof_sha256"] = digest(result)
+    return result
+
+
+def validate_case_proof(value: dict, context: dict, exit_code: int,
+                        run_id: str, expected_execution: dict | None = None,
+                        expected_assertion: str | None = None) -> None:
+    validate_case_proof_identity(value)
+    validate_proof_result(value, context, exit_code, run_id)
+    summary = value["execution"]
+    if expected_execution is not None and summary != expected_execution:
+        raise ValueError("case proof installed execution differs")
+    validate_execution_summary(summary, context)
+    validate_proof_assertion(value, expected_assertion)
+
+
+def validate_case_proof_identity(value: dict) -> None:
+    fields = {"schema", "run_id", "execution", "context", "assertion", "exit_code",
+              "non_authorizing", "proof_sha256"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("case proof fields differ")
+    copy = {**value, "proof_sha256": None}
+    if value["schema"] != "iicp.pre1-packaged-case-proof.v2" or value["proof_sha256"] != digest(copy):
+        raise ValueError("case proof schema or digest differs")
+    validate_proof_result_fields(value)
+
+
+
+def validate_proof_result(value: dict, context: dict, exit_code: int, run_id: str) -> None:
+    if value["context"] != context or value["exit_code"] != exit_code or value["run_id"] != run_id:
+        raise ValueError("case proof execution context or result differs")
+
+
+def validate_proof_assertion(value: dict, expected_assertion: str | None) -> None:
+    if not isinstance(value["assertion"], str) or not value["assertion"]:
+        raise ValueError("case proof assertion is missing")
+    if expected_assertion is not None and value["assertion"] != expected_assertion:
+        raise ValueError("case proof assertion differs from the owned mapping")
+
+
+
+def validate_proof_result_fields(value: dict) -> None:
+    if not isinstance(value["exit_code"], int) or isinstance(value["exit_code"], bool) or value["non_authorizing"] is not True:
+        raise ValueError("case proof authority or exit code differs")
+    if not isinstance(value["run_id"], str) or not re.fullmatch(r"[a-zA-Z0-9._-]+", value["run_id"]):
+        raise ValueError("case proof run identifier is invalid")
+def validate_execution_summary(summary: dict, context: dict) -> None:
+    validate_summary_identity(summary)
+    if any(summary[key] != context[key] for key in ("component", "runtime", "target")):
+        raise ValueError("package execution summary target differs")
+    if summary["bindings"] != {key: context[key] for key in BINDINGS}:
+        raise ValueError("package execution summary immutable bindings differ")
+
+
+def validate_summary_identity(summary: dict) -> None:
+    fields = {"schema", "component", "runtime", "target", "bindings",
+              "artifact_sha256", "installed_payload_sha256", "fixtures_sha256",
+              "test_dependencies_sha256", "package_execution_sha256", "non_authorizing"}
+    if not isinstance(summary, dict) or set(summary) != fields:
+        raise ValueError("package execution summary fields differ")
+    if summary["schema"] != "iicp.pre1-package-execution-summary.v1" or summary["non_authorizing"] is not True:
+        raise ValueError("package execution summary schema or authority differs")
+    for key in fields - {"schema", "component", "runtime", "target", "bindings", "non_authorizing"}:
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", str(summary[key])) is None:
+            raise ValueError("package execution summary digest is invalid")
+
+
+def write_case_proof(value: dict) -> Path:
+    """Publish a complete sidecar atomically, without overwriting earlier evidence."""
+    path = Path(os.environ["IICP_PRE1_CASE_PROOF_OUTPUT"])
+    home = safe_path(Path(os.environ["HOME"]))
+    parent = safe_path(path.parent)
+    if not path.is_absolute() or not parent.is_relative_to(home) or path.exists() or path.is_symlink():
+        raise ValueError("case proof output is unsafe or already exists")
+    descriptor, temporary = tempfile.mkstemp(prefix=".case-proof-", dir=parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return path
+
+
+# Rust uses the unchanged crate payload, including its packaged assertions.
+# The vendor bundle supplies only dependency/config files, never runtime source.
+def rust_archive_files(artifact: Path, prefix: str) -> dict[str, str]:
+    safe_path(artifact)
+    result, seen, total = {}, set(), 0
+    with tarfile.open(artifact, "r|gz") as archive:
+        for row in archive:
+            name = row.name.rstrip("/")
+            total = validate_rust_archive_member(row, name, seen, total)
+            if row.isfile() and name.startswith(prefix):
+                handle = archive.extractfile(row)
+                if handle is None:
+                    raise ValueError("Rust archive member is unavailable")
+                h = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    h.update(chunk)
+                result[name.removeprefix(prefix)] = "sha256:" + h.hexdigest()
+    if not result:
+        raise ValueError("Rust archive payload is empty")
+    return result
+
+
+
+
+def validate_rust_archive_name(name):
+    if not name or name.startswith("/") or "\\" in name or ":" in name:
+        raise ValueError("Rust archive contains an unsafe member name")
+    if any(part in {"", ".", ".."} for part in name.split("/")):
+        raise ValueError("Rust archive contains an unsafe member path")
+
+
+def validate_rust_archive_member(row, name, seen, total):
+    validate_rust_archive_name(name)
+    if name in seen or not (row.isfile() or row.isdir()):
+        raise ValueError("Rust archive contains an unsafe or duplicate member")
+    seen.add(name)
+    total += row.size
+    if len(seen) > 20000 or total > 1024 * 1024 * 1024:
+        raise ValueError("Rust archive exceeds bounded extraction limits")
+    return total
+
+
+def rust_dependencies(workspace: Path) -> dict[str, str]:
+    return {**{"vendor/" + k: v for k, v in tree(workspace / "vendor").items()},
+            **{".cargo/" + k: v for k, v in tree(workspace / ".cargo").items()}}
+
+
+def verify_rust_payload(workspace, installed, artifact, vendor_artifact):
+    if vendor_artifact is None:
+        raise ValueError("Rust vendor artifact must be candidate-bound")
+    crate = rust_archive_files(artifact, artifact.stem + "/")
+    if tree(installed) != crate:
+        raise ValueError("installed Rust SDK differs from the frozen crate")
+    source = rust_archive_files(vendor_artifact, "source/")
+    if source != crate:
+        raise ValueError("Rust vendor source differs from the frozen crate")
+    vendor = rust_archive_files(vendor_artifact, "vendor/")
+    config = rust_archive_files(vendor_artifact, ".cargo/")
+    expected = {**{"vendor/" + k: v for k, v in vendor.items()},
+                **{".cargo/" + k: v for k, v in config.items()}}
+    if rust_dependencies(workspace) != expected:
+        raise ValueError("Rust vendor dependencies/config differ from the candidate")
+    return crate, expected
+
+
+def rust_fixtures(root: Path, installed: Path) -> dict[str, str]:
+    mapping = "qualification/pre1-cases.json"
+    if (installed / mapping).read_bytes() != (root / mapping).read_bytes():
+        raise ValueError("Rust packaged assertion mapping differs from reviewed source")
+    return {mapping: file_digest(installed / mapping),
+            **{"tests/" + k: v for k, v in tree(installed / "tests").items()}}
+
+
+def create_rust_binding(root, workspace, installed, artifact, runtime, target, bindings, vendor_artifact):
+    validate_immutable_bindings(bindings)
+    validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])),
+                               safe_path(installed), root)
+    payload, deps = verify_rust_payload(workspace, installed, artifact, vendor_artifact)
+    value = {"schema": SCHEMA, "component": "client-rust", "runtime": runtime,
+        "target": target, "bindings": bindings, "workspace": str(workspace),
+        "installed_package": str(installed), "artifact_sha256": file_digest(artifact),
+        "vendor_artifact_sha256": file_digest(vendor_artifact),
+        "installed_payload_sha256": digest(payload),
+        "fixtures_sha256": digest(rust_fixtures(root, installed)),
+        "test_dependencies_sha256": digest(deps), "binding_sha256": None,
+        "assertion_adapter": "canonical-runtime-verifier-and-cli.v1",
+        "non_authorizing": True, "qualification_credit": False}
+    value["binding_sha256"] = digest(value)
+    return value
+
+
+def validate_rust_binding(value, context, artifact, root, vendor_artifact):
+    validate_binding_identity(value)
+    validate_binding_context(value, context)
+    workspace = safe_path(Path(value["workspace"]))
+    installed = safe_path(Path(value["installed_package"]))
+    validate_workspace_boundary(workspace, safe_path(Path(os.environ["HOME"])), installed, root)
+    payload, deps = verify_rust_payload(workspace, installed, artifact, vendor_artifact)
+    expected = {"artifact_sha256": file_digest(artifact),
+                "vendor_artifact_sha256": file_digest(vendor_artifact),
+                "installed_payload_sha256": digest(payload),
+                "test_dependencies_sha256": digest(deps),
+                "fixtures_sha256": digest(rust_fixtures(root, installed))}
+    if any(value.get(k) != v for k, v in expected.items()):
+        raise ValueError("Rust package execution inputs changed")
+    return installed
+
+
+def rust_artifacts(component, artifact_root):
+    paths = []
+    for kind in ("crate", "vendored-offline-package"):
+        rows = [row for row in component["artifacts"] if row["kind"] == kind]
+        if len(rows) != 1:
+            raise ValueError("Rust candidate artifact is ambiguous")
+        path = safe_path(artifact_root / "client-rust" / rows[0]["name"])
+        if file_digest(path) != rows[0]["sha256"]:
+            raise ValueError("Rust candidate artifact digest differs")
+        paths.append(path)
+    return paths
+
+
+def rust_package_command(root, context, component, artifact_root, argv, env, value):
+    artifact, vendor = rust_artifacts(component, artifact_root)
+    installed = validate_binding(value, context, artifact, root, vendor)
+    workspace = safe_path(Path(value["workspace"]))
+    home = safe_path(Path(env["HOME"]))
+    cargo_home = home / "rust-cargo-home"
+    cargo_home.mkdir(mode=0o700, exist_ok=True)
+    safe_path(cargo_home)
+    target = home / "rust-build" / context["runtime"]
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe_path(target)
+    env = {**env, "CARGO_HOME": str(cargo_home), "CARGO_TARGET_DIR": str(target),
+           "CARGO_NET_OFFLINE": "true", "CARGO_INCREMENTAL": "0"}
+    # Cargo can otherwise discover unrelated configs above the run workspace.
+    if workspace.parent != home or installed.parent != workspace:
+        raise ValueError("Rust package workspace layout differs")
+    reject_inherited_cargo_config(home, cargo_home)
+    argv = [*argv[:3], "--offline", *argv[3:]]
+    return argv, env, installed, {"value": value, "artifact": artifact, "vendor_artifact": vendor}
+
+
+
+def extract_rust_packages(artifact: Path, vendor_artifact: Path, workspace: Path) -> Path:
+    """Extract only into an empty caller-owned workspace after validating both archives."""
+    safe_path(workspace)
+    if any(workspace.iterdir()):
+        raise ValueError("Rust extraction workspace must be empty")
+    crate = rust_archive_files(artifact, artifact.stem + "/")
+    if crate != rust_archive_files(vendor_artifact, "source/"):
+        raise ValueError("Rust vendor source differs from the frozen crate")
+    rust_archive_files(vendor_artifact, "vendor/")
+    rust_archive_files(vendor_artifact, ".cargo/")
+    extract_rust_prefix(artifact, artifact.stem + "/", workspace / "source")
+    extract_rust_prefix(vendor_artifact, "vendor/", workspace / "vendor")
+    extract_rust_prefix(vendor_artifact, ".cargo/", workspace / ".cargo")
+    return safe_path(workspace / "source")
+
+
+def extract_rust_prefix(artifact: Path, prefix: str, destination: Path) -> None:
+    destination.mkdir(mode=0o700)
+    with tarfile.open(artifact, "r|gz") as archive:
+        for row in archive:
+            if not row.isfile() or not row.name.startswith(prefix):
+                continue
+            extract_rust_file(archive, row, prefix, destination)
+
+
+def extract_rust_file(archive, row, prefix, destination):
+    relative = row.name.removeprefix(prefix)
+    if Path(relative).is_absolute() or any(p in {"", ".", ".."} for p in relative.split("/")):
+        raise ValueError("Rust extraction path is unsafe")
+    path = destination / relative
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe_path(path.parent)
+    handle = archive.extractfile(row)
+    if handle is None:
+        raise ValueError("Rust extraction member is unavailable")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700 if row.mode & 0o111 else 0o600)
+    with os.fdopen(fd, "wb") as output:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            output.write(chunk)
+
+
+def reject_inherited_cargo_config(home, cargo_home):
+    for ancestor in (home, *home.parents):
+        for name in ("config", "config.toml"):
+            path = ancestor / ".cargo" / name
+            if path.exists() or path.is_symlink():
+                raise ValueError("Rust inherited Cargo configuration is forbidden")
+    if (cargo_home / "config").exists() or (cargo_home / "config.toml").exists():
+        raise ValueError("Rust inherited Cargo home configuration is forbidden")
+
+
+def management_consumer_files(root: Path, payload: Path) -> dict[str, bytes]:
+    """Keep frozen runtime source separate from reviewed external assertions.
+
+    Cargo disables automatic tests in the published Management crate. A
+    separate consumer manifest names only the existing mapped integration
+    fixtures and points its library/binaries at the untouched crate source.
+    No dependency, lockfile, assertion or runtime source is rewritten.
+    """
+    root, payload = safe_path(root), safe_path(payload)
+    mapping = safe_path(root / "qualification/pre1-cases.json")
+    cases = json.loads(mapping.read_text())
+    if cases.get("component") != "management" or cases.get("schema") != "iicp.pre1-component-case-map.v2":
+        raise ValueError("Management consumer case map differs")
+    names = set()
+    for case in [cases["support"], *cases["scenarios"].values()]:
+        command = case["command"]
+        if "--test" in command:
+            name = command[command.index("--test") + 1]
+            if not isinstance(name, str) or re.fullmatch(r"[a-z][a-z0-9_]*", name) is None:
+                raise ValueError("Management consumer test name is unsafe")
+            names.add(name)
+    tracked = set(subprocess.check_output(["git", "ls-files", "-z", "--", "tests"], cwd=root).decode().split("\0"))
+    files = {}
+    for name in sorted(names):
+        path = f"tests/{name}.rs"
+        if path not in tracked:
+            raise ValueError("Management consumer assertion is not Git-bound")
+        source = safe_path(root / path).read_text()
+        files[path] = management_assertions(path, source).encode()
+    for name in tree(payload):
+        if not name.startswith(("src/", "examples/")) and name != "Cargo.toml":
+            files[name] = (payload / name).read_bytes()
+    manifest = (payload / "Cargo.toml").read_text()
+    for path in re.findall(r'^path = "([^"\n]+)"$', manifest, flags=re.M):
+        validate_rust_archive_name(path)
+        if not path.startswith(("src/", "examples/")):
+            raise ValueError("Management consumer manifest source path differs")
+    manifest = re.sub(r'^path = "((?:src|examples)/[^"\n]+)"$',
+                      lambda match: f'path = "../payload/{match[1]}"', manifest, flags=re.M)
+    for name in sorted(names):
+        manifest += f'\n[[test]]\nname = "{name}"\npath = "tests/{name}.rs"\n'
+    files["Cargo.toml"] = manifest.encode()
+    return files
+
+
+def management_assertions(name, source):
+    """Validate pre-1 builder metadata; retain the older publisher assertions."""
+    if name != "tests/release_manifest.rs":
+        return source
+    marker = '    let manifest: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();'
+    optional = '    let Some(path) = env::var_os("IICP_RELEASE_MANIFEST") else {\n        return;\n    };'
+    if source.count(marker) != 1 or source.count(optional) != 1:
+        raise ValueError("Management release fixture shape differs")
+    branch = '''
+    if manifest["schema"] == "iicp.pre1-management-release-manifest.v1" {
+        let candidate: Value = serde_json::from_str(&fs::read_to_string(
+            env::var_os("IICP_PRE1_CANDIDATE_MANIFEST").expect("candidate required")
+        ).unwrap()).unwrap();
+        let component = candidate["components"].as_array().unwrap().iter()
+            .find(|row| row["id"] == "management").unwrap();
+        assert_eq!(manifest["source_commit"], component["source_commit"]);
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest["version"], component["version"]);
+        assert_eq!(manifest["product"], "iicp-management-core");
+        assert_eq!(manifest["channel"], "developer-preview");
+        assert_eq!(manifest["non_authorizing"], true);
+        for flag in ["publication_authorized", "deployment_authorized", "management_service", "directory_authority"] {
+            assert_eq!(manifest[flag], false);
+        }
+        assert_eq!(manifest["binaries"], json!(["iicp-management", "iicp-management-controller", "iicp-management-conformance"]));
+        assert_eq!(manifest.as_object().unwrap().len(), 11);
+        return;
+    }
+'''
+    return source.replace(optional, '    let path = env::var_os("IICP_RELEASE_MANIFEST").expect("release manifest required");').replace(marker, marker + branch)
+
+
+def stage_management_consumer(root: Path, artifact: Path, workspace: Path) -> dict:
+    """Prepare only; the caller owns dependency acquisition and isolation."""
+    root, artifact, workspace = safe_path(root), safe_path(artifact), safe_path(workspace)
+    home = safe_path(Path(os.environ["HOME"]))
+    if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root) or any(workspace.iterdir()):
+        raise ValueError("Management consumer workspace is not empty and run-isolated")
+    expected = rust_archive_files(artifact, artifact.stem + "/")
+    extract_rust_prefix(artifact, artifact.stem + "/", workspace / "payload")
+    payload = workspace / "payload"
+    if tree(payload) != expected:
+        raise ValueError("Management extracted crate differs")
+    files = management_consumer_files(root, payload)
+    consumer = workspace / "consumer"
+    consumer.mkdir(mode=0o700)
+    for name, data in files.items():
+        path = consumer / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return {"schema": "iicp.pre1-management-consumer.v1",
+            "artifact_sha256": file_digest(artifact), "payload_sha256": digest(expected),
+            "consumer_sha256": digest(tree(consumer)),
+            "non_authorizing": True, "qualification_credit": False}
+
+
+def validate_management_consumer(root: Path, artifact: Path, workspace: Path, binding: dict) -> Path:
+    """Recheck artifact and reviewed assertions, even after a forged rehash."""
+    workspace = safe_path(workspace)
+    home = safe_path(Path(os.environ["HOME"]))
+    if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root.resolve()):
+        raise ValueError("Management consumer workspace is not run-isolated")
+    payload = safe_path(workspace / "payload")
+    consumer = safe_path(workspace / "consumer")
+    expected = rust_archive_files(artifact, artifact.stem + "/")
+    actual = tree(consumer)
+    fixtures = {name: "sha256:" + hashlib.sha256(data).hexdigest()
+                for name, data in management_consumer_files(root, payload).items()}
+    if binding != {"schema": "iicp.pre1-management-consumer.v1",
+                   "artifact_sha256": file_digest(artifact), "payload_sha256": digest(expected),
+                   "consumer_sha256": digest(actual),
+                   "non_authorizing": True, "qualification_credit": False} or tree(payload) != expected or actual != fixtures:
+        raise ValueError("Management consumer artifact or reviewed fixtures changed")
+    return consumer
+
+
+def management_consumer_binding(artifact, workspace):
+    return {"schema": "iicp.pre1-management-consumer.v1",
+            "artifact_sha256": file_digest(artifact),
+            "payload_sha256": digest(rust_archive_files(artifact, artifact.stem + "/")),
+            "consumer_sha256": digest(tree(workspace / "consumer")),
+            "non_authorizing": True, "qualification_credit": False}
+
+
+def management_dependencies(workspace):
+    expected = ('[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
+                '[source.vendored-sources]\ndirectory = ' + json.dumps(str(workspace / "vendor")) + '\n')
+    if tree(workspace / ".cargo") != {"config.toml": "sha256:" + hashlib.sha256(expected.encode()).hexdigest()}:
+        raise ValueError("Management offline Cargo configuration differs")
+    return rust_dependencies(workspace)
+
+
+def create_management_binding(root, workspace, installed, artifact, runtime, target, bindings):
+    validate_immutable_bindings(bindings)
+    staged = management_consumer_binding(artifact, workspace)
+    if safe_path(installed) != validate_management_consumer(root, artifact, workspace, staged):
+        raise ValueError("Management consumer path differs")
+    value = {"schema": SCHEMA, "component": "management", "runtime": runtime,
+        "target": target, "bindings": bindings, "workspace": str(workspace),
+        "installed_package": str(installed), "artifact_sha256": staged["artifact_sha256"],
+        "installed_payload_sha256": staged["payload_sha256"],
+        "fixtures_sha256": staged["consumer_sha256"],
+        "test_dependencies_sha256": digest(management_dependencies(workspace)),
+        "binding_sha256": None, "assertion_adapter": "canonical-runtime-verifier-and-cli.v1",
+        "non_authorizing": True, "qualification_credit": False}
+    value["binding_sha256"] = digest(value)
+    return value
+
+
+def validate_management_binding(value, context, artifact, root):
+    validate_binding_identity(value)
+    validate_binding_context(value, context)
+    workspace = safe_path(Path(value["workspace"]))
+    expected = create_management_binding(root, workspace, Path(value["installed_package"]),
+        artifact, context["runtime"], context["target"], {key: context[key] for key in BINDINGS})
+    if value != expected:
+        raise ValueError("Management package execution inputs changed")
+    return safe_path(workspace / "consumer")
