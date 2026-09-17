@@ -778,7 +778,7 @@ def management_assertions(name, source):
             .find(|row| row["id"] == "management").unwrap();
         assert_eq!(manifest["source_commit"], component["source_commit"]);
         assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(manifest["version"], component["version"]);
+        assert_eq!(manifest["version"], component["source_version"]);
         assert_eq!(manifest["product"], "iicp-management-core");
         assert_eq!(manifest["channel"], "developer-preview");
         assert_eq!(manifest["non_authorizing"], true);

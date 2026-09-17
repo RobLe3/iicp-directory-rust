@@ -42,6 +42,8 @@ class PackageExecutionTests(unittest.TestCase):
         source = '    let Some(path) = env::var_os("IICP_RELEASE_MANIFEST") else {\n        return;\n    };\n    let manifest: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();\nassert_eq!(manifest["authorizes_deployment"], false);'
         staged = adapter.management_assertions("tests/release_manifest.rs", source)
         self.assertIn('component["source_commit"]', staged)
+        self.assertIn('component["source_version"]', staged)
+        self.assertNotIn('component["version"]', staged)
         self.assertIn('expect("release manifest required")', staged)
         self.assertIn('assert_eq!(manifest["authorizes_deployment"], false)', staged)
         self.assertIn('"management_service", "directory_authority"', staged)
