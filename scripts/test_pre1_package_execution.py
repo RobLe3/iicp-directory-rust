@@ -17,6 +17,193 @@ import pre1_package_execution as adapter
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def directory_inputs(self, component="directory-rust"):
+        import shutil
+        shutil.rmtree(self.workspace)
+        self.workspace.mkdir()
+        (self.root / "qualification").mkdir(exist_ok=True)
+        mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
+                   "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
+                     for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore"]}}
+        (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
+        if component == "directory-rust":
+            artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
+            header = bytearray(20)
+            header[:6] = b"\x7fELF\x02\x01"
+            header[18:20] = (183).to_bytes(2, "little")
+            artifact.write_bytes(header)
+        else:
+            artifact = self.home / "php.tar.gz"
+            with tarfile.open(artifact, "w:gz") as archive:
+                for name in ["artisan", "composer.json", "composer.lock", "app/runtime.php"]:
+                    data = name.encode()
+                    member = tarfile.TarInfo("iicp-directory-php-v1.10.94/" + name)
+                    member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+        installed = adapter.stage_directory_payload(artifact, self.workspace, component)
+        if component == "directory-php":
+            (installed / "vendor").mkdir()
+            (installed / "vendor/autoload.php").write_text("locked vendor")
+        value = adapter.create_binding(self.root, self.workspace, installed, artifact,
+            component, "php-8.3" if component == "directory-php" else "rust-1.98.0", "linux-aarch64", self.bindings)
+        context = {**self.context, "component": component, "runtime": value["runtime"],
+                   "target": "linux-aarch64", "mode": "local-only", "scenario_id": "config-missing"}
+        return artifact, installed, value, context
+
+    def test_directory_binary_binding_and_proof_are_candidate_bound(self):
+        artifact, installed, value, context = self.directory_inputs()
+        self.assertEqual(adapter.validate_binding(value, context, artifact, self.root), self.workspace)
+        proof = adapter.make_case_proof(value, context, "config-missing", 0, "directory-test")
+        adapter.validate_case_proof(proof, context, 0, "directory-test",
+            adapter.execution_summary(value), "config-missing")
+        self.assertFalse(value["qualification_credit"])
+        self.assertEqual((installed / "iicp-directory-rs").read_bytes(), artifact.read_bytes())
+
+    def test_directory_binary_rehashed_tamper_and_wrong_architecture_fail(self):
+        artifact, installed, value, context = self.directory_inputs()
+        binary = installed / "iicp-directory-rs"
+        binary.write_bytes(binary.read_bytes() + b"tamper")
+        value["installed_payload_sha256"] = adapter.digest(adapter.tree(installed))
+        value["binding_sha256"] = adapter.digest({**value, "binding_sha256": None})
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+        binary.write_bytes(artifact.read_bytes())
+        with self.assertRaisesRegex(ValueError, "architecture differs"):
+            adapter.create_binding(self.root, self.workspace, installed, artifact,
+                "directory-rust", "rust-1.98.0", "linux-x86_64", self.bindings)
+
+    def test_directory_fixtures_cannot_be_deleted_or_rehashed(self):
+        artifact, installed, value, context = self.directory_inputs()
+        (self.workspace / "directory-probe.py").unlink()
+        with self.assertRaisesRegex(ValueError, "fixtures changed"):
+            adapter.validate_binding(value, context, artifact, self.root)
+        self.assertFalse((self.workspace / "directory-probe.py").exists())
+        (self.workspace / "directory-probe.py").write_text("fake success")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+
+    def test_directory_binary_modes_and_extra_runtime_files_fail(self):
+        artifact, installed, value, context = self.directory_inputs()
+        binary = installed / "iicp-directory-rs"
+        binary.chmod(0o755)
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+        binary.chmod(0o700)
+        (installed / "fallback-runtime").write_text("checkout substitute")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+
+    def test_directory_archive_source_and_vendor_are_separately_bound(self):
+        artifact, installed, value, context = self.directory_inputs("directory-php")
+        self.assertEqual(adapter.validate_binding(value, context, artifact, self.root), self.workspace)
+        (installed / "storage").mkdir(exist_ok=True)
+        (installed / "storage/log.txt").write_text("volatile test log")
+        adapter.validate_binding(value, context, artifact, self.root)
+        (installed / "app/runtime.php").write_text("checkout fallback")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+
+    def test_directory_archive_vendor_tamper_and_symlinks_fail(self):
+        artifact, installed, value, context = self.directory_inputs("directory-php")
+        (installed / "vendor/autoload.php").write_text("unlocked dependencies")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+        (installed / "vendor/autoload.php").unlink()
+        (installed / "vendor/autoload.php").symlink_to(self.root / "src/runtime.py")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+
+    def test_directory_php_guard_checks_real_namespace_prefixes_and_cache_tamper(self):
+        self.assertIn("'App\\\\'", adapter.DIRECTORY_ORIGIN)
+        self.assertIn("'Tests\\\\'", adapter.DIRECTORY_ORIGIN)
+        self.assertIn("'Database\\\\'", adapter.DIRECTORY_ORIGIN)
+        self.assertIn("str_starts_with(realpath($file), $expected)", adapter.DIRECTORY_ORIGIN)
+        self.assertNotIn("str_starts_with(realpath($file), $root . DIRECTORY_SEPARATOR)", adapter.DIRECTORY_ORIGIN)
+        artifact, installed, value, context = self.directory_inputs("directory-php")
+        (installed / "bootstrap/cache").mkdir(parents=True, exist_ok=True)
+        (installed / "bootstrap/cache/services.php").write_text("unbound executable cache")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
+
+    def test_directory_archive_provisions_private_runtime_directories(self):
+        import stat
+        artifact, installed, value, context = self.directory_inputs("directory-php")
+        for name in ("bootstrap/cache", "storage/logs", "storage/framework/cache/data",
+                     "storage/framework/sessions", "storage/framework/views"):
+            path = installed / name
+            self.assertTrue(path.is_dir())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+        self.assertEqual(adapter.validate_binding(value, context, artifact, self.root), self.workspace)
+
+    def test_directory_runtime_paths_refuse_symlink_and_file(self):
+        import shutil
+        artifact, installed, value, context = self.directory_inputs("directory-php")
+        cache = installed / "bootstrap/cache"
+        shutil.rmtree(cache)
+        cache.symlink_to(self.home, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            adapter.provision_directory_runtime_paths(installed)
+        cache.unlink()
+        cache.write_text("not a directory")
+        with self.assertRaisesRegex(ValueError, "not a directory"):
+            adapter.provision_directory_runtime_paths(installed)
+
+    def test_directory_php_probe_self_report_and_junit_fail_closed(self):
+        import sys
+        artifact, installed, value, context = self.directory_inputs("directory-php")
+        probe = self.workspace / "directory-probe.py"
+        runtime = self.home / "fake-php"
+        runtime.write_text("#!" + sys.executable + "\n" +
+            "import sys, os\nfrom pathlib import Path\n" +
+            "p = Path(sys.argv[sys.argv.index('--log-junit') + 1])\n" +
+            "p.write_text(os.environ.get('FAKE_JUNIT', '<testsuite><testcase name=\"package-version-self-report\"/></testsuite>'))\n")
+        runtime.chmod(0o700)
+        context["scenario_id"] = "package-version-self-report"
+        env = {**os.environ, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context),
+               "IICP_PRE1_DIRECTORY_INSTALLED": str(installed), "IICP_PRE1_DIRECTORY_PHP": str(runtime)}
+        for document, expected in [
+            ('<testsuite><testcase name="package-version-self-report"/></testsuite>', 0),
+            ('<testsuite><testcase name="package-version-self-report"><skipped/></testcase></testsuite>', 1),
+            ('<testsuite><testcase name="wrong"/></testsuite>', 1),
+            ('<testsuite><testcase name="package-version-self-report"/><testcase name="extra"/></testsuite>', 1),
+        ]:
+            (self.workspace / "directory-junit.xml").unlink(missing_ok=True)
+            # The child environment is intentionally sanitized; vary the fake
+            # runtime itself instead of relying on inherited environment values.
+            runtime.write_text("#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n" +
+                "Path(sys.argv[sys.argv.index('--log-junit') + 1]).write_text(" + repr(document) + ")\n")
+            result = subprocess.run([sys.executable, "-I", "-S", str(probe), "package-version-self-report"],
+                cwd=self.workspace, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertEqual("IICP_PRE1_DIRECTORY_ASSERTION_PASS" in result.stdout, expected == 0)
+
+    def test_directory_archive_refuses_links_traversal_and_multiple_roots(self):
+        for name, kind in [("../escape", "file"), ("iicp-directory-php-v1.10.94/link", "link"), ("other/root", "file")]:
+            artifact = self.home / "unsafe.tar.gz"
+            with tarfile.open(artifact, "w:gz") as archive:
+                member = tarfile.TarInfo(name)
+                if kind == "link":
+                    member.type, member.linkname = tarfile.SYMTYPE, "/outside"
+                archive.addfile(member)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                adapter.directory_archive_payload(artifact)
+
+    def test_directory_unimplemented_case_and_modes_never_use_checkout_commands(self):
+        artifact, installed, value, context = self.directory_inputs()
+        manifest = {"source_version": "0.1.15", "artifacts": [{"name": artifact.name,
+            "kind": "release-artifact", "target": "linux-aarch64", "sha256": adapter.file_digest(artifact)}]}
+        artifact_root = self.home / "artifacts"
+        (artifact_root / "directory-rust").mkdir(parents=True)
+        import shutil
+        shutil.copyfile(artifact, artifact_root / "directory-rust" / artifact.name)
+        for mutation in [{"mode": "restricted"}, {"mode": "public"}, {"scenario_id": "backup-restore"}]:
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                adapter.directory_package_command(self.root, {**context, **mutation}, manifest, artifact_root, {}, value)
+        argv, env, cwd, proof = adapter.directory_package_command(self.root, context, manifest, artifact_root, {}, value)
+        self.assertEqual(cwd, self.workspace)
+        self.assertNotIn("cargo", argv)
+        self.assertNotIn(str(self.root), " ".join(argv))
+
     def management_artifact(self):
         self.workspace = self.home / "run/management"
         self.workspace.mkdir(parents=True)

@@ -1,4 +1,4 @@
-"""Bind staged assertions to byte-verified installed frozen SDK payloads.
+"""Bind staged assertions to byte-verified installed frozen component payloads.
 
 Preparation never installs dependencies or grants qualification credit. The
 caller owns network isolation, runtime selection and workspace lifetime.
@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -299,6 +300,8 @@ def validate_immutable_bindings(bindings: dict) -> None:
 def create_binding(root: Path, workspace: Path, installed: Path, artifact: Path,
                    component: str, runtime: str, target: str, bindings: dict,
                    vendor_artifact: Path | None = None) -> dict:
+    if component in {"directory-php", "directory-rust"}:
+        return create_directory_binding(root, workspace, installed, artifact, component, runtime, target, bindings)
     if component == "management":
         return create_management_binding(root, workspace, installed, artifact, runtime, target, bindings)
     if component == "client-rust":
@@ -343,6 +346,8 @@ def validate_binding_context(value: dict, context: dict) -> None:
 
 def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
                      vendor_artifact: Path | None = None) -> Path:
+    if context["component"] in {"directory-php", "directory-rust"}:
+        return validate_directory_binding(value, context, artifact, root)
     if context["component"] == "management":
         return validate_management_binding(value, context, artifact, root)
     if context["component"] == "client-rust":
@@ -377,6 +382,8 @@ def package_command(root: Path, context: dict, component_manifest: dict,
     value = json.loads(path.read_text())
     if value.get("binding_sha256") != os.environ.get("IICP_PRE1_PACKAGE_EXECUTION_SHA256"):
         raise ValueError("package execution binding pin differs")
+    if context["component"] in {"directory-php", "directory-rust"}:
+        return directory_package_command(root, context, component_manifest, artifact_root, env, value)
     if context["component"] == "client-rust":
         return rust_package_command(root, context, component_manifest, artifact_root, argv, env, value)
     if context["component"] == "management":
@@ -879,3 +886,270 @@ def validate_management_binding(value, context, artifact, root):
     if value != expected:
         raise ValueError("Management package execution inputs changed")
     return safe_path(workspace / "consumer")
+
+# Directory adapters deliberately refuse unimplemented cases and modes. A
+# source-test command is never used as a fallback for a released binary.
+DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+context = json.loads(os.environ["IICP_PRE1_EXECUTION_CONTEXT"])
+component, scenario = context["component"], context["scenario_id"]
+if context["mode"] != "local-only":
+    raise ValueError("Directory packaged mode is not implemented")
+installed = Path(os.environ["IICP_PRE1_DIRECTORY_INSTALLED"])
+assertion = sys.argv[1]
+env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP") if k in os.environ}
+env.update(APP_ENV="testing", NO_COLOR="1")
+if component == "directory-rust":
+    argv = [str(installed / "iicp-directory-rs")]
+    if scenario == "package-version-self-report":
+        argv.append("--version")
+        expected = "iicp-directory-rs " + os.environ["IICP_PRE1_DIRECTORY_VERSION"]
+        expected_code = 0
+    elif scenario == "config-missing":
+        expected = "DATABASE_URL is required"
+        expected_code = 1
+    elif scenario == "config-malformed":
+        env.update(IICP_ALLOW_IN_MEMORY="true", IICP_REPLICA_MODE="true",
+            IICP_SEED_URL="https://seed.invalid/v1", IICP_SEED_DID="did:web:seed.invalid",
+            IICP_REPLICA_DID="did:web:replica.invalid", IICP_REPLICA_ENDPOINT="https://replica.invalid/v1",
+            IICP_DIRECTORY_DID="did:web:other.invalid")
+        expected = "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID"
+        expected_code = 1
+    else:
+        raise ValueError("Directory packaged scenario is not implemented")
+else:
+    mapping = json.loads(Path("directory-case-map.json").read_text())
+    case = mapping["support"] if scenario == "support" else mapping["scenarios"][scenario]
+    argv = [os.environ["IICP_PRE1_DIRECTORY_PHP"], *case["command"][1:]]
+    if case["command"][0] != "@php" or case["assertion"] != assertion:
+        raise ValueError("structural Python checks are not packaged Directory operations")
+    report = Path("directory-junit.xml").resolve()
+    if report.exists():
+        raise ValueError("Directory case result already exists")
+    argv.extend(["--do-not-cache-result", "--bootstrap", str(Path("directory-origin.php").resolve()),
+                 "--log-junit", str(report)])
+    env.update(PRE1_DIRECTORY_INSTALLED=str(installed))
+    expected_code, expected = 0, None
+limit = 32 * 1024 * 1024
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+with tempfile.NamedTemporaryFile(prefix="directory-output-", dir=Path.cwd(), delete=False) as log:
+    output_file = Path(log.name)
+    process = subprocess.Popen(argv, cwd=installed, env=env, stdout=log, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    try:
+        process.wait(timeout=180)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=10)
+    size = log.tell()
+    if size > 32 * 1024 * 1024:
+        raise ValueError("Directory case output exceeds the diagnostic bound")
+    log.seek(0)
+    output = log.read().decode("utf-8", errors="replace")
+if process.returncode != expected_code or (expected is not None and expected not in output) or (
+    component == "directory-rust" and scenario == "package-version-self-report" and output.strip() != expected
+):
+    raise ValueError("Directory packaged postcondition failed")
+if component == "directory-php":
+    document = ET.parse(report)
+    cases = list(document.iter("testcase"))
+    if len(cases) != 1 or cases[0].get("name") != assertion or any(
+        list(document.iter(tag)) for tag in ("skipped", "failure", "error")
+    ):
+        raise ValueError("Directory exact assertion did not pass once without skips")
+    report.unlink()
+output_file.unlink()
+print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+'''
+DIRECTORY_ORIGIN = r'''<?php
+$root = realpath(getenv('PRE1_DIRECTORY_INSTALLED'));
+if (!$root) { throw new RuntimeException('Directory package root unavailable'); }
+require $root . '/vendor/autoload.php';
+register_shutdown_function(function () use ($root) {
+    foreach (get_declared_classes() as $class) {
+        $expected = null;
+        foreach (['App\\' => 'app', 'Tests\\' => 'tests', 'Database\\' => 'database'] as $prefix => $directory) {
+            if (str_starts_with($class, $prefix)) {
+                $expected = $root . DIRECTORY_SEPARATOR . $directory . DIRECTORY_SEPARATOR;
+                break;
+            }
+        }
+        if ($expected !== null) {
+            $file = (new ReflectionClass($class))->getFileName();
+            if (!$file || !str_starts_with(realpath($file), $expected)) {
+                fwrite(STDERR, "Directory application class escaped packaged origin\n");
+                exit(2);
+            }
+        }
+    }
+});
+'''
+
+
+def directory_archive_payload(artifact):
+    files = rust_archive_files(artifact, "")
+    prefixes = {name.split("/", 1)[0] for name in files}
+    if len(prefixes) != 1:
+        raise ValueError("Directory archive must have one package root")
+    prefix = prefixes.pop() + "/"
+    if not re.fullmatch(r"iicp-directory-php-v\d+\.\d+\.\d+/", prefix):
+        raise ValueError("Directory archive package root differs")
+    result = {name.removeprefix(prefix): value for name, value in files.items()}
+    if not {"artisan", "composer.json", "composer.lock"}.issubset(result) or any(
+        name.startswith("vendor/") for name in result
+    ):
+        raise ValueError("Directory archive lacks locked source or contains vendor")
+    return result
+
+
+def stage_directory_payload(artifact, workspace, component):
+    workspace = safe_path(workspace)
+    home = safe_path(Path(os.environ["HOME"]))
+    if workspace == home or not workspace.is_relative_to(home) or list(workspace.iterdir()):
+        raise ValueError("Directory staging requires an empty run workspace")
+    safe_path(artifact)
+    installed = workspace / "payload"
+    if component == "directory-rust":
+        installed.mkdir(mode=0o700)
+        (installed / "iicp-directory-rs").write_bytes(artifact.read_bytes())
+        (installed / "iicp-directory-rs").chmod(0o700)
+    elif component == "directory-php":
+        expected = directory_archive_payload(artifact)
+        installed.mkdir(mode=0o700)
+        with tarfile.open(artifact, "r:gz") as archive:
+            for row in archive:
+                if row.isfile():
+                    name = row.name.split("/", 1)[1]
+                    if name not in expected:
+                        raise ValueError("Directory archive contains an unexpected member")
+                    dest = installed / name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    handle = archive.extractfile(row)
+                    if handle is None:
+                        raise ValueError("Directory archive member unavailable")
+                    with dest.open("xb") as output:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            output.write(chunk)
+                    dest.chmod(0o600)
+        if tree(installed) != expected:
+            raise ValueError("Directory staged archive differs")
+        provision_directory_runtime_paths(installed)
+    else:
+        raise ValueError("Directory staging component differs")
+    return installed
+
+
+def provision_directory_runtime_paths(installed):
+    # Release archives need not contain empty runtime directories. Provision
+    # only Laravel's private writable paths before Composer's locked scripts
+    # execute; these are not alternate application or dependency sources.
+    for relative in ("bootstrap/cache", "storage/logs", "storage/framework/cache/data",
+                     "storage/framework/sessions", "storage/framework/views"):
+        directory = installed
+        for part in relative.split("/"):
+            directory = directory / part
+            if directory.exists() or directory.is_symlink():
+                safe_path(directory)
+                if not directory.is_dir():
+                    raise ValueError("Directory runtime path is not a directory")
+            else:
+                directory.mkdir(mode=0o700)
+
+
+def directory_fixtures(root, component):
+    result = {"directory-probe.py": DIRECTORY_PROBE.encode(),
+              "directory-case-map.json": safe_path(root / "qualification/pre1-cases.json").read_bytes()}
+    if component == "directory-php":
+        result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
+    return result
+
+
+def directory_payload(artifact, installed, component, target):
+    files = tree(installed)
+    if component == "directory-rust":
+        binary = safe_path(installed / "iicp-directory-rs")
+        with binary.open("rb") as handle:
+            header = handle.read(20)
+        machine = {"linux-aarch64": 183, "linux-x86_64": 62}.get(target)
+        if len(header) != 20 or header[:6] != b"\x7fELF\x02\x01" or machine is None or int.from_bytes(header[18:20], "little") != machine:
+            raise ValueError("Directory binary architecture differs")
+        if stat.S_IMODE(binary.stat().st_mode) != 0o700 or files != {"iicp-directory-rs": file_digest(artifact)}:
+            raise ValueError("Directory installed binary differs")
+        return files, {}
+    expected = directory_archive_payload(artifact)
+    volatile = ("vendor/", "storage/", "bootstrap/cache/")
+    immutable = {k: v for k, v in files.items() if not k.startswith(volatile)}
+    if immutable != {k: v for k, v in expected.items() if not k.startswith(volatile)}:
+        raise ValueError("Directory installed archive differs")
+    deps = {"vendor/" + k: v for k, v in tree(safe_path(installed / "vendor")).items()}
+    cache = installed / "bootstrap/cache"
+    if cache.exists() or cache.is_symlink():
+        deps.update({"bootstrap-cache/" + k: v for k, v in tree(safe_path(cache)).items()})
+    return immutable, deps
+
+
+def create_directory_binding(root, workspace, installed, artifact, component, runtime, target, bindings, *, stage_fixtures=True):
+    validate_immutable_bindings(bindings)
+    validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])), safe_path(installed), root)
+    payload, deps = directory_payload(artifact, installed, component, target)
+    fixtures = directory_fixtures(root, component)
+    for name, data in fixtures.items():
+        dest = workspace / name
+        if not dest.exists() and stage_fixtures:
+            with dest.open("xb") as output:
+                output.write(data)
+            dest.chmod(0o600)
+        if not dest.exists() or dest.is_symlink() or dest.read_bytes() != data:
+            raise ValueError("Directory packaged fixtures changed")
+    value = {"schema": SCHEMA, "component": component, "runtime": runtime, "target": target,
+        "bindings": bindings, "workspace": str(workspace), "installed_package": str(installed),
+        "artifact_sha256": file_digest(artifact), "installed_payload_sha256": digest(payload),
+        "fixtures_sha256": digest({k: "sha256:" + hashlib.sha256(v).hexdigest() for k, v in fixtures.items()}),
+        "test_dependencies_sha256": digest(deps), "binding_sha256": None,
+        "assertion_adapter": "canonical-runtime-verifier-and-cli.v1",
+        "non_authorizing": True, "qualification_credit": False}
+    value["binding_sha256"] = digest(value)
+    return value
+
+
+def validate_directory_binding(value, context, artifact, root):
+    validate_binding_identity(value)
+    validate_binding_context(value, context)
+    expected = create_directory_binding(root, Path(value["workspace"]), Path(value["installed_package"]),
+        artifact, context["component"], context["runtime"], context["target"], {k: context[k] for k in BINDINGS}, stage_fixtures=False)
+    if value != expected:
+        raise ValueError("Directory package execution inputs changed")
+    return safe_path(Path(value["workspace"]))
+
+
+def directory_package_command(root, context, component_manifest, artifact_root, env, value):
+    component, scenario = context["component"], context["scenario_id"]
+    if context["mode"] != "local-only":
+        raise ValueError("Directory packaged mode remains unimplemented")
+    kind = "release-artifact" if component == "directory-rust" else "release-archive"
+    rows = [r for r in component_manifest["artifacts"] if r["kind"] == kind and r["target"] in {context["target"], "any"}]
+    if len(rows) != 1:
+        raise ValueError("Directory execution artifact is ambiguous")
+    artifact = safe_path(artifact_root / component / rows[0]["name"])
+    if file_digest(artifact) != rows[0]["sha256"]:
+        raise ValueError("Directory candidate artifact digest differs")
+    workspace = validate_directory_binding(value, context, artifact, root)
+    mapping = json.loads((workspace / "directory-case-map.json").read_text())
+    case = mapping["support"] if scenario == "support" else mapping["scenarios"][scenario]
+    if component == "directory-rust" and scenario not in {"package-version-self-report", "config-missing", "config-malformed"}:
+        raise ValueError("Directory black-box scenario remains unimplemented")
+    if component == "directory-php" and case["command"][0] != "@php":
+        raise ValueError("Directory structural checks are not packaged operation evidence")
+    env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
+           "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
+           "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"]}
+    if component == "directory-php":
+        runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
+        env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
+    argv = [sys.executable, "-I", "-S", str(workspace / "directory-probe.py"), case["assertion"]]
+    return argv, env, workspace, {"value": value, "artifact": artifact, "vendor_artifact": None}
