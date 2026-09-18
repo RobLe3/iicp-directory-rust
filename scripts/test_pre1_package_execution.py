@@ -36,7 +36,7 @@ class PackageExecutionTests(unittest.TestCase):
         tree = ast.parse(adapter.DIRECTORY_PROBE)
         branch = next(n for n in tree.body if isinstance(n, ast.If)
                       and ast.unparse(n.test) == "component == 'directory-rust'")
-        for scenario in adapter.DIRECTORY_RUST_HTTP_SCENARIOS:
+        for scenario in adapter.DIRECTORY_RUST_HTTP_SCENARIOS | adapter.DIRECTORY_RUST_DATABASE_SCENARIOS:
             invoke = Mock()
             namespace = {"component": "directory-rust", "scenario": scenario,
                 "installed": Path("/fixture"), "Path": Path, "env": {},
@@ -47,6 +47,83 @@ class PackageExecutionTests(unittest.TestCase):
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
             self.assertEqual(stopped.exception.code, 0)
             self.assertEqual(invoke.call_args.args[2], scenario)
+            self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
+
+    def test_credential_replay_requires_database_verification_rotation_and_recovery(self):
+        from unittest.mock import Mock
+        import hashlib, hmac
+        check = self.directory_http_functions()["credential_replay_postcondition"]
+        responses = [(201, {"node_id": "fixture-replay", "node_token": "synthetic", "node_hmac_key": "fixture-key"}),
+                     *[(200, {"ok": True, "challenge": str(n)}) for n in range(1, 5)]]
+        observations = [None, {"verified_at": None, "challenge": "1"},
+            {"verified_at": 100, "challenge": "2"}, {"verified_at": 100, "challenge": "3"},
+            {"verified_at": 103, "challenge": "4"}]
+        with patch("time.sleep"):
+            request = Mock(side_effect=copy.deepcopy(responses))
+            observe = Mock(side_effect=copy.deepcopy(observations))
+            check(request, observe)
+        calls = request.call_args_list
+        answer = lambda value: hmac.new(b"fixture-key", value.encode(), hashlib.sha256).hexdigest()
+        self.assertNotIn("challenge_response", calls[1].args[1])
+        self.assertEqual(calls[2].args[1]["challenge_response"], answer("1"))
+        self.assertEqual(calls[3].args[1]["challenge_response"], answer("1"))
+        self.assertEqual(calls[4].args[1]["challenge_response"], answer("3"))
+        for index, field, value in [(1, "verified_at", 100), (1, "challenge", "other"),
+                (2, "verified_at", None), (2, "challenge", "1"),
+                (3, "verified_at", 101), (3, "challenge", "2"),
+                (4, "verified_at", 100), (4, "challenge", "3")]:
+            mutated = copy.deepcopy(observations); mutated[index][field] = value
+            with self.subTest(index=index, field=field), patch("time.sleep"), self.assertRaises(ValueError):
+                check(Mock(side_effect=copy.deepcopy(responses)), Mock(side_effect=mutated))
+        with self.assertRaises(ValueError):
+            check(Mock(), Mock(return_value={"verified_at": None, "challenge": "stale"}))
+
+    def test_database_observation_uses_bounded_loopback_native_client(self):
+        check = self.directory_http_functions()
+        config = {"username": "iicp_pre1_fixture", "database": "iicp_pre1_" + "a" * 16}
+        check["require_loopback_only"] = lambda: None
+        check["database_fixture_inputs"] = lambda: (config, "synthetic-private-password")
+        from unittest.mock import Mock
+        for raw, code, expected in [(b"100\tchallenge\n", 0, {"verified_at": 100, "challenge": "challenge"}),
+                (b"NULL\tchallenge\n", 0, {"verified_at": None, "challenge": "challenge"}), (b"", 0, None),
+                (b"100\tchallenge\n100\tother", 0, "FAIL"), (b"100\tNULL", 0, "FAIL"),
+                (b"-1\tchallenge", 0, "FAIL"), (b"x" * 4097, 0, "FAIL"), (b"", 1, "FAIL")]:
+            def invoke(argv, **kwargs):
+                self.assertIn("--host=127.0.0.1", argv)
+                self.assertNotIn("synthetic-private-password", " ".join(argv))
+                self.assertEqual(kwargs["timeout"], 10)
+                kwargs["stdout"].write(raw)
+                return Mock(returncode=code)
+            with self.subTest(raw=raw[:20], code=code), patch("subprocess.run", side_effect=invoke):
+                if expected == "FAIL":
+                    with self.assertRaises(ValueError): check["database_observation"]()
+                else:
+                    self.assertEqual(check["database_observation"](), expected)
+
+    def test_database_fixture_dependencies_bind_tools_and_refuse_unsafe_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            self.assertEqual(adapter.directory_database_dependencies(workspace), {})
+            config = workspace / "directory-operator-fixture.json"
+            config.write_text(json.dumps({"schema": "iicp.pre1-directory-operator-fixture.v1",
+                "database": "iicp_pre1_" + "a" * 16, "username": "iicp_pre1_fixture", "port": 3306}))
+            password = workspace / "directory-operator-password"
+            password.write_text("synthetic-private-password"); password.chmod(0o600)
+            tools = workspace / "directory-database-tools"; (tools / "lib").mkdir(parents=True)
+            for name in ["loader", "mysql", "lib/libc.so.6"]: (tools / name).write_text("fixture")
+            bound = adapter.directory_database_dependencies(workspace)
+            self.assertEqual(set(bound), {"database-config", "database-password", "database-tools"})
+            (tools / "mysql").write_text("changed")
+            self.assertNotEqual(bound, adapter.directory_database_dependencies(workspace))
+            password.chmod(0o644)
+            with self.assertRaises(ValueError): adapter.directory_database_dependencies(workspace)
+            password.chmod(0o600)
+            (tools / "mysql").unlink(); (tools / "mysql").symlink_to(tools / "loader")
+            with self.assertRaises(ValueError): adapter.directory_database_dependencies(workspace)
+            (tools / "mysql").unlink(); (tools / "mysql").write_text("fixture")
+            config.write_text(json.dumps({"schema": "iicp.pre1-directory-operator-fixture.v1",
+                "database": "production", "username": "iicp_pre1_fixture", "port": 3306}))
+            with self.assertRaises(ValueError): adapter.directory_database_dependencies(workspace)
 
     def test_duplicate_registration_requires_damaged_reputation_and_identity_preservation(self):
         from unittest.mock import Mock

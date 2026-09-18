@@ -891,7 +891,8 @@ def validate_management_binding(value, context, artifact, root):
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"})
-DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | frozenset({
+DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
+DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
@@ -1081,7 +1082,95 @@ def require_loopback_only():
     if active != {"lo"}:
         raise ValueError("Directory HTTP fixture requires loopback-only isolation")
 
-def rust_http_case(binary, env, scenario, version):
+def database_fixture_inputs():
+    import re, stat
+    workspace = Path.cwd()
+    config_path = workspace / "directory-operator-fixture.json"
+    secret = workspace / "directory-operator-password"
+    if config_path.is_symlink() or secret.is_symlink():
+        raise ValueError("Directory database fixture paths must not be symlinks")
+    if config_path.stat().st_size > 4096 or not 16 <= secret.stat().st_size <= 128:
+        raise ValueError("Directory database fixture inputs exceed bounds")
+    config = json.loads(config_path.read_text())
+    if (set(config) != {"schema", "database", "username", "port"}
+        or config["schema"] != "iicp.pre1-directory-operator-fixture.v1"
+        or not re.fullmatch(r"iicp_pre1_[a-f0-9]{16}", config["database"])
+        or config["username"] != "iicp_pre1_fixture" or config["port"] != 3306
+        or stat.S_IMODE(secret.stat().st_mode) != 0o600):
+        raise ValueError("Directory database fixture configuration differs")
+    return config, secret.read_text().strip()
+
+def database_observation():
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--batch", "--raw", "--skip-column-names", "--protocol=TCP", "--host=127.0.0.1",
+        "--port=3306", "--connect-timeout=3", "--user=" + config["username"],
+        "--database=" + config["database"], "--execute",
+        "SELECT UNIX_TIMESTAMP(liveness_verified_at), liveness_challenge FROM nodes WHERE id = 'fixture-replay'"]
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(argv, env={"PATH": os.environ.get("PATH", ""), "MYSQL_PWD": password},
+            stdout=output, stderr=subprocess.DEVNULL, timeout=10)
+        output.seek(0); raw = output.read(4097)
+    if result.returncode or len(raw) > 4096:
+        raise ValueError("Directory database observation failed")
+    text = raw.decode().strip()
+    if not text:
+        return None
+    rows = text.splitlines()
+    if len(rows) != 1 or len(rows[0].split("\t")) != 2:
+        raise ValueError("Directory database observation shape differs")
+    verified, challenge = rows[0].split("\t")
+    if (verified != "NULL" and not verified.isdigit()) or not challenge or challenge == "NULL":
+        raise ValueError("Directory database observation state differs")
+    return {"verified_at": None if verified == "NULL" else int(verified), "challenge": challenge}
+
+def credential_replay_postcondition(request, observe):
+    import hmac, hashlib
+    if observe() is not None:
+        raise ValueError("Directory replay fixture identity already exists")
+    body = {"node_id": "fixture-replay", "endpoint": "http://127.0.0.1:1/v1/task",
+        "region": "eu-central", "nat_type": "public", "nat_method": "direct_ipv4",
+        "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
+    status, registered = request("/v1/register", body)
+    token, key = registered.get("node_token"), registered.get("node_hmac_key")
+    if status != 201 or registered.get("node_id") != body["node_id"] or not token or not key:
+        raise ValueError("Directory replay registration positive control differs")
+    headers = {"Authorization": "Bearer " + token}
+    def heartbeat(response=None):
+        payload = {"node_id": body["node_id"], "available": False}
+        if response is not None:
+            payload["challenge_response"] = response
+        code, value = request("/v1/heartbeat", payload, headers)
+        challenge = value.get("challenge")
+        if code != 200 or value.get("ok") is not True or not isinstance(challenge, str) or not challenge:
+            raise ValueError("Directory replay heartbeat positive control differs")
+        return challenge
+    def answer(challenge):
+        return hmac.new(key.encode(), challenge.encode(), hashlib.sha256).hexdigest()
+    first = heartbeat()
+    initial = observe()
+    if initial != {"verified_at": None, "challenge": first}:
+        raise ValueError("Directory replay initial database state differs")
+    response = answer(first)
+    second = heartbeat(response)
+    accepted = observe()
+    if not accepted or accepted["verified_at"] is None or accepted["challenge"] != second or second == first:
+        raise ValueError("Directory replay valid response was not verified and rotated")
+    time.sleep(1.1)  # MySQL NOW() records whole seconds; do not alias replay to the positive control.
+    third = heartbeat(response)
+    replay = observe()
+    if replay != {"verified_at": accepted["verified_at"], "challenge": third} or third in {first, second}:
+        raise ValueError("Directory replay updated verification or failed to rotate")
+    time.sleep(1.1)
+    fourth = heartbeat(answer(third))
+    recovered = observe()
+    if (not recovered or recovered["verified_at"] is None or recovered["verified_at"] <= accepted["verified_at"]
+        or recovered["challenge"] != fourth or fourth in {first, second, third}):
+        raise ValueError("Directory replay fresh response recovery differs")
+
+def rust_http_case(binary, env, scenario, version, database=False):
     require_loopback_only()
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
@@ -1103,10 +1192,17 @@ def rust_http_case(binary, env, scenario, version):
             if not isinstance(value, dict):
                 raise ValueError("Directory HTTP evidence must be an object")
             return response.code, value
+    launch_env = {**env, "APP_KEY": "iicp-pre1-isolated-synthetic-key"}
+    if database:
+        config, password = database_fixture_inputs()
+        from urllib.parse import quote
+        launch_env["DATABASE_URL"] = ("mysql://" + config["username"] + ":" + quote(password, safe="")
+            + "@127.0.0.1:3306/" + config["database"])
+    else:
+        launch_env["IICP_ALLOW_IN_MEMORY"] = "true"
     with tempfile.TemporaryFile() as log:
         process = subprocess.Popen([str(binary)], cwd=binary.parent,
-            env={**env, "IICP_ALLOW_IN_MEMORY": "true",
-                 "APP_KEY": "iicp-pre1-isolated-synthetic-key"}, stdout=log, stderr=subprocess.STDOUT,
+            env=launch_env, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True)
         try:
             deadline = time.monotonic() + 30
@@ -1122,7 +1218,10 @@ def rust_http_case(binary, env, scenario, version):
                 if time.monotonic() >= deadline:
                     raise ValueError("Directory HTTP fixture readiness timed out")
                 time.sleep(0.1)
-            http_postcondition(request, scenario)
+            if database:
+                credential_replay_postcondition(request, database_observation)
+            else:
+                http_postcondition(request, scenario)
         finally:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -1257,6 +1356,10 @@ if component == "directory-rust":
                     "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    elif scenario == "credential-replayed":
+        rust_http_case(installed / "iicp-directory-rs", env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"], database=True)
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     elif scenario == "package-version-self-report":
@@ -1454,6 +1557,40 @@ def directory_payload(artifact, installed, component, target):
     return immutable, deps
 
 
+
+
+def directory_operator_config(config):
+    safe_path(config)
+    if not config.is_file() or config.stat().st_size > 4096:
+        raise ValueError("Directory operator fixture configuration exceeds bound")
+    raw = config.read_bytes()
+    value = json.loads(raw)
+    if (not isinstance(value, dict) or set(value) != {"schema", "database", "username", "port"}
+        or value["schema"] != "iicp.pre1-directory-operator-fixture.v1"
+        or not re.fullmatch(r"iicp_pre1_[a-f0-9]{16}", str(value["database"]))
+        or value["username"] != "iicp_pre1_fixture" or value["port"] != 3306):
+        raise ValueError("Directory operator fixture configuration differs")
+    return raw
+
+def directory_database_dependencies(workspace):
+    config = workspace / "directory-operator-fixture.json"
+    password = workspace / "directory-operator-password"
+    tools = workspace / "directory-database-tools"
+    if not any(path.exists() or path.is_symlink() for path in (config, password, tools)):
+        return {}
+    raw = directory_operator_config(config)
+    safe_path(password); safe_path(tools)
+    if (not stat.S_ISREG(password.stat().st_mode) or stat.S_IMODE(password.stat().st_mode) != 0o600
+        or not 16 <= password.stat().st_size <= 128 or not tools.is_dir()):
+        raise ValueError("Directory database fixture dependency differs")
+    files = tree(tools)
+    if (not {"loader", "mysql"}.issubset(files) or not 3 <= len(files) <= 32
+        or any(not re.fullmatch(r"(?:loader|mysql|lib/[a-zA-Z0-9._+-]+)", name) for name in files)
+        or sum((tools / name).stat().st_size for name in files) > 64 * 1024 * 1024):
+        raise ValueError("Directory database tool snapshot differs")
+    return {"database-config": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "database-password": file_digest(password), "database-tools": digest(files)}
+
 def create_directory_binding(root, workspace, installed, artifact, component, runtime, target, bindings, *, stage_fixtures=True):
     validate_immutable_bindings(bindings)
     validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])), safe_path(installed), root)
@@ -1509,6 +1646,9 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
            "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"]}
+    if component == "directory-rust" and scenario in DIRECTORY_RUST_DATABASE_SCENARIOS:
+        if not directory_database_dependencies(workspace):
+            raise ValueError("Directory packaged database fixture is missing")
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
