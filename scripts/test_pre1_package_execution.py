@@ -107,7 +107,8 @@ class PackageExecutionTests(unittest.TestCase):
         (self.root / "qualification").mkdir(exist_ok=True)
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
-                     for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore"]}}
+                     for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
+                                  "credential-missing", "unsupported-version"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
@@ -286,6 +287,23 @@ class PackageExecutionTests(unittest.TestCase):
         self.assertEqual(cwd, self.workspace)
         self.assertNotIn("cargo", argv)
         self.assertNotIn(str(self.root), " ".join(argv))
+
+    def test_directory_http_commands_use_bound_installed_binary_not_source_tests(self):
+        import shutil
+        artifact, installed, value, context = self.directory_inputs()
+        artifact_root = self.home / "artifacts"
+        (artifact_root / "directory-rust").mkdir(parents=True)
+        shutil.copyfile(artifact, artifact_root / "directory-rust" / artifact.name)
+        manifest = {"source_version": "0.1.15", "artifacts": [{"name": artifact.name,
+            "kind": "release-artifact", "target": "linux-aarch64", "sha256": adapter.file_digest(artifact)}]}
+        for scenario in ("credential-missing", "unsupported-version"):
+            argv, env, cwd, proof = adapter.directory_package_command(self.root,
+                {**context, "scenario_id": scenario}, manifest, artifact_root, {}, value)
+            self.assertEqual(argv[-1], scenario)
+            self.assertEqual(env["IICP_PRE1_DIRECTORY_INSTALLED"], str(installed))
+            self.assertEqual(json.loads(env["IICP_PRE1_EXECUTION_CONTEXT"])["scenario_id"], scenario)
+            self.assertNotIn("cargo", argv)
+            self.assertEqual(cwd, self.workspace)
 
     def management_artifact(self):
         self.workspace = self.home / "run/management"
