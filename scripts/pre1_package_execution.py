@@ -1254,7 +1254,7 @@ env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
-                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness"}:
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)

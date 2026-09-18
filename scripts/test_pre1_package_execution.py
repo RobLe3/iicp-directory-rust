@@ -30,6 +30,24 @@ class PackageExecutionTests(unittest.TestCase):
         exec(compile(functions, "directory-probe.py", "exec"), namespace)
         return namespace
 
+    def test_all_admitted_http_cases_reach_staged_runtime_dispatch(self):
+        import ast, resource
+        from unittest.mock import Mock
+        tree = ast.parse(adapter.DIRECTORY_PROBE)
+        branch = next(n for n in tree.body if isinstance(n, ast.If)
+                      and ast.unparse(n.test) == "component == 'directory-rust'")
+        for scenario in adapter.DIRECTORY_RUST_HTTP_SCENARIOS:
+            invoke = Mock()
+            namespace = {"component": "directory-rust", "scenario": scenario,
+                "installed": Path("/fixture"), "Path": Path, "env": {},
+                "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
+                "resource": Mock(RLIMIT_FSIZE=resource.RLIMIT_FSIZE),
+                "rust_http_case": invoke, "assertion": "fixture", "print": Mock()}
+            with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
+                exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
+            self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(invoke.call_args.args[2], scenario)
+
     def test_duplicate_registration_requires_damaged_reputation_and_identity_preservation(self):
         from unittest.mock import Mock
         check = self.directory_http_functions()["duplicate_registration_postcondition"]
