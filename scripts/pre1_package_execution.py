@@ -1218,7 +1218,7 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 if time.monotonic() >= deadline:
                     raise ValueError("Directory HTTP fixture readiness timed out")
                 time.sleep(0.1)
-            if database:
+            if scenario == "credential-replayed":
                 credential_replay_postcondition(request, database_observation)
             else:
                 http_postcondition(request, scenario)
@@ -1355,7 +1355,8 @@ if component == "directory-rust":
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
                     "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
-        rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
+            database=(Path.cwd() / "directory-operator-fixture.json").exists())
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     elif scenario == "credential-replayed":
