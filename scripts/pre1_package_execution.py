@@ -1223,16 +1223,23 @@ def permission_snapshot_postcondition(process, snapshot, log, request):
 
 def bounded_snapshot_filesystem(directory):
     # Never fill a host bind mount or an unbounded developer filesystem.
+    import stat
+    if directory.is_symlink() or directory.parent.is_symlink():
+        raise ValueError("Directory disk-full fixture path is unsafe")
     directory = directory.resolve(strict=True)
+    parent = directory.parent.stat()
+    if stat.S_IMODE(parent.st_mode) != 0o700 or parent.st_uid != os.getuid():
+        raise ValueError("Directory disk-full fixture mount must be private and owned")
     mounts = []
     for line in Path('/proc/self/mountinfo').read_text().splitlines():
         fields = line.split()
         mount = Path(fields[4])
         if directory == mount or mount in directory.parents:
-            mounts.append((len(mount.parts), fields[fields.index('-') + 1]))
+            mounts.append((len(mount.parts), fields[fields.index('-') + 1], mount))
     info = os.statvfs(directory)
     ceiling = info.f_blocks * info.f_frsize
-    if not mounts or max(mounts)[1] != 'tmpfs' or not 0 < ceiling <= 16 * 1024 * 1024:
+    selected = max(mounts, key=lambda row: row[0]) if mounts else None
+    if not selected or selected[1] != 'tmpfs' or selected[2] != directory.parent or not 0 < ceiling <= 16 * 1024 * 1024:
         raise ValueError('Directory disk-full fixture requires bounded Linux tmpfs')
     return ceiling
 

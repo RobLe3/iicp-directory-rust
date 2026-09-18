@@ -96,15 +96,25 @@ class PackageExecutionTests(unittest.TestCase):
     def test_disk_full_refuses_host_filesystems_and_oversized_tmpfs(self):
         from types import SimpleNamespace
         check = self.directory_http_functions()["bounded_snapshot_filesystem"]
+        self.workspace.chmod(0o700)
+        directory = self.workspace / "snapshot"
+        directory.mkdir()
         info = SimpleNamespace(f_blocks=4096, f_frsize=4096)
         for kind, blocks in [("ext4", 4096), ("tmpfs", 4097), ("tmpfs", 0)]:
             info.f_blocks = blocks
-            with patch.object(Path, "read_text", return_value=f"1 0 0:1 / / rw - {kind} none rw\n"), patch.object(os, "statvfs", return_value=info):
+            with patch.object(Path, "read_text", return_value=f"1 0 0:1 / {self.workspace} rw - {kind} none rw\n"), patch.object(os, "statvfs", return_value=info):
                 with self.subTest(kind=kind, blocks=blocks), self.assertRaisesRegex(ValueError, "bounded Linux tmpfs"):
-                    check(self.workspace)
+                    check(directory)
         info.f_blocks = 4096
+        with patch.object(Path, "read_text", return_value=f"1 0 0:1 / {self.workspace} rw - tmpfs none rw\n"), patch.object(os, "statvfs", return_value=info):
+            self.assertEqual(check(directory), 16777216)
+        self.workspace.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "private and owned"):
+            check(directory)
+        self.workspace.chmod(0o700)
         with patch.object(Path, "read_text", return_value="1 0 0:1 / / rw - tmpfs none rw\n"), patch.object(os, "statvfs", return_value=info):
-            self.assertEqual(check(self.workspace), 16777216)
+            with self.assertRaisesRegex(ValueError, "bounded Linux tmpfs"):
+                check(directory)
 
     def test_disk_full_filler_requires_enospc_and_preserves_existing_paths(self):
         import errno
