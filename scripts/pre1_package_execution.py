@@ -890,7 +890,7 @@ def validate_management_binding(value, context, artifact, root):
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
-    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness"})
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed"})
 
@@ -1013,6 +1013,40 @@ def initial_route_postcondition(request):
                 if worker.is_alive():
                     raise ValueError("synthetic route worker did not stop")
 
+def duplicate_registration_postcondition(request):
+    # Declared direct reachability skips external probes; the reserved .invalid
+    # identity and loopback endpoint can never target a production provider.
+    body = {"node_id": "fixture-duplicate", "endpoint": "http://127.0.0.1:1",
+        "nat_type": "public", "transport_method": "direct_ipv4",
+        "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]}
+    status, first = request("/v1/register", body)
+    if (status != 201 or first.get("node_id") != body["node_id"]
+            or not isinstance(first.get("node_token"), str) or not first["node_token"]):
+        raise ValueError("duplicate fixture first registration differs")
+    def detail():
+        status, value = request("/v1/node/" + body["node_id"])
+        score = value.get("reputation_score")
+        if (status != 200 or value.get("node_id") != body["node_id"]
+                or type(score) not in (int, float) or not 0 <= score <= 1):
+            raise ValueError("duplicate fixture node evidence differs")
+        return value
+    baseline = detail()["reputation_score"]
+    status, heartbeat = request("/v1/heartbeat", {"node_id": body["node_id"],
+        "available": True, "metrics": {"tasks_success": 0, "tasks_failed": 5,
+                                       "avg_latency_ms": 0}},
+        headers={"Authorization": "Bearer " + first["node_token"]})
+    if status != 200 or heartbeat.get("ok") is not True:
+        raise ValueError("duplicate fixture damaging heartbeat failed")
+    damaged = detail()["reputation_score"]
+    if damaged >= baseline:
+        raise ValueError("duplicate fixture reputation was not damaged")
+    status, second = request("/v1/register", {**body, "current_node_token": first["node_token"]})
+    if status != 201 or second.get("node_id") != body["node_id"]:
+        raise ValueError("duplicate fixture re-registration identity differs")
+    after = detail()
+    if after["reputation_score"] != damaged or after.get("endpoint") != body["endpoint"]:
+        raise ValueError("duplicate registration reset reputation or changed endpoint")
+
 def http_postcondition(request, scenario):
     if scenario == "credential-missing":
         status, value = request("/v1/peers", {"node_id": "fixture", "known_peers": []})
@@ -1027,6 +1061,8 @@ def http_postcondition(request, scenario):
             raise ValueError("conflicted version refusal cause differs")
     elif scenario in {"credential-expired", "credential-rotated"}:
         replica_snapshot_postcondition(request, scenario)
+    elif scenario == "duplicate-registration":
+        duplicate_registration_postcondition(request)
     elif scenario == "rate-limit":
         registration_rate_postcondition(request)
     elif scenario == "dynamic-public-route-readiness":

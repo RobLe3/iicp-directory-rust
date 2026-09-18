@@ -30,6 +30,25 @@ class PackageExecutionTests(unittest.TestCase):
         exec(compile(functions, "directory-probe.py", "exec"), namespace)
         return namespace
 
+    def test_duplicate_registration_requires_damaged_reputation_and_identity_preservation(self):
+        from unittest.mock import Mock
+        check = self.directory_http_functions()["duplicate_registration_postcondition"]
+        node = lambda score: {"node_id": "fixture-duplicate", "endpoint": "http://127.0.0.1:1", "reputation_score": score}
+        rows = [(201, {"node_id": "fixture-duplicate", "node_token": "synthetic"}),
+                (200, node(.5)), (200, {"ok": True}), (200, node(.3)),
+                (201, {"node_id": "fixture-duplicate"}), (200, node(.3))]
+        request = Mock(side_effect=rows)
+        check(request)
+        self.assertEqual(request.call_args_list[2].kwargs["headers"], {"Authorization": "Bearer synthetic"})
+        self.assertEqual(request.call_args_list[4].args[1]["current_node_token"], "synthetic")
+        for index, replacement in [(0, (201, {})), (1, (200, node(True))),
+                (2, (200, {"ok": False})), (3, (200, node(.5))),
+                (4, (201, {"node_id": "other"})), (5, (200, node(.5))),
+                (5, (200, {**node(.3), "endpoint": "https://wrong.invalid"}))]:
+            changed = list(rows); changed[index] = replacement
+            with self.subTest(index=index, replacement=replacement), self.assertRaises(ValueError):
+                check(Mock(side_effect=changed))
+
     def test_directory_http_postconditions_reject_status_only_false_positives(self):
         check = self.directory_http_functions()["http_postcondition"]
         for status in (200, 403, 404, 500):
@@ -201,7 +220,7 @@ class PackageExecutionTests(unittest.TestCase):
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
-                                  "rate-limit", "dynamic-public-route-readiness"]}}
+                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
