@@ -895,9 +895,6 @@ DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed"})
 
-DIRECTORY_PHP_OPERATOR_SCENARIOS = frozenset({"backup-restore", "migration-interrupted", "rollback-last-supported"})
-DIRECTORY_PHP_PREVIOUS_SHA256 = "sha256:20ab5112879ec9a6e51db82ad52a799c5cf5dc9babed1448960b3d073f16cda1"
-
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -1552,87 +1549,6 @@ if component == "directory-php":
 output_file.unlink()
 print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
 '''
-DIRECTORY_OPERATOR = r'''<?php
-$operation = $argv[1];
-$pdo = new PDO('mysql:host=127.0.0.1;port=3306;dbname='.getenv('DB_DATABASE'),
-    getenv('DB_USERNAME'), getenv('DB_PASSWORD'), [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-function tables(PDO $pdo): array { return $pdo->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN); }
-function identifier(string $name): string {
-    if (!preg_match('/^[a-zA-Z0-9_]+$/D', $name)) { throw new RuntimeException('Unsafe fixture identifier'); }
-    return '`'.$name.'`';
-}
-function resetTables(PDO $pdo): void {
-    $pdo->exec('SET FOREIGN_KEY_CHECKS=0');
-    try { foreach (tables($pdo) as $table) { $pdo->exec('DROP TABLE '.identifier($table)); } }
-    finally { $pdo->exec('SET FOREIGN_KEY_CHECKS=1'); }
-}
-if ($operation === 'empty') { echo tables($pdo) === [] ? 'true' : 'false'; }
-elseif ($operation === 'reset') { resetTables($pdo); }
-elseif ($operation === 'seed') {
-    $pdo->exec('CREATE TABLE iicp_rehearsal_fixture (id INT PRIMARY KEY, marker VARCHAR(16) NOT NULL) ENGINE=InnoDB');
-    $pdo->exec("INSERT INTO iicp_rehearsal_fixture VALUES (1, 'alpha'), (2, 'beta')");
-} elseif ($operation === 'digest') {
-    $rows = $pdo->query('SELECT id, marker FROM iicp_rehearsal_fixture ORDER BY id')->fetchAll(PDO::FETCH_ASSOC);
-    echo hash('sha256', implode('|', array_map(fn ($row) => $row['id'].':'.$row['marker'], $rows)));
-} elseif ($operation === 'tamper') { $pdo->exec("UPDATE iicp_rehearsal_fixture SET marker='changed' WHERE id=1"); }
-elseif ($operation === 'backup') {
-    $backup = [];
-    if (count(tables($pdo)) > 256) { throw new RuntimeException('Fixture table bound exceeded'); }
-    foreach (tables($pdo) as $table) {
-        $id = identifier($table);
-        $rows = $pdo->query('SELECT * FROM '.$id.' LIMIT 1001')->fetchAll(PDO::FETCH_ASSOC);
-        if (count($rows) > 1000) { throw new RuntimeException('Fixture row bound exceeded'); }
-        $backup[$table] = ['ddl' => $pdo->query('SHOW CREATE TABLE '.$id)->fetch(PDO::FETCH_NUM)[1], 'rows' => $rows];
-    }
-    $data = json_encode($backup, JSON_THROW_ON_ERROR);
-    if (strlen($data) > 16 * 1024 * 1024) { throw new RuntimeException('Fixture backup bound exceeded'); }
-    $file = fopen($argv[2], 'x');
-    if (!$file) { throw new RuntimeException('Backup unavailable'); }
-    chmod($argv[2], 0600);
-    if (fwrite($file, $data) !== strlen($data)) { throw new RuntimeException('Backup write failed'); }
-    fclose($file);
-} elseif ($operation === 'restore') {
-    $data = file_get_contents($argv[2]);
-    if (strlen($data) > 16 * 1024 * 1024) { throw new RuntimeException('Fixture backup bound exceeded'); }
-    $backup = json_decode($data, true, 512, JSON_THROW_ON_ERROR);
-    resetTables($pdo);
-    $pdo->exec('SET FOREIGN_KEY_CHECKS=0');
-    try {
-        foreach ($backup as $table => $entry) {
-            $pdo->exec($entry['ddl']);
-            foreach ($entry['rows'] as $row) {
-                $columns = implode(',', array_map('identifier', array_keys($row)));
-                $insert = $pdo->prepare('INSERT INTO '.identifier($table).' ('.$columns.') VALUES ('.implode(',', array_fill(0, count($row), '?')).')');
-                $insert->execute(array_values($row));
-            }
-        }
-    } finally { $pdo->exec('SET FOREIGN_KEY_CHECKS=1'); }
-} elseif ($operation === 'ready') {
-    require getcwd().'/vendor/autoload.php';
-    $app = require getcwd().'/bootstrap/app.php';
-    $kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
-    $response = $kernel->handle(Illuminate\Http\Request::create('/iicp/ready'));
-    $value = json_decode($response->getContent(), true, 512, JSON_THROW_ON_ERROR);
-    echo json_encode(['ready' => $response->getStatusCode() === 200 && $value === ['ok' => true, 'role' => 'directory', 'ready' => true],
-        'version' => trim(file_get_contents(getcwd().'/VERSION'))], JSON_THROW_ON_ERROR);
-} else { throw new RuntimeException('Unknown fixture operation'); }
-'''
-DIRECTORY_INTERRUPTION = r'''<?php
-return new class extends Illuminate\Database\Migrations\Migration {
-    public function up(): void {
-        Illuminate\Support\Facades\DB::beginTransaction();
-        Illuminate\Support\Facades\DB::statement("INSERT INTO iicp_rehearsal_fixture VALUES (9, 'uncommitted')");
-        $file = fopen(getenv('IICP_PRE1_INTERRUPTION_READY'), 'x');
-        if (!$file) { throw new RuntimeException('Checkpoint unavailable'); }
-        chmod(getenv('IICP_PRE1_INTERRUPTION_READY'), 0600);
-        fwrite($file, 'transaction-open'); fclose($file);
-        sleep(60);
-        throw new RuntimeException('Interruption was not performed');
-    }
-    public function down(): void {}
-};
-'''
-
 DIRECTORY_ORIGIN = r'''<?php
 $root = realpath(getenv('PRE1_DIRECTORY_INSTALLED'));
 if (!$root) { throw new RuntimeException('Directory package root unavailable'); }
@@ -1733,8 +1649,6 @@ def directory_fixtures(root, component):
               "directory-case-map.json": safe_path(root / "qualification/pre1-cases.json").read_bytes()}
     if component == "directory-php":
         result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
-        result["directory-operator.php"] = DIRECTORY_OPERATOR.encode()
-        result["directory-interruption.php"] = DIRECTORY_INTERRUPTION.encode()
     return result
 
 
@@ -1762,17 +1676,6 @@ def directory_payload(artifact, installed, component, target):
     return immutable, deps
 
 
-def stage_directory_previous(artifact, workspace):
-    """Stage the exact supported predecessor, never a relabelled current tree."""
-    safe_path(artifact)
-    if not artifact.is_file() or artifact.stat().st_size > 2 * 1024 * 1024:
-        raise ValueError("Directory previous release artifact exceeds bound")
-    if file_digest(artifact) != DIRECTORY_PHP_PREVIOUS_SHA256:
-        raise ValueError("Directory previous release artifact differs")
-    installed = stage_directory_payload(artifact, workspace, "directory-php")
-    (workspace / "archive.tar.gz").write_bytes(artifact.read_bytes())
-    (workspace / "archive.tar.gz").chmod(0o600)
-    return installed
 
 
 def directory_operator_config(config):
@@ -1787,31 +1690,6 @@ def directory_operator_config(config):
         or value["username"] != "iicp_pre1_fixture" or value["port"] != 3306):
         raise ValueError("Directory operator fixture configuration differs")
     return raw
-
-
-def directory_operator_dependencies(workspace):
-    config = workspace / "directory-operator-fixture.json"
-    if not config.exists() and not config.is_symlink():
-        return {}
-    raw = directory_operator_config(config)
-    password = safe_path(workspace / "directory-operator-password")
-    if not stat.S_ISREG(password.stat().st_mode) or stat.S_IMODE(password.stat().st_mode) != 0o600 or not 16 <= password.stat().st_size <= 128:
-        raise ValueError("Directory operator secret must be a private regular file")
-    previous = safe_path(workspace / "previous")
-    for installed in (workspace / "payload", previous / "payload"):
-        if (installed / "bootstrap/cache/config.php").exists() or (installed / "bootstrap/cache/config.php").is_symlink():
-            raise ValueError("Directory operator cached configuration is forbidden")
-    archive = safe_path(previous / "archive.tar.gz")
-    if not archive.is_file() or archive.stat().st_size > 2 * 1024 * 1024:
-        raise ValueError("Directory previous release artifact exceeds bound")
-    if file_digest(archive) != DIRECTORY_PHP_PREVIOUS_SHA256:
-        raise ValueError("Directory previous release artifact differs")
-    payload, deps = directory_payload(archive, safe_path(previous / "payload"), "directory-php", "any")
-    return {"operator-config": "sha256:" + hashlib.sha256(raw).hexdigest(),
-            "operator-password": file_digest(password), "previous-artifact": file_digest(archive),
-            "previous-payload": digest(payload), "previous-dependencies": digest(deps)}
-
-
 
 def directory_database_dependencies(workspace):
     config = workspace / "directory-operator-fixture.json"
@@ -1836,9 +1714,7 @@ def create_directory_binding(root, workspace, installed, artifact, component, ru
     validate_immutable_bindings(bindings)
     validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])), safe_path(installed), root)
     payload, deps = directory_payload(artifact, installed, component, target)
-    if component == "directory-php":
-        deps.update(directory_operator_dependencies(workspace))
-    else:
+    if component == "directory-rust":
         deps.update(directory_database_dependencies(workspace))
     fixtures = directory_fixtures(root, component)
     for name, data in fixtures.items():
@@ -1893,7 +1769,7 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     case = mapping["support"] if scenario == "support" else mapping["scenarios"][scenario]
     if component == "directory-rust" and scenario not in DIRECTORY_RUST_SCENARIOS:
         raise ValueError("Directory black-box scenario remains unimplemented")
-    if component == "directory-php" and scenario not in DIRECTORY_PHP_OPERATOR_SCENARIOS and case["command"][0] != "@php":
+    if component == "directory-php" and case["command"][0] != "@php":
         raise ValueError("Directory structural checks are not packaged operation evidence")
     env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
@@ -1902,7 +1778,5 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
-        if scenario in DIRECTORY_PHP_OPERATOR_SCENARIOS and not directory_operator_dependencies(workspace):
-            raise ValueError("Directory packaged operator fixture is missing")
     argv = [sys.executable, "-I", "-S", str(workspace / "directory-probe.py"), case["assertion"]]
     return argv, env, workspace, {"value": value, "artifact": artifact, "vendor_artifact": None}
