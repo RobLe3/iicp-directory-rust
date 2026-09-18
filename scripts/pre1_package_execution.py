@@ -1105,7 +1105,7 @@ def database_observation():
     config, password = database_fixture_inputs()
     tools = Path.cwd() / "directory-database-tools"
     argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
-        "--batch", "--raw", "--skip-column-names", "--protocol=TCP", "--host=127.0.0.1",
+        "--no-defaults", "--no-login-paths", "--batch", "--raw", "--skip-column-names", "--protocol=TCP", "--host=127.0.0.1",
         "--port=3306", "--connect-timeout=3", "--user=" + config["username"],
         "--database=" + config["database"], "--execute",
         "SELECT UNIX_TIMESTAMP(liveness_verified_at), liveness_challenge FROM nodes WHERE id = 'fixture-replay'"]
