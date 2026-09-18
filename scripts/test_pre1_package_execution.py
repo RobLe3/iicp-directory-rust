@@ -49,6 +49,50 @@ class PackageExecutionTests(unittest.TestCase):
             self.assertEqual(invoke.call_args.args[2], scenario)
             self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
 
+    def test_snapshot_checkpoint_refuses_identity_permissions_and_partial_output(self):
+        check = self.directory_http_functions()["snapshot_checkpoint"]
+        path = self.workspace / "snapshot.json"
+        baseline = {"health_schema_version": 1, "pid": 321, "sequence": 2}
+        path.write_text(json.dumps(baseline)); path.chmod(0o600)
+        self.assertEqual(check(path, 321)[0], 2)
+        with self.assertRaisesRegex(ValueError, "identity"):
+            check(path, 999)
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "permissions"):
+            check(path, 321)
+        path.chmod(0o600); path.write_text("{")
+        with self.assertRaises(ValueError):
+            check(path, 321)
+        path.unlink(); path.symlink_to(self.workspace / "outside")
+        with self.assertRaisesRegex(ValueError, "boundary"):
+            check(path, 321)
+
+    def test_permission_snapshot_requires_refusal_preservation_and_recovery(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        snapshot = self.workspace / "health" / "health.json"
+        snapshot.parent.mkdir()
+        baseline = b'{"health_schema_version":1,"pid":321,"sequence":2}'
+        snapshot.write_bytes(baseline); snapshot.chmod(0o600)
+        process = Mock(pid=321); process.poll.return_value = None
+        with tempfile.TemporaryFile() as log:
+            def checkpoint(*args):
+                if len(args) == 3:
+                    self.assertEqual(snapshot.parent.stat().st_mode & 0o777, 0o700)
+                    return 3, baseline
+                return 2, baseline
+            original = ns["wait_snapshot_checkpoint"]
+            ns["wait_snapshot_checkpoint"] = Mock(side_effect=checkpoint)
+            with patch.object(os, "geteuid", return_value=500), patch.object(os, "access", return_value=False), patch.object(os, "pread", return_value=b"snapshot write failed: Permission denied (os error 13)"):
+                request = Mock(return_value=(200, {"ok": True}))
+                ns["permission_snapshot_postcondition"](process, snapshot, log, request)
+                self.assertEqual(request.call_count, 2)
+                snapshot.write_text('{"health_schema_version":1,"pid":321,"sequence":9}')
+                with self.assertRaisesRegex(ValueError, "changed verified"):
+                    ns["permission_snapshot_postcondition"](process, snapshot, log, request)
+                self.assertEqual(snapshot.parent.stat().st_mode & 0o777, 0o700)
+            ns["wait_snapshot_checkpoint"] = original
+
     def test_credential_replay_requires_database_verification_rotation_and_recovery(self):
         from unittest.mock import Mock
         import hashlib, hmac
@@ -345,7 +389,7 @@ class PackageExecutionTests(unittest.TestCase):
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
-                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"]}}
+                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"

@@ -890,7 +890,7 @@ def validate_management_binding(value, context, artifact, root):
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
-    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"})
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed"})
@@ -1170,6 +1170,57 @@ def credential_replay_postcondition(request, observe):
         or recovered["challenge"] != fourth or fourth in {first, second, third}):
         raise ValueError("Directory replay fresh response recovery differs")
 
+def snapshot_checkpoint(path, pid):
+    import stat
+    if path.is_symlink() or not path.is_file() or not 1 <= path.stat().st_size <= 8192:
+        raise ValueError("Directory snapshot file boundary differs")
+    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise ValueError("Directory snapshot permissions differ")
+    value = json.loads(path.read_bytes())
+    if (value.get("health_schema_version") != 1 or value.get("pid") != pid
+        or type(value.get("sequence")) is not int or value["sequence"] < 1):
+        raise ValueError("Directory snapshot identity differs")
+    return value["sequence"], path.read_bytes()
+
+def wait_snapshot_checkpoint(process, snapshot, previous=None):
+    deadline = time.monotonic() + 12
+    while True:
+        if process.poll() is not None:
+            raise ValueError("Directory snapshot writer exited")
+        if snapshot.exists():
+            value = snapshot_checkpoint(snapshot, process.pid)
+            if previous is None or value[0] > previous:
+                return value
+        if time.monotonic() >= deadline:
+            raise ValueError("Directory snapshot progress timed out")
+        time.sleep(0.1)
+
+def permission_snapshot_postcondition(process, snapshot, log, request):
+    # Exercise the released writer, not an injected source-test implementation.
+    if os.geteuid() == 0:
+        raise ValueError("Directory permission fixture requires unprivileged execution")
+    sequence, verified = wait_snapshot_checkpoint(process, snapshot)
+    directory = snapshot.parent
+    offset = os.fstat(log.fileno()).st_size
+    directory.chmod(0o500)
+    try:
+        if os.access(directory, os.W_OK):
+            raise ValueError("Directory permission fixture did not deny writes")
+        deadline = time.monotonic() + 12
+        while b"snapshot write failed: Permission denied (os error 13)" not in os.pread(log.fileno(), 65536, offset):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise ValueError("Directory snapshot permission refusal was not observed")
+            time.sleep(0.1)
+        if snapshot_checkpoint(snapshot, process.pid)[1] != verified or list(directory.glob("*.tmp-*")):
+            raise ValueError("Directory denied write changed verified snapshot")
+        if request("/health")[0] != 200:
+            raise ValueError("Directory permission failure broke runtime health")
+    finally:
+        directory.chmod(0o700)
+    recovered, _ = wait_snapshot_checkpoint(process, snapshot, sequence)
+    if recovered <= sequence or request("/health")[0] != 200:
+        raise ValueError("Directory snapshot recovery differs")
+
 def rust_http_case(binary, env, scenario, version, database=False):
     require_loopback_only()
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1200,7 +1251,9 @@ def rust_http_case(binary, env, scenario, version, database=False):
             + "@127.0.0.1:3306/" + config["database"])
     else:
         launch_env["IICP_ALLOW_IN_MEMORY"] = "true"
-    with tempfile.TemporaryFile() as log:
+    with tempfile.TemporaryDirectory(prefix="directory-health-", dir=Path.cwd()) as health_dir, tempfile.TemporaryFile() as log:
+        snapshot = Path(health_dir) / "health.json"
+        launch_env["IICP_RUNTIME_HEALTH_FILE"] = str(snapshot)
         process = subprocess.Popen([str(binary)], cwd=binary.parent,
             env=launch_env, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True)
@@ -1218,7 +1271,9 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 if time.monotonic() >= deadline:
                     raise ValueError("Directory HTTP fixture readiness timed out")
                 time.sleep(0.1)
-            if scenario == "credential-replayed":
+            if scenario == "config-permission-denied":
+                permission_snapshot_postcondition(process, snapshot, log, request)
+            elif scenario == "credential-replayed":
                 credential_replay_postcondition(request, database_observation)
             else:
                 http_postcondition(request, scenario)
@@ -1353,7 +1408,7 @@ env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
-                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration"}:
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             database=(Path.cwd() / "directory-operator-fixture.json").exists())
