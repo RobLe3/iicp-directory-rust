@@ -17,6 +17,89 @@ import pre1_package_execution as adapter
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def directory_http_functions(self):
+        import ast
+        import signal
+        import time
+        import urllib.request
+        import urllib.error
+        parsed = ast.parse(adapter.DIRECTORY_PROBE)
+        functions = ast.Module(body=[n for n in parsed.body if isinstance(n, ast.FunctionDef)], type_ignores=[])
+        namespace = dict(json=json, os=os, signal=signal,
+                         subprocess=subprocess, tempfile=tempfile, time=time, Path=Path, urllib=urllib)
+        exec(compile(functions, "directory-probe.py", "exec"), namespace)
+        return namespace
+
+    def test_directory_http_postconditions_reject_status_only_false_positives(self):
+        check = self.directory_http_functions()["http_postcondition"]
+        for status in (200, 403, 404, 500):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                check(lambda *a: (status, {}), "credential-missing")
+        check(lambda *a: (401, {}), "credential-missing")
+        with self.assertRaises(ValueError):
+            check(lambda *a: (422, {"message": "endpoint invalid"}), "unsupported-version")
+        check(lambda *a: (422, {"message": "sdk_compatibility_version must match sdk_version when both are supplied"}), "unsupported-version")
+        with self.assertRaises(ValueError):
+            check(lambda *a: (200, {}), "backup-restore")
+
+    def directory_network(self, active):
+        import struct
+        from unittest.mock import Mock
+        from contextlib import ExitStack
+        import socket
+        stack = ExitStack()
+        ioctl = Mock()
+        ioctl.ioctl.side_effect = lambda fd, op, name: b"\0" * 16 + struct.pack("H", int(name.rstrip(b"\0").decode() in active))
+        stack.enter_context(patch.dict("sys.modules", {"fcntl": ioctl}))
+        stack.enter_context(patch.object(socket, "if_nameindex", return_value=[(1, "lo"), (2, "eth0"), (3, "gre0")]))
+        return stack
+
+    def test_directory_http_fixture_refuses_host_network_before_process_start(self):
+        run = self.directory_http_functions()["rust_http_case"]
+        with self.directory_network({"lo", "eth0"}), \
+             patch.object(subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "loopback-only"):
+                run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+            launch.assert_not_called()
+
+    def test_directory_http_fixture_wrong_identity_kills_owned_process(self):
+        from unittest.mock import Mock, MagicMock
+        import urllib.request
+        run = self.directory_http_functions()["rust_http_case"]
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        response = MagicMock(code=200)
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok":true,"version":"v9.9.9-rs"}'
+        with self.directory_network({"lo"}), \
+             patch.object(subprocess, "Popen", return_value=process), \
+             patch.object(os, "pread", return_value=b"listening on 0.0.0.0:8090", create=True), \
+             patch.object(os, "killpg", create=True) as kill, \
+             patch.object(urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value = response
+            with self.assertRaisesRegex(ValueError, "identity differs"):
+                run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+            kill.assert_called_once()
+            process.wait.assert_called_once_with(timeout=10)
+
+    def test_directory_http_fixture_timeout_and_early_exit_preserve_cleanup(self):
+        from unittest.mock import Mock
+        import time
+        run = self.directory_http_functions()["rust_http_case"]
+        for exit_code, cause in ((None, "timed out"), (1, "exited before readiness")):
+            process = Mock(pid=123)
+            process.poll.return_value = exit_code
+            with self.subTest(exit_code=exit_code), \
+                 self.directory_network({"lo"}), \
+                 patch.object(subprocess, "Popen", return_value=process), \
+                 patch.object(os, "pread", return_value=b"", create=True), \
+                 patch.object(os, "killpg", create=True) as kill, \
+                 patch.object(time, "monotonic", side_effect=[0, 31]):
+                with self.assertRaisesRegex(ValueError, cause):
+                    run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+                kill.assert_called_once()
+                process.wait.assert_called_once_with(timeout=10)
+
     def directory_inputs(self, component="directory-rust"):
         import shutil
         shutil.rmtree(self.workspace)

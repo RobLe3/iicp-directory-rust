@@ -889,9 +889,81 @@ def validate_management_binding(value, context, artifact, root):
 
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
-DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile
+DIRECTORY_RUST_SCENARIOS = frozenset({"package-version-self-report", "config-missing", "config-malformed",
+                                     "credential-missing", "unsupported-version"})
+
+DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 import xml.etree.ElementTree as ET
+import urllib.request, urllib.error
+
+def http_postcondition(request, scenario):
+    if scenario == "credential-missing":
+        status, value = request("/v1/peers", {"node_id": "fixture", "known_peers": []})
+        if status != 401:
+            raise ValueError("unauthenticated peer access was not refused")
+    elif scenario == "unsupported-version":
+        status, value = request("/v1/register", {
+            "endpoint": "https://provider.invalid", "region": "eu-central",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}],
+            "sdk_compatibility_version": "0.7.101", "sdk_version": "0.7.100"})
+        if status != 422 or "sdk_compatibility_version must match sdk_version" not in json.dumps(value):
+            raise ValueError("conflicted version refusal cause differs")
+    else:
+        raise ValueError("Directory HTTP scenario remains unimplemented")
+
+def rust_http_case(binary, env, scenario, version):
+    # The frozen listener binds 0.0.0.0:8090. Admit this in-memory fixture only
+    # in a Linux network namespace with loopback alone, never on the host LAN.
+    import fcntl, socket, struct
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control:
+        active = {name for _, name in socket.if_nameindex()
+            if struct.unpack_from("H", fcntl.ioctl(control.fileno(), 0x8913,
+                struct.pack("256s", name.encode())), 16)[0] & 1}
+    if active != {"lo"}:
+        raise ValueError("Directory HTTP fixture requires loopback-only isolation")
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    def request(path, body=None):
+        req = urllib.request.Request("http://127.0.0.1:8090" + path,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            response = opener.open(req, timeout=2)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                raise ValueError("Directory HTTP evidence exceeds bound")
+            return response.code, json.loads(raw)
+    with tempfile.TemporaryFile() as log:
+        process = subprocess.Popen([str(binary)], cwd=binary.parent,
+            env={**env, "IICP_ALLOW_IN_MEMORY": "true"}, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True)
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                if process.poll() is not None:
+                    raise ValueError("Directory HTTP fixture exited before readiness")
+                listening = b"listening on 0.0.0.0:8090" in os.pread(log.fileno(), 65536, 0)
+                if listening:
+                    status, health = request("/health")
+                    if status != 200 or health.get("ok") is not True or health.get("version") != "v" + version + "-rs":
+                        raise ValueError("Directory HTTP fixture identity differs")
+                    break
+                if time.monotonic() >= deadline:
+                    raise ValueError("Directory HTTP fixture readiness timed out")
+                time.sleep(0.1)
+            http_postcondition(request, scenario)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
 
 context = json.loads(os.environ["IICP_PRE1_EXECUTION_CONTEXT"])
 component, scenario = context["component"], context["scenario_id"]
@@ -903,7 +975,12 @@ env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP") if k 
 env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
-    if scenario == "package-version-self-report":
+    if scenario in {"credential-missing", "unsupported-version"}:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
+        rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    elif scenario == "package-version-self-report":
         argv.append("--version")
         expected = "iicp-directory-rs " + os.environ["IICP_PRE1_DIRECTORY_VERSION"]
         expected_code = 0
@@ -1141,7 +1218,7 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     workspace = validate_directory_binding(value, context, artifact, root)
     mapping = json.loads((workspace / "directory-case-map.json").read_text())
     case = mapping["support"] if scenario == "support" else mapping["scenarios"][scenario]
-    if component == "directory-rust" and scenario not in {"package-version-self-report", "config-missing", "config-malformed"}:
+    if component == "directory-rust" and scenario not in DIRECTORY_RUST_SCENARIOS:
         raise ValueError("Directory black-box scenario remains unimplemented")
     if component == "directory-php" and case["command"][0] != "@php":
         raise ValueError("Directory structural checks are not packaged operation evidence")
