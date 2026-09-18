@@ -1251,7 +1251,7 @@ def rust_http_case(binary, env, scenario, version, database=False):
             + "@127.0.0.1:3306/" + config["database"])
     else:
         launch_env["IICP_ALLOW_IN_MEMORY"] = "true"
-    with tempfile.TemporaryDirectory(prefix="directory-health-", dir=Path.cwd()) as health_dir, tempfile.TemporaryFile() as log:
+    with tempfile.TemporaryDirectory(prefix="directory-health-", dir=Path(env.get("TMPDIR", str(Path.cwd())))) as health_dir, tempfile.TemporaryFile() as log:
         snapshot = Path(health_dir) / "health.json"
         launch_env["IICP_RUNTIME_HEALTH_FILE"] = str(snapshot)
         process = subprocess.Popen([str(binary)], cwd=binary.parent,
