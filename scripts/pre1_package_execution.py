@@ -987,7 +987,8 @@ def initial_route_postcondition(request):
         # The reserved socket is not listening during the refusal control.
         server.server_close()
         status, value = request("/v1/register", body)
-        if status != 422 or value.get("error") != "IICP-E036":
+        if (status != 422 or not isinstance(value.get("error"), dict)
+                or value["error"].get("code") != "IICP-E036"):
             raise ValueError("unready external route registration was not refused")
         if request("/v1/node/fixture-route")[0] != 404:
             raise ValueError("unready route identity was persisted")
@@ -1059,7 +1060,10 @@ def rust_http_case(binary, env, scenario, version):
             raw = response.read(65537)
             if len(raw) > 65536:
                 raise ValueError("Directory HTTP evidence exceeds bound")
-            return response.code, json.loads(raw)
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("Directory HTTP evidence must be an object")
+            return response.code, value
     with tempfile.TemporaryFile() as log:
         process = subprocess.Popen([str(binary)], cwd=binary.parent,
             env={**env, "IICP_ALLOW_IN_MEMORY": "true",

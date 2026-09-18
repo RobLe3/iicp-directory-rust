@@ -118,9 +118,9 @@ class PackageExecutionTests(unittest.TestCase):
         import http.server, time
         from unittest.mock import Mock, MagicMock
         check = self.directory_http_functions()["initial_route_postcondition"]
-        rows = [(422, {"error": "IICP-E036"}), (404, {}),
+        rows = [(422, {"error": {"code": "IICP-E036"}}), (404, {}),
                 (201, {"node_id": "fixture-route"}), (200, {"endpoint": "http://127.0.0.1:12345"})]
-        for changed in [rows, [(422, {})], [rows[0], (200, {})], rows[:2] + [(422, {})],
+        for changed in [rows, [(422, {})], [(422, {"error": "IICP-E036"})], [rows[0], (200, {})], rows[:2] + [(422, {})],
                         rows[:3] + [(200, {"endpoint": "http://other.invalid"})]]:
             server = MagicMock(); server.__enter__.return_value = server; server.server_port = 12345
             server.handle_request.side_effect = lambda: time.sleep(0.001)
