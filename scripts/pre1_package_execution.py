@@ -890,7 +890,7 @@ def validate_management_binding(value, context, artifact, root):
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
-    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full"})
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed"})
@@ -1289,6 +1289,44 @@ def disk_full_snapshot_postcondition(process, snapshot, log, request):
     if recovered <= sequence or request('/health')[0] != 200:
         raise ValueError('Directory disk-full snapshot recovery differs')
 
+def crash_restart_snapshot_postcondition(process, snapshot, request, restart, version):
+    # Observe a real crash, preserve evidence, then require a new writer identity.
+    wait_snapshot_checkpoint(process, snapshot)
+    os.killpg(process.pid, signal.SIGKILL)
+    if process.wait(timeout=10) != -signal.SIGKILL:
+        raise ValueError("Directory fixture was not killed by SIGKILL")
+    _, verified = snapshot_checkpoint(snapshot, process.pid)
+    if snapshot.read_bytes() != verified:
+        raise ValueError("Directory crashed snapshot is not stable")
+    replacement = restart()
+    try:
+        if replacement.pid == process.pid:
+            raise ValueError("Directory replacement process identity was reused")
+        deadline = time.monotonic() + 30
+        while True:
+            if replacement.poll() is not None:
+                raise ValueError("Directory replacement exited before snapshot readiness")
+            # An old snapshot is retained, but never counts as new readiness.
+            value = json.loads(snapshot.read_bytes())
+            if value.get("pid") == replacement.pid:
+                sequence, _ = snapshot_checkpoint(snapshot, replacement.pid)
+                break
+            if time.monotonic() >= deadline:
+                raise ValueError("Directory replacement snapshot timed out")
+            time.sleep(0.1)
+        status, health = request("/health")
+        if status != 200 or health.get("ok") is not True or health.get("version") != "v" + version + "-rs":
+            raise ValueError("Directory replacement HTTP identity differs")
+        wait_snapshot_checkpoint(replacement, snapshot, sequence)
+        return replacement
+    except BaseException:
+        try:
+            os.killpg(replacement.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        replacement.wait(timeout=10)
+        raise
+
 def rust_http_case(binary, env, scenario, version, database=False):
     require_loopback_only()
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1343,6 +1381,12 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 permission_snapshot_postcondition(process, snapshot, log, request)
             elif scenario == "disk-full":
                 disk_full_snapshot_postcondition(process, snapshot, log, request)
+            elif scenario == "process-crash-restart":
+                def restart():
+                    return subprocess.Popen([str(binary)], cwd=binary.parent,
+                        env=launch_env, stdout=log, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+                process = crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
             elif scenario == "credential-replayed":
                 credential_replay_postcondition(request, database_observation)
             else:
@@ -1478,7 +1522,7 @@ env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
-                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full"}:
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             database=(Path.cwd() / "directory-operator-fixture.json").exists())
