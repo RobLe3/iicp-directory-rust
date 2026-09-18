@@ -17,6 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pre1_harness_binding import harness_identity, validate_harness_source
 from pre1_environment_contract import validate_modern_environment
+from pre1_package_execution import package_command, validate_binding, make_case_proof, write_case_proof
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = 'directory-rust'
@@ -87,6 +88,7 @@ def description() -> dict:
         "network_policy": "isolated-fixtures-only",
         "evidence_policy": "digest-only",
         "artifact_consumption": "verified-candidate-root",
+        "case_proof_schema": "iicp.pre1-packaged-case-proof.v2",
         "source_commit_binding": True,
         "supported_environment_schemas": [
             "iicp.pre1-qualification-environment.v1",
@@ -522,20 +524,25 @@ def main() -> int:
     if args.scenario is not None and args.scenario not in SCENARIO_COMMANDS:
         parser.error("scenario is not owned by this component")
     try:
-        runtime, runtime_row, manifest, _context = validate_context(
-            args.cell, args.scenario
-        )
+        runtime, runtime_row, manifest, context = validate_context(args.cell, args.scenario)
         validate_runtime(runtime, runtime_row, manifest)
         case = SCENARIO_CASES[args.scenario] if args.scenario else SUPPORT_CASE
-        template = case["command"]
-        argv = expand_command(template, runtime_row)
+        component = next(row for row in manifest["components"] if row["id"] == COMPONENT)
         env = command_environment(runtime_row, runtime)
-        verify_exact_assertion(argv, case["assertion"], env)
-        result = subprocess.run(argv, cwd=ROOT, env=env, check=False)
-    except (KeyError, OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+        argv, env, workspace, proof = package_command(ROOT, context, component,
+            Path(os.environ["IICP_PRE1_ARTIFACT_ROOT"]), [], env)
+        result = subprocess.run(argv, cwd=workspace, env=env, check=False,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=210)
+        print(result.stdout, end="")
+        validate_binding(proof["value"], context, proof["artifact"], ROOT)
+        marker = "IICP_PRE1_DIRECTORY_ASSERTION_PASS " + case["assertion"]
+        exit_code = result.returncode or (0 if result.stdout.splitlines() == [marker] else 2)
+        write_case_proof(make_case_proof(proof["value"], context, case["assertion"],
+            exit_code, os.environ["IICP_PRE1_RUN_ID"]))
+    except (KeyError, OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f"pre-1.0 {COMPONENT} case refused: {error}", file=sys.stderr)
         return 2
-    return result.returncode
+    return exit_code
 
 
 if __name__ == "__main__":
