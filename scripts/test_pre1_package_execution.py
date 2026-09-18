@@ -49,6 +49,34 @@ class PackageExecutionTests(unittest.TestCase):
             self.assertEqual(invoke.call_args.args[2], scenario)
             self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
 
+    def test_crash_restart_requires_new_snapshot_identity_health_and_progress(self):
+        from unittest.mock import Mock
+        import signal
+        for failure in [None, "kill", "exit", "health", "progress", "stale"]:
+            ns = self.directory_http_functions()
+            snapshot = self.workspace / "restart.json"
+            snapshot.write_text(json.dumps({"health_schema_version": 1, "pid": 321, "sequence": 2}))
+            snapshot.chmod(0o600)
+            old = Mock(pid=321); old.wait.return_value = 0 if failure == "kill" else -signal.SIGKILL
+            new = Mock(pid=654); new.poll.return_value = 1 if failure == "exit" else None
+            def restart():
+                if failure != "stale":
+                    snapshot.write_text(json.dumps({"health_schema_version": 1, "pid": 654, "sequence": 1}))
+                    snapshot.chmod(0o600)
+                return new
+            wait = Mock(side_effect=[(2, b"old"), ValueError("no progress") if failure == "progress" else (2, b"new")])
+            health = Mock(return_value=(503 if failure == "health" else 200, {"ok": True, "version": "v0.1.15-rs"}))
+            with self.subTest(failure=failure), patch.dict(ns, wait_snapshot_checkpoint=wait), patch("os.killpg") as kill, patch.object(ns["time"], "monotonic", side_effect=[0, 31]):
+                if failure is None:
+                    self.assertIs(ns["crash_restart_snapshot_postcondition"](old, snapshot, health, restart, "0.1.15"), new)
+                    self.assertEqual(wait.call_args.args, (new, snapshot, 1))
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["crash_restart_snapshot_postcondition"](old, snapshot, health, restart, "0.1.15")
+                    if failure != "kill":
+                        self.assertEqual(kill.call_args.args, (654, signal.SIGKILL))
+            snapshot.unlink()
+
     def test_snapshot_checkpoint_refuses_identity_permissions_and_partial_output(self):
         check = self.directory_http_functions()["snapshot_checkpoint"]
         path = self.workspace / "snapshot.json"
@@ -466,7 +494,7 @@ class PackageExecutionTests(unittest.TestCase):
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
-                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full"]}}
+                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
