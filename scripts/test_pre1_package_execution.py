@@ -63,6 +63,8 @@ class PackageExecutionTests(unittest.TestCase):
             observe = Mock(side_effect=copy.deepcopy(observations))
             check(request, observe)
         calls = request.call_args_list
+        self.assertEqual(calls[0].args[1]["transport_method"], "direct_ipv4")
+        self.assertNotIn("nat_method", calls[0].args[1])
         answer = lambda value: hmac.new(b"fixture-key", value.encode(), hashlib.sha256).hexdigest()
         self.assertNotIn("challenge_response", calls[1].args[1])
         self.assertEqual(calls[2].args[1]["challenge_response"], answer("1"))
@@ -142,6 +144,14 @@ class PackageExecutionTests(unittest.TestCase):
                     {key: "sha256:" + "b" * 64 for key in adapter.BINDINGS}, stage_fixtures=False)
             dependency.assert_called_once_with(workspace)
             self.assertEqual(value["test_dependencies_sha256"], adapter.digest(deps))
+
+    def test_replay_case_requires_database_but_other_modes_do_not_claim_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            with self.assertRaisesRegex(ValueError, "database fixture is missing"):
+                adapter.require_directory_database_fixture("directory-rust", "credential-replayed", workspace)
+            self.assertIsNone(adapter.require_directory_database_fixture("directory-rust", "config-missing", workspace))
+            self.assertIsNone(adapter.require_directory_database_fixture("directory-php", "credential-replayed", workspace))
 
     def test_duplicate_registration_requires_damaged_reputation_and_identity_preservation(self):
         from unittest.mock import Mock

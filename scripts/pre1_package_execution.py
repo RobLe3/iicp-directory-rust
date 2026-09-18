@@ -1131,7 +1131,7 @@ def credential_replay_postcondition(request, observe):
     if observe() is not None:
         raise ValueError("Directory replay fixture identity already exists")
     body = {"node_id": "fixture-replay", "endpoint": "http://127.0.0.1:1/v1/task",
-        "region": "eu-central", "nat_type": "public", "nat_method": "direct_ipv4",
+        "region": "eu-central", "nat_type": "public", "transport_method": "direct_ipv4",
         "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
     status, registered = request("/v1/register", body)
     token, key = registered.get("node_token"), registered.get("node_hmac_key")
@@ -1628,6 +1628,13 @@ def validate_directory_binding(value, context, artifact, root):
     return safe_path(Path(value["workspace"]))
 
 
+
+def require_directory_database_fixture(component, scenario, workspace):
+    if component == "directory-rust" and scenario in DIRECTORY_RUST_DATABASE_SCENARIOS:
+        if not directory_database_dependencies(workspace):
+            raise ValueError("Directory packaged database fixture is missing")
+
+
 def directory_package_command(root, context, component_manifest, artifact_root, env, value):
     component, scenario = context["component"], context["scenario_id"]
     if context["mode"] != "local-only":
@@ -1649,9 +1656,7 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
            "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"]}
-    if component == "directory-rust" and scenario in DIRECTORY_RUST_DATABASE_SCENARIOS:
-        if not directory_database_dependencies(workspace):
-            raise ValueError("Directory packaged database fixture is missing")
+    require_directory_database_fixture(component, scenario, workspace)
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
