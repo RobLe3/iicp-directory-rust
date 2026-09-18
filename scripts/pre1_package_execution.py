@@ -1105,12 +1105,12 @@ def database_observation():
     config, password = database_fixture_inputs()
     tools = Path.cwd() / "directory-database-tools"
     argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
-        "--no-defaults", "--no-login-paths", "--batch", "--raw", "--skip-column-names", "--protocol=TCP", "--host=127.0.0.1",
+        "--no-defaults", "--batch", "--raw", "--skip-column-names", "--protocol=TCP", "--host=127.0.0.1",
         "--port=3306", "--connect-timeout=3", "--user=" + config["username"],
         "--database=" + config["database"], "--execute",
         "SELECT UNIX_TIMESTAMP(liveness_verified_at), liveness_challenge FROM nodes WHERE id = 'fixture-replay'"]
-    with tempfile.TemporaryFile() as output:
-        result = subprocess.run(argv, env={"PATH": os.environ.get("PATH", ""), "MYSQL_PWD": password},
+    with tempfile.TemporaryDirectory(prefix="directory-oracle-home-", dir=Path.cwd()) as private_home, tempfile.TemporaryFile() as output:
+        result = subprocess.run(argv, env={"PATH": os.environ.get("PATH", ""), "MYSQL_PWD": password, "HOME": private_home},
             stdout=output, stderr=subprocess.DEVNULL, timeout=10)
         output.seek(0); raw = output.read(4097)
     if result.returncode or len(raw) > 4096:

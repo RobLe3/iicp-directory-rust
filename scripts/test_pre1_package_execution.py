@@ -92,7 +92,8 @@ class PackageExecutionTests(unittest.TestCase):
                 (b"-1\tchallenge", 0, "FAIL"), (b"x" * 4097, 0, "FAIL"), (b"", 1, "FAIL")]:
             def invoke(argv, **kwargs):
                 self.assertIn("--host=127.0.0.1", argv)
-                self.assertEqual(argv[4:6], ["--no-defaults", "--no-login-paths"])
+                self.assertEqual(argv[4], "--no-defaults")
+                self.assertEqual(list(Path(kwargs["env"]["HOME"]).iterdir()), [])
                 self.assertNotIn("synthetic-private-password", " ".join(argv))
                 self.assertEqual(kwargs["timeout"], 10)
                 kwargs["stdout"].write(raw)
