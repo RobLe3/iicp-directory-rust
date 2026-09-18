@@ -1034,7 +1034,7 @@ def http_postcondition(request, scenario):
     else:
         raise ValueError("Directory HTTP scenario remains unimplemented")
 
-def rust_http_case(binary, env, scenario, version):
+def require_loopback_only():
     # The frozen listener binds 0.0.0.0:8090. Admit this in-memory fixture only
     # in a Linux network namespace with loopback alone, never on the host LAN.
     import fcntl, socket, struct
@@ -1044,6 +1044,9 @@ def rust_http_case(binary, env, scenario, version):
                 struct.pack("256s", name.encode())), 16)[0] & 1}
     if active != {"lo"}:
         raise ValueError("Directory HTTP fixture requires loopback-only isolation")
+
+def rust_http_case(binary, env, scenario, version):
+    require_loopback_only()
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
@@ -1091,6 +1094,119 @@ def rust_http_case(binary, env, scenario, version):
                 pass
             process.wait(timeout=10)
 
+def php_operator_case(installed, env, scenario, version):
+    require_loopback_only()
+    import hashlib, re, stat
+    workspace = Path.cwd()
+    config = json.loads((workspace / "directory-operator-fixture.json").read_text())
+    if (set(config) != {"schema", "database", "username", "port"}
+        or config["schema"] != "iicp.pre1-directory-operator-fixture.v1"
+        or not re.fullmatch(r"iicp_pre1_[a-f0-9]{16}", config["database"])
+        or config["username"] != "iicp_pre1_fixture" or config["port"] != 3306):
+        raise ValueError("Directory operator fixture configuration differs")
+    secret = workspace / "directory-operator-password"
+    if secret.is_symlink() or stat.S_IMODE(secret.stat().st_mode) != 0o600:
+        raise ValueError("Directory operator secret must be a private regular file")
+    previous = workspace / "previous/payload"
+    base = {**env, "APP_ENV": "testing", "DB_CONNECTION": "mysql", "DB_HOST": "127.0.0.1",
+        "DB_PORT": "3306", "DB_DATABASE": config["database"], "DB_USERNAME": config["username"],
+        "DB_PASSWORD": secret.read_text().strip(), "CACHE_STORE": "array", "SESSION_DRIVER": "array",
+        "QUEUE_CONNECTION": "sync", "LOG_CHANNEL": "stderr", "APP_URL": "http://localhost"}
+    php = os.environ["IICP_PRE1_DIRECTORY_PHP"]
+    helper = str(workspace / "directory-operator.php")
+    def command(root, args):
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen([php, *args], cwd=root, env=base,
+                stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                process.wait(timeout=120)
+                if process.returncode != 0:
+                    raise ValueError("Directory packaged operator command failed")
+                output.seek(0)
+                data = output.read(65537)
+                if len(data) > 65536:
+                    raise ValueError("Directory operator output exceeds bound")
+                return data.decode()
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=10)
+    def migrate(root):
+        command(root, ["artisan", "migrate", "--force", "--no-interaction"])
+    def ready(root, expected):
+        value = json.loads(command(root, [helper, "ready"]))
+        if value != {"ready": True, "version": expected}:
+            raise ValueError("Directory packaged operator readiness differs")
+    def verify(root):
+        if command(root, [helper, "digest"]).strip() != hashlib.sha256(b"1:alpha|2:beta").hexdigest():
+            raise ValueError("Directory persistent fixture digest differs")
+    # Each case gets an empty, disposable schema. Never erase a pre-existing schema.
+    if command(installed, [helper, "empty"]).strip() != "true":
+        raise ValueError("Directory operator database is not empty")
+    backup = workspace / "directory-backup.json"
+    if backup.exists() or backup.is_symlink():
+        raise ValueError("Directory operator backup already exists")
+    try:
+        migrate(previous)
+        ready(previous, "1.10.93")
+        command(previous, [helper, "seed"])
+        verify(previous)
+        command(previous, [helper, "backup", str(backup)])
+        backup_digest = hashlib.sha256(backup.read_bytes()).hexdigest()
+        if scenario == "migration-interrupted":
+            interrupt_migration(installed, workspace, php, base, command, helper)
+            verify(previous)
+        elif scenario not in {"backup-restore", "rollback-last-supported"}:
+            raise ValueError("Directory operator scenario remains unimplemented")
+        migrate(installed)
+        ready(installed, version)
+        verify(installed)
+        command(installed, [helper, "tamper"])
+        if hashlib.sha256(backup.read_bytes()).hexdigest() != backup_digest:
+            raise ValueError("Directory operator backup changed")
+        command(installed, [helper, "restore", str(backup)])
+        ready(previous, "1.10.93")
+        command(previous, ["artisan", "migrate:status", "--no-interaction"])
+        verify(previous)
+        migrate(installed)
+        ready(installed, version)
+        verify(installed)
+    finally:
+        # Only the checked synthetic schema. The allocation controller separately owns the DB process.
+        command(installed, [helper, "reset"])
+        if command(installed, [helper, "empty"]).strip() != "true":
+            raise ValueError("Directory operator schema cleanup failed")
+        backup.unlink(missing_ok=True)
+
+def interrupt_migration(installed, workspace, php, env, command, helper):
+    checkpoint = workspace / "directory-interruption-ready"
+    if checkpoint.exists() or checkpoint.is_symlink():
+        raise ValueError("Directory interruption checkpoint already exists")
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen([php, "artisan", "migrate", "--force", "--no-interaction",
+            "--realpath", "--path=" + str(workspace / "directory-interruption.php")], cwd=installed,
+            env={**env, "IICP_PRE1_INTERRUPTION_READY": str(checkpoint)},
+            stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 20
+            while not checkpoint.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise ValueError("Directory migration interruption was not observed")
+                time.sleep(0.1)
+            if checkpoint.is_symlink() or checkpoint.read_text() != "transaction-open":
+                raise ValueError("Directory interruption checkpoint differs")
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
+            checkpoint.unlink(missing_ok=True)
+    if process.returncode != -signal.SIGKILL:
+        raise ValueError("Directory migration was not interrupted")
+
 context = json.loads(os.environ["IICP_PRE1_EXECUTION_CONTEXT"])
 component, scenario = context["component"], context["scenario_id"]
 if context["mode"] != "local-only":
@@ -1124,6 +1240,11 @@ if component == "directory-rust":
     else:
         raise ValueError("Directory packaged scenario is not implemented")
 else:
+    if scenario in {"backup-restore", "migration-interrupted", "rollback-last-supported"}:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
+        php_operator_case(installed, env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
     mapping = json.loads(Path("directory-case-map.json").read_text())
     case = mapping["support"] if scenario == "support" else mapping["scenarios"][scenario]
     argv = [os.environ["IICP_PRE1_DIRECTORY_PHP"], *case["command"][1:]]
