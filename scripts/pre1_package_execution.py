@@ -890,7 +890,7 @@ def validate_management_binding(value, context, artifact, root):
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
-    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied"})
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed"})
@@ -1221,6 +1221,74 @@ def permission_snapshot_postcondition(process, snapshot, log, request):
     if recovered <= sequence or request("/health")[0] != 200:
         raise ValueError("Directory snapshot recovery differs")
 
+def bounded_snapshot_filesystem(directory):
+    # Never fill a host bind mount or an unbounded developer filesystem.
+    import stat
+    if directory.is_symlink() or directory.parent.is_symlink():
+        raise ValueError("Directory disk-full fixture path is unsafe")
+    directory = directory.resolve(strict=True)
+    parent = directory.parent.stat()
+    if stat.S_IMODE(parent.st_mode) != 0o700 or parent.st_uid != os.getuid():
+        raise ValueError("Directory disk-full fixture mount must be private and owned")
+    mounts = []
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        fields = line.split()
+        mount = Path(fields[4])
+        if directory == mount or mount in directory.parents:
+            mounts.append((len(mount.parts), fields[fields.index('-') + 1], mount))
+    info = os.statvfs(directory)
+    ceiling = info.f_blocks * info.f_frsize
+    selected = max(mounts, key=lambda row: row[0]) if mounts else None
+    if not selected or selected[1] != 'tmpfs' or selected[2] != directory.parent or not 0 < ceiling <= 16 * 1024 * 1024:
+        raise ValueError('Directory disk-full fixture requires bounded Linux tmpfs')
+    return ceiling
+
+def exhaust_snapshot_filesystem(directory, ceiling):
+    import errno
+    filler = directory / 'disk-full.fixture'
+    try:
+        with filler.open('xb', buffering=0) as stream:
+            block = b'\0' * 65536
+            written = 0
+            while written <= ceiling:
+                try:
+                    count = stream.write(block)
+                    if not count:
+                        raise ValueError('Directory disk-full fixture made no progress')
+                    written += count
+                except OSError as error:
+                    if error.errno != errno.ENOSPC:
+                        raise
+                    return filler
+        raise ValueError('Directory disk-full fixture did not exhaust storage')
+    except BaseException:
+        # Only remove a file created here; exclusive creation protects existing paths.
+        if 'stream' in locals():
+            filler.unlink(missing_ok=True)
+        raise
+
+def disk_full_snapshot_postcondition(process, snapshot, log, request):
+    ceiling = bounded_snapshot_filesystem(snapshot.parent)
+    sequence, verified = wait_snapshot_checkpoint(process, snapshot)
+    offset = os.fstat(log.fileno()).st_size
+    filler = exhaust_snapshot_filesystem(snapshot.parent, ceiling)
+    try:
+        deadline = time.monotonic() + 12
+        refusal = b'snapshot write failed: No space left on device (os error 28)'
+        while refusal not in os.pread(log.fileno(), 65536, offset):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise ValueError('Directory snapshot disk-full refusal was not observed')
+            time.sleep(0.1)
+        if snapshot_checkpoint(snapshot, process.pid)[1] != verified or list(snapshot.parent.glob('*.tmp-*')):
+            raise ValueError('Directory disk-full write changed verified snapshot')
+        if request('/health')[0] != 200:
+            raise ValueError('Directory disk-full failure broke runtime health')
+    finally:
+        filler.unlink()
+    recovered, _ = wait_snapshot_checkpoint(process, snapshot, sequence)
+    if recovered <= sequence or request('/health')[0] != 200:
+        raise ValueError('Directory disk-full snapshot recovery differs')
+
 def rust_http_case(binary, env, scenario, version, database=False):
     require_loopback_only()
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1251,7 +1319,7 @@ def rust_http_case(binary, env, scenario, version, database=False):
             + "@127.0.0.1:3306/" + config["database"])
     else:
         launch_env["IICP_ALLOW_IN_MEMORY"] = "true"
-    with tempfile.TemporaryDirectory(prefix="directory-health-", dir=Path(env.get("TMPDIR", str(Path.cwd())))) as health_dir, tempfile.TemporaryFile() as log:
+    with tempfile.TemporaryDirectory(prefix="directory-health-", dir=Path(env.get("TMPDIR", str(Path.cwd())))) as health_dir, tempfile.TemporaryFile(dir=binary.parent if scenario == "disk-full" else None) as log:
         snapshot = Path(health_dir) / "health.json"
         launch_env["IICP_RUNTIME_HEALTH_FILE"] = str(snapshot)
         process = subprocess.Popen([str(binary)], cwd=binary.parent,
@@ -1273,6 +1341,8 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 time.sleep(0.1)
             if scenario == "config-permission-denied":
                 permission_snapshot_postcondition(process, snapshot, log, request)
+            elif scenario == "disk-full":
+                disk_full_snapshot_postcondition(process, snapshot, log, request)
             elif scenario == "credential-replayed":
                 credential_replay_postcondition(request, database_observation)
             else:
@@ -1408,7 +1478,7 @@ env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
-                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied"}:
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             database=(Path.cwd() / "directory-operator-fixture.json").exists())

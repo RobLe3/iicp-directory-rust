@@ -93,6 +93,83 @@ class PackageExecutionTests(unittest.TestCase):
                 self.assertEqual(snapshot.parent.stat().st_mode & 0o777, 0o700)
             ns["wait_snapshot_checkpoint"] = original
 
+    def test_disk_full_refuses_host_filesystems_and_oversized_tmpfs(self):
+        from types import SimpleNamespace
+        check = self.directory_http_functions()["bounded_snapshot_filesystem"]
+        self.workspace.chmod(0o700)
+        directory = self.workspace / "snapshot"
+        directory.mkdir()
+        info = SimpleNamespace(f_blocks=4096, f_frsize=4096)
+        for kind, blocks in [("ext4", 4096), ("tmpfs", 4097), ("tmpfs", 0)]:
+            info.f_blocks = blocks
+            with patch.object(Path, "read_text", return_value=f"1 0 0:1 / {self.workspace} rw - {kind} none rw\n"), patch.object(os, "statvfs", return_value=info):
+                with self.subTest(kind=kind, blocks=blocks), self.assertRaisesRegex(ValueError, "bounded Linux tmpfs"):
+                    check(directory)
+        info.f_blocks = 4096
+        with patch.object(Path, "read_text", return_value=f"1 0 0:1 / {self.workspace} rw - tmpfs none rw\n"), patch.object(os, "statvfs", return_value=info):
+            self.assertEqual(check(directory), 16777216)
+        self.workspace.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "private and owned"):
+            check(directory)
+        self.workspace.chmod(0o700)
+        with patch.object(Path, "read_text", return_value="1 0 0:1 / / rw - tmpfs none rw\n"), patch.object(os, "statvfs", return_value=info):
+            with self.assertRaisesRegex(ValueError, "bounded Linux tmpfs"):
+                check(directory)
+
+    def test_disk_full_filler_requires_enospc_and_preserves_existing_paths(self):
+        import errno
+        from unittest.mock import MagicMock
+        fill = self.directory_http_functions()["exhaust_snapshot_filesystem"]
+        filler = self.workspace / "disk-full.fixture"
+        filler.write_bytes(b"existing")
+        with self.assertRaises(FileExistsError):
+            fill(self.workspace, 65536)
+        self.assertEqual(filler.read_bytes(), b"existing")
+        filler.unlink(); filler.symlink_to(self.workspace / "outside")
+        with self.assertRaises(FileExistsError):
+            fill(self.workspace, 65536)
+        self.assertTrue(filler.is_symlink()); filler.unlink()
+        stream = MagicMock(); stream.__enter__.return_value = stream
+        stream.write.side_effect = OSError(errno.ENOSPC, "fixture")
+        with patch.object(Path, "open", return_value=stream):
+            self.assertEqual(fill(self.workspace, 65536), filler)
+        stream.write.side_effect = OSError(errno.EIO, "fixture")
+        with patch.object(Path, "open", return_value=stream), self.assertRaises(OSError):
+            fill(self.workspace, 65536)
+        stream.write.side_effect = None; stream.write.return_value = 65536
+        with patch.object(Path, "open", return_value=stream), self.assertRaisesRegex(ValueError, "did not exhaust"):
+            fill(self.workspace, 65536)
+
+    def test_disk_full_snapshot_requires_refusal_preservation_health_and_recovery(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        snapshot = self.workspace / "health.json"
+        baseline = b'{"health_schema_version":1,"pid":321,"sequence":2}'
+        process = Mock(pid=321); process.poll.return_value = None
+        ns["bounded_snapshot_filesystem"] = Mock(return_value=16777216)
+        def fill(*args):
+            filler = self.workspace / "disk-full.fixture"
+            filler.write_bytes(b"fixture")
+            return filler
+        ns["exhaust_snapshot_filesystem"] = fill
+        for bad in [None, "preservation", "partial", "health", "recovery", "missing-refusal"]:
+            snapshot.write_bytes(baseline); snapshot.chmod(0o600)
+            ns["wait_snapshot_checkpoint"] = Mock(side_effect=[(2, baseline), (2 if bad == "recovery" else 3, baseline)])
+            ns["snapshot_checkpoint"] = Mock(return_value=(2, b"changed" if bad == "preservation" else baseline))
+            temporary = self.workspace / "health.tmp-321"
+            if bad == "partial": temporary.write_text("{")
+            request = Mock(return_value=(503 if bad == "health" else 200, {}))
+            process.poll.return_value = 1 if bad == "missing-refusal" else None
+            with tempfile.TemporaryFile() as log, patch.object(os, "pread", return_value=b"" if bad == "missing-refusal" else b"snapshot write failed: No space left on device (os error 28)"):
+                with self.subTest(bad=bad):
+                    if bad:
+                        with self.assertRaises(ValueError): ns["disk_full_snapshot_postcondition"](process, snapshot, log, request)
+                    else:
+                        ns["disk_full_snapshot_postcondition"](process, snapshot, log, request)
+                        self.assertEqual(request.call_count, 2)
+            self.assertFalse((self.workspace / "disk-full.fixture").exists())
+            temporary.unlink(missing_ok=True)
+
     def test_credential_replay_requires_database_verification_rotation_and_recovery(self):
         from unittest.mock import Mock
         import hashlib, hmac
@@ -389,7 +466,7 @@ class PackageExecutionTests(unittest.TestCase):
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
-                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied"]}}
+                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
