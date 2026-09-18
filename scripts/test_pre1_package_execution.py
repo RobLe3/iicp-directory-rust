@@ -31,7 +31,7 @@ class PackageExecutionTests(unittest.TestCase):
         return namespace
 
     def test_all_admitted_http_cases_reach_staged_runtime_dispatch(self):
-        import ast, resource
+        import ast
         from unittest.mock import Mock
         tree = ast.parse(adapter.DIRECTORY_PROBE)
         branch = next(n for n in tree.body if isinstance(n, ast.If)
@@ -41,7 +41,7 @@ class PackageExecutionTests(unittest.TestCase):
             namespace = {"component": "directory-rust", "scenario": scenario,
                 "installed": Path("/fixture"), "Path": Path, "env": {},
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
-                "resource": Mock(RLIMIT_FSIZE=resource.RLIMIT_FSIZE),
+                "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
