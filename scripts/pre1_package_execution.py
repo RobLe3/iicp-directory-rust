@@ -889,13 +889,128 @@ def validate_management_binding(value, context, artifact, root):
 
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
-DIRECTORY_RUST_SCENARIOS = frozenset({"package-version-self-report", "config-missing", "config-malformed",
-                                     "credential-missing", "unsupported-version"})
+DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness"})
+DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | frozenset({
+    "package-version-self-report", "config-missing", "config-malformed"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import urllib.request, urllib.error
+
+
+def replica_snapshot_postcondition(request, scenario):
+    # This key belongs only to the isolated synthetic fixture. Never inherit
+    # APP_KEY or credentials from the operator environment.
+    import base64, hashlib, hmac
+    def token(expiry):
+        now = int(time.time())
+        encode = lambda value: base64.urlsafe_b64encode(json.dumps(
+            value, separators=(",", ":")).encode()).rstrip(b"=")
+        header = encode({"alg": "HS256", "typ": "JWT"})
+        claims = encode({"sub": "fixture-unregistered", "iss": "iicp.network",
+            "iat": now - 7200, "exp": expiry, "role": "replica",
+            "scope": "GET /v1/snapshot", "jti": "0" * 32})
+        message = header + b"." + claims
+        signature = base64.urlsafe_b64encode(hmac.new(
+            b"iicp-pre1-isolated-synthetic-key", message, hashlib.sha256).digest()).rstrip(b"=")
+        return (message + b"." + signature).decode()
+    def snapshot(credential):
+        return request("/v1/snapshot", headers={"Authorization": "Bearer " + credential})
+    if scenario == "credential-expired":
+        status, value = snapshot(token(int(time.time()) + 300))
+        if status != 401 or value.get("error", {}).get("message") != "Replica not registered":
+            raise ValueError("non-expired signature positive control differs")
+        status, value = snapshot(token(int(time.time()) - 3600))
+        if status != 401 or value.get("error", {}).get("code") != "token_expired":
+            raise ValueError("expired credential refusal cause differs")
+    else:
+        body = {"did": "did:web:replica-fixture.invalid", "endpoint": "http://127.0.0.1:1/v1"}
+        def register():
+            status, value = request("/v1/replicas/register", body)
+            if (status != 200 or not isinstance(value.get("replica_id"), str)
+                    or not value["replica_id"] or not isinstance(value.get("replica_token"), str)
+                    or not value["replica_token"]):
+                raise ValueError("synthetic replica registration differs")
+            return value
+        first = register()
+        if snapshot(first["replica_token"])[0] != 200:
+            raise ValueError("first replica credential positive control failed")
+        second = register()
+        if (first["replica_id"] != second["replica_id"]
+                or first["replica_token"] == second["replica_token"]):
+            raise ValueError("replica rotation identity or credential differs")
+        status, value = snapshot(first["replica_token"])
+        if (status != 401 or value.get("error", {}).get("code") != "unauthorized"
+                or "token has been rotated" not in value.get("error", {}).get("message", "")):
+            raise ValueError("rotated credential refusal cause differs")
+        if snapshot(second["replica_token"])[0] != 200:
+            raise ValueError("replacement replica credential failed")
+
+def registration_rate_postcondition(request):
+    # Validation failures still consume admission capacity, without DNS probes,
+    # providers, persistence, or external traffic. A fresh child owns this window.
+    body = {"endpoint": "http://127.0.0.1:1",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}],
+            "sdk_compatibility_version": "0.7.101", "sdk_version": "0.7.100"}
+    def validation():
+        status, value = request("/v1/register", body)
+        if status != 422 or "sdk_compatibility_version must match sdk_version" not in json.dumps(value):
+            raise ValueError("registration admission validation control differs")
+    started = time.monotonic()
+    for _ in range(60):
+        validation()
+    for _ in range(2):
+        status, value = request("/v1/register", body)
+        if (status != 429 or value.get("error") != "IICP-E034"
+                or type(value.get("retry_after")) is not int or value["retry_after"] != 60):
+            raise ValueError("registration rate rejection differs")
+    if time.monotonic() - started >= 55:
+        raise ValueError("registration burst exceeded safe fixture window")
+    time.sleep(max(0, 61 - (time.monotonic() - started)))
+    validation()
+
+def initial_route_postcondition(request):
+    import http.server, threading
+    class Provider(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200 if self.path == "/iicp/health" else 404)
+            self.end_headers()
+        def log_message(self, *args):
+            pass
+    with http.server.HTTPServer(("127.0.0.1", 0), Provider) as server:
+        endpoint = "http://127.0.0.1:" + str(server.server_port)
+        body = {"node_id": "fixture-route", "endpoint": endpoint,
+            "nat_type": "symmetric", "transport_method": "external_tunnel",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1"}]}
+        # The reserved socket is not listening during the refusal control.
+        server.server_close()
+        status, value = request("/v1/register", body)
+        if status != 422 or value.get("error") != "IICP-E036":
+            raise ValueError("unready external route registration was not refused")
+        if request("/v1/node/fixture-route")[0] != 404:
+            raise ValueError("unready route identity was persisted")
+        with http.server.HTTPServer(("127.0.0.1", int(endpoint.rsplit(":", 1)[1])), Provider) as ready:
+            ready.timeout = 0.1
+            stopping = threading.Event()
+            def serve():
+                while not stopping.is_set():
+                    ready.handle_request()
+            worker = threading.Thread(target=serve)
+            worker.start()
+            try:
+                status, value = request("/v1/register", body)
+                if status != 201 or value.get("node_id") != body["node_id"]:
+                    raise ValueError("ready external route registration failed")
+                status, value = request("/v1/node/fixture-route")
+                if status != 200 or value.get("endpoint") != endpoint:
+                    raise ValueError("ready route endpoint was not persisted")
+            finally:
+                stopping.set()
+                worker.join(timeout=3)
+                if worker.is_alive():
+                    raise ValueError("synthetic route worker did not stop")
 
 def http_postcondition(request, scenario):
     if scenario == "credential-missing":
@@ -909,6 +1024,12 @@ def http_postcondition(request, scenario):
             "sdk_compatibility_version": "0.7.101", "sdk_version": "0.7.100"})
         if status != 422 or "sdk_compatibility_version must match sdk_version" not in json.dumps(value):
             raise ValueError("conflicted version refusal cause differs")
+    elif scenario in {"credential-expired", "credential-rotated"}:
+        replica_snapshot_postcondition(request, scenario)
+    elif scenario == "rate-limit":
+        registration_rate_postcondition(request)
+    elif scenario == "dynamic-public-route-readiness":
+        initial_route_postcondition(request)
     else:
         raise ValueError("Directory HTTP scenario remains unimplemented")
 
@@ -926,10 +1047,10 @@ def rust_http_case(binary, env, scenario, version):
         def redirect_request(self, *args, **kwargs):
             return None
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    def request(path, body=None):
+    def request(path, body=None, headers=None):
         req = urllib.request.Request("http://127.0.0.1:8090" + path,
             data=None if body is None else json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json", **(headers or {})})
         try:
             response = opener.open(req, timeout=2)
         except urllib.error.HTTPError as error:
@@ -941,7 +1062,8 @@ def rust_http_case(binary, env, scenario, version):
             return response.code, json.loads(raw)
     with tempfile.TemporaryFile() as log:
         process = subprocess.Popen([str(binary)], cwd=binary.parent,
-            env={**env, "IICP_ALLOW_IN_MEMORY": "true"}, stdout=log, stderr=subprocess.STDOUT,
+            env={**env, "IICP_ALLOW_IN_MEMORY": "true",
+                 "APP_KEY": "iicp-pre1-isolated-synthetic-key"}, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True)
         try:
             deadline = time.monotonic() + 30
@@ -975,7 +1097,8 @@ env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP") if k 
 env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
-    if scenario in {"credential-missing", "unsupported-version"}:
+    if scenario in {"credential-missing", "unsupported-version", "credential-expired",
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)

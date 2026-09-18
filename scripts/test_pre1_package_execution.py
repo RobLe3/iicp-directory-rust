@@ -42,6 +42,98 @@ class PackageExecutionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check(lambda *a: (200, {}), "backup-restore")
 
+    def test_directory_expired_credential_requires_valid_signature_control_and_specific_cause(self):
+        from unittest.mock import Mock
+        check = self.directory_http_functions()["replica_snapshot_postcondition"]
+        good = (401, {"error": {"message": "Replica not registered"}})
+        expired = (401, {"error": {"code": "token_expired"}})
+        request = Mock(side_effect=[good, expired])
+        check(request, "credential-expired")
+        first, second = [c.kwargs["headers"]["Authorization"] for c in request.call_args_list]
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("Bearer "))
+        for responses in ([expired, expired], [good, (401, {})], [good, (200, {})]):
+            with self.subTest(responses=responses), self.assertRaises(ValueError):
+                check(Mock(side_effect=responses), "credential-expired")
+
+    def test_directory_synthetic_replica_jwt_has_deterministic_fixture_signature(self):
+        import base64, hashlib, hmac
+        from unittest.mock import Mock
+        request = Mock(side_effect=[(401, {"error": {"message": "Replica not registered"}}),
+                                   (401, {"error": {"code": "token_expired"}})])
+        self.directory_http_functions()["replica_snapshot_postcondition"](request, "credential-expired")
+        value = request.call_args_list[0].kwargs["headers"]["Authorization"][7:]
+        header, claims, signature = value.split(".")
+        decode = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+        self.assertEqual(json.loads(decode(header)), {"alg": "HS256", "typ": "JWT"})
+        self.assertEqual(json.loads(decode(claims))["scope"], "GET /v1/snapshot")
+        self.assertEqual(decode(signature), hmac.new(b"iicp-pre1-isolated-synthetic-key",
+                         (header + "." + claims).encode(), hashlib.sha256).digest())
+
+    def test_directory_rotated_credential_requires_old_refusal_and_replacement_success(self):
+        from unittest.mock import Mock
+        check = self.directory_http_functions()["replica_snapshot_postcondition"]
+        rows = [(200, {"replica_id": "fixture", "replica_token": "old"}), (200, {}),
+                (200, {"replica_id": "fixture", "replica_token": "new"}),
+                (401, {"error": {"code": "unauthorized", "message": "Replica token has been rotated"}}), (200, {})]
+        check(Mock(side_effect=rows), "credential-rotated")
+        mutations = [(1, (401, {})), (2, rows[0]),
+                     (2, (200, {"replica_id": "other", "replica_token": "new"})),
+                     (3, (401, {"error": {"code": "token_expired"}})), (3, (200, {})), (4, (401, {}))]
+        for index, value in mutations:
+            changed = rows.copy(); changed[index] = value
+            with self.subTest(index=index, value=value), self.assertRaises(ValueError):
+                check(Mock(side_effect=changed), "credential-rotated")
+
+    def test_directory_rate_burst_is_bounded_and_tests_recovery(self):
+        from unittest.mock import Mock
+        import time
+        check = self.directory_http_functions()["registration_rate_postcondition"]
+        normal = (422, {"message": "sdk_compatibility_version must match sdk_version"})
+        limit = (429, {"error": "IICP-E034", "retry_after": 60})
+        request = Mock(side_effect=[normal] * 60 + [limit] * 2 + [normal])
+        with patch.object(time, "monotonic", return_value=10), patch.object(time, "sleep") as sleep:
+            check(request)
+        self.assertEqual(request.call_count, 63)
+        sleep.assert_called_once_with(61)
+        self.assertTrue(request.call_args.args[1]["capabilities"])
+
+    def test_directory_rate_rejects_early_limit_wrong_reason_and_absent_recovery(self):
+        from unittest.mock import Mock
+        import time
+        check = self.directory_http_functions()["registration_rate_postcondition"]
+        normal = (422, {"message": "sdk_compatibility_version must match sdk_version"})
+        limit = (429, {"error": "IICP-E034", "retry_after": 60})
+        for rows in ([limit], [normal] * 60 + [(429, {})],
+                     [normal] * 60 + [limit] * 2 + [limit]):
+            with self.subTest(length=len(rows)), patch.object(time, "monotonic", return_value=0), \
+                    patch.object(time, "sleep"), self.assertRaises(ValueError):
+                check(Mock(side_effect=rows))
+        with patch.object(time, "monotonic", side_effect=[0, 56]), \
+                patch.object(time, "sleep") as sleep, self.assertRaisesRegex(ValueError, "window"):
+            check(Mock(side_effect=[normal] * 60 + [limit] * 2))
+        sleep.assert_not_called()
+
+    def test_directory_route_readiness_requires_refusal_absent_identity_and_ready_control(self):
+        import http.server, time
+        from unittest.mock import Mock, MagicMock
+        check = self.directory_http_functions()["initial_route_postcondition"]
+        rows = [(422, {"error": "IICP-E036"}), (404, {}),
+                (201, {"node_id": "fixture-route"}), (200, {"endpoint": "http://127.0.0.1:12345"})]
+        for changed in [rows, [(422, {})], [rows[0], (200, {})], rows[:2] + [(422, {})],
+                        rows[:3] + [(200, {"endpoint": "http://other.invalid"})]]:
+            server = MagicMock(); server.__enter__.return_value = server; server.server_port = 12345
+            server.handle_request.side_effect = lambda: time.sleep(0.001)
+            request = Mock(side_effect=changed)
+            with self.subTest(rows=changed), patch.object(http.server, "HTTPServer", return_value=server):
+                if changed == rows:
+                    check(request)
+                    self.assertEqual(request.call_count, 4)
+                else:
+                    with self.assertRaises(ValueError):
+                        check(request)
+            server.server_close.assert_called_once()
+
     def directory_network(self, active):
         import struct
         from unittest.mock import Mock
@@ -108,7 +200,8 @@ class PackageExecutionTests(unittest.TestCase):
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
-                                  "credential-missing", "unsupported-version"]}}
+                                  "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
+                                  "rate-limit", "dynamic-public-route-readiness"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
@@ -296,7 +389,7 @@ class PackageExecutionTests(unittest.TestCase):
         shutil.copyfile(artifact, artifact_root / "directory-rust" / artifact.name)
         manifest = {"source_version": "0.1.15", "artifacts": [{"name": artifact.name,
             "kind": "release-artifact", "target": "linux-aarch64", "sha256": adapter.file_digest(artifact)}]}
-        for scenario in ("credential-missing", "unsupported-version"):
+        for scenario in sorted(adapter.DIRECTORY_RUST_HTTP_SCENARIOS):
             argv, env, cwd, proof = adapter.directory_package_command(self.root,
                 {**context, "scenario_id": scenario}, manifest, artifact_root, {}, value)
             self.assertEqual(argv[-1], scenario)
