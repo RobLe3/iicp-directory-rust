@@ -31,7 +31,9 @@ jobs:
       - run: python3 scripts/test_disposable_cargo_target.py
       - run: python3 scripts/test_pre1_candidate_artifacts.py
       - run: python3 scripts/test_operator_persistence.py
-      - run: python3 scripts/check_dependency_policy.py
+      - run: |
+          python3 -B scripts/test_dependency_policy.py
+          python3 scripts/check_dependency_policy.py
       - run: python3 scripts/check_package_manifest.py
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
