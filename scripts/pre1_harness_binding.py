@@ -24,6 +24,14 @@ TOOL_ONLY_PATHS = frozenset({
 })
 
 
+# Quality workflows remain bound by the full harness commit/tree digest.
+# This classification grants no merge, release or required-check authority.
+CI_ONLY_PATHS = frozenset({
+    ".github/workflows/quality.yml",
+    ".github/workflows/ci.yml",
+})
+
+
 def git(root: Path, *argv: str) -> bytes:
     return subprocess.check_output(
         ["git", *argv], cwd=root, stderr=subprocess.PIPE, timeout=30
@@ -67,5 +75,5 @@ def validate_harness_source(
         root, "diff", "--no-renames", "--name-only", "-z",
         product_source_commit, binding["harness_source_commit"], "--"
     ).decode().split("\0")
-    if set(filter(None, changes)) - TOOL_ONLY_PATHS:
+    if set(filter(None, changes)) - (TOOL_ONLY_PATHS | CI_ONLY_PATHS):
         raise ValueError("qualification tooling revision changes frozen product source")

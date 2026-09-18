@@ -261,5 +261,22 @@ class ModernEnvironmentTests(unittest.TestCase):
             self.check(value, runtime)
 
 
+class QualityWorkflowBoundaryTests(unittest.TestCase):
+    def check_changes(self, paths):
+        from unittest.mock import patch
+        import pre1_harness_binding as binding
+        identity = {"harness_source_commit": "1" * 40, "harness_sha256": "sha256:" + "2" * 64}
+        with patch.object(binding, "harness_identity", return_value=identity), patch.object(binding, "git", side_effect=[b"", ("\0".join(paths) + "\0").encode()]):
+            binding.validate_harness_source(ROOT, "3" * 40, identity)
+
+    def test_reviewed_quality_workflows_are_digest_bound_tooling(self):
+        self.check_changes([".github/workflows/quality.yml", ".github/workflows/ci.yml"])
+
+    def test_release_dependencies_and_runtime_remain_frozen(self):
+        for path in [".github/workflows/release.yml", ".github/workflows/other.yml", "Cargo.lock", "Cargo.toml", "src/lib.rs"]:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "frozen product source"):
+                self.check_changes([path])
+
+
 if __name__ == "__main__":
     unittest.main()
