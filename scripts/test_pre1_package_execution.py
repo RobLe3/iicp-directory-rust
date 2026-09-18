@@ -125,6 +125,24 @@ class PackageExecutionTests(unittest.TestCase):
                 "database": "production", "username": "iicp_pre1_fixture", "port": 3306}))
             with self.assertRaises(ValueError): adapter.directory_database_dependencies(workspace)
 
+    def test_directory_binding_includes_database_fixture_dependencies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve(); home = base / "home"; home.mkdir()
+            workspace = home / "directory"; workspace.mkdir()
+            installed = workspace / "payload"; installed.mkdir()
+            root = base / "source"; root.mkdir()
+            artifact = base / "artifact"; artifact.write_bytes(b"fixture")
+            deps = {"database-tools": "sha256:" + "a" * 64}
+            with patch.dict(os.environ, {"HOME": str(home)}), \
+                    patch.object(adapter, "directory_payload", return_value=({}, {})), \
+                    patch.object(adapter, "directory_fixtures", return_value={}), \
+                    patch.object(adapter, "directory_database_dependencies", return_value=deps) as dependency:
+                value = adapter.create_directory_binding(root, workspace, installed, artifact,
+                    "directory-rust", "msrv-1.88", "linux-aarch64",
+                    {key: "sha256:" + "b" * 64 for key in adapter.BINDINGS}, stage_fixtures=False)
+            dependency.assert_called_once_with(workspace)
+            self.assertEqual(value["test_dependencies_sha256"], adapter.digest(deps))
+
     def test_duplicate_registration_requires_damaged_reputation_and_identity_preservation(self):
         from unittest.mock import Mock
         check = self.directory_http_functions()["duplicate_registration_postcondition"]

@@ -1596,6 +1596,8 @@ def create_directory_binding(root, workspace, installed, artifact, component, ru
     validate_immutable_bindings(bindings)
     validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])), safe_path(installed), root)
     payload, deps = directory_payload(artifact, installed, component, target)
+    if component == "directory-rust":
+        deps.update(directory_database_dependencies(workspace))
     fixtures = directory_fixtures(root, component)
     for name, data in fixtures.items():
         dest = workspace / name
