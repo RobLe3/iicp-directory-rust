@@ -11,12 +11,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import build_pre1_candidate_artifacts as candidate_artifact
 import prepare_operator_artifact as operator_artifact
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/build_pre1_candidate_artifacts.py"
 DOCKERFILE = ROOT / "Dockerfile"
+ARTIFACT_DOCKERFILE = ROOT / "ops" / "pre1-artifact" / "Dockerfile"
 
 
 class Pre1CandidateArtifactBuilderTest(unittest.TestCase):
@@ -27,7 +29,79 @@ class Pre1CandidateArtifactBuilderTest(unittest.TestCase):
         self.assertEqual(value["component"], "directory-rust")
         self.assertEqual(value["target_artifact"], "release-artifact")
         self.assertEqual(value["portable_artifacts_on"], "linux-x86_64")
+        self.assertTrue(value["requires_docker_buildx"])
+        self.assertEqual(value["minimum_linux_runtime"]["glibc"], "2.36")
+        self.assertIn(
+            "bookworm-slim@sha256:",
+            value["minimum_linux_runtime"]["runtime_image"],
+        )
         self.assertTrue(value["non_authorizing"])
+
+    def test_retained_binary_builder_and_runtime_are_digest_pinned_bookworm(self) -> None:
+        text = ARTIFACT_DOCKERFILE.read_text()
+        self.assertIn(candidate_artifact.BUILDER_IMAGE, text)
+        self.assertNotIn("rust:latest", text)
+        self.assertEqual(candidate_artifact.MINIMUM_GLIBC, "2.36")
+        self.assertRegex(
+            candidate_artifact.RUNTIME_IMAGE,
+            r"^debian:bookworm-slim@sha256:[0-9a-f]{64}$",
+        )
+
+    def test_portable_binary_build_uses_pinned_platform_and_oldest_runtime(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="iicp-bookworm-builder-") as temporary:
+            root = Path(temporary)
+            exported = root / "bookworm-artifact"
+
+            def run(argv, cwd, env=None):
+                del cwd, env
+                self.assertEqual(argv[:4], ["docker", "buildx", "build", "--pull"])
+                self.assertIn("linux/amd64", argv)
+                self.assertIn(candidate_artifact.ARTIFACT_DOCKERFILE.as_posix(), argv)
+                exported.mkdir(exist_ok=True)
+                binary = exported / "iicp-directory-rs"
+                binary.write_bytes(b"portable")
+
+            outputs = iter(
+                [
+                    "first-use pull progress\nglibc 2.36",
+                    "iicp-directory-rs 0.1.15",
+                ]
+            )
+            with patch.object(
+                candidate_artifact.common, "run", side_effect=run
+            ), patch.object(
+                candidate_artifact.common,
+                "output",
+                side_effect=lambda *args, **kwargs: next(outputs),
+            ) as output:
+                binary, glibc = candidate_artifact.build_portable_binary(
+                    root, "linux-x86_64", "0.1.15"
+                )
+            self.assertEqual(binary.read_bytes(), b"portable")
+            self.assertEqual(glibc, "glibc 2.36")
+            runtime_argv = output.call_args_list[-1].args[0]
+            self.assertIn("--network", runtime_argv)
+            self.assertIn("none", runtime_argv)
+            self.assertIn("--read-only", runtime_argv)
+            self.assertIn("65534:65534", runtime_argv)
+            self.assertIn(candidate_artifact.RUNTIME_IMAGE, runtime_argv)
+
+    def test_portable_binary_build_rejects_newer_runtime_baseline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="iicp-bookworm-builder-") as temporary:
+            root = Path(temporary)
+
+            def run(argv, cwd, env=None):
+                del argv, cwd, env
+                exported = root / "bookworm-artifact"
+                exported.mkdir(exist_ok=True)
+                (exported / "iicp-directory-rs").write_bytes(b"portable")
+
+            with patch.object(
+                candidate_artifact.common, "run", side_effect=run
+            ), patch.object(
+                candidate_artifact.common, "output", return_value="glibc 2.39"
+            ), self.assertRaisesRegex(ValueError, "glibc differs"):
+                candidate_artifact.build_portable_binary(root, "linux-x86_64", "0.1.15")
 
     def test_fault_injection_fixture_is_not_built_by_the_default_gate(self) -> None:
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())

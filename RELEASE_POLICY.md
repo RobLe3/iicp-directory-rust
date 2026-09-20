@@ -20,6 +20,13 @@ Every release records:
 - compatible database schema contract;
 - PHP baseline used for parity evidence.
 
+Retained pre-1 Linux executables are built with the exact candidate Rust
+toolchain in a digest-pinned Debian Bookworm builder. The artifact gate then
+executes the binary, without network access and as a non-root user, in the
+digest-pinned Bookworm runtime. Debian Bookworm's glibc 2.36 is the oldest
+declared GNU/Linux runtime baseline for these executables; a binary that
+requires a newer glibc cannot enter the candidate.
+
 Route acknowledgement is insufficient. Authorization, response projection,
 signing, persistence, concurrency, retention and failure behavior must match
 the declared shared contracts. Rust-specific operational hardening may exceed
