@@ -49,6 +49,33 @@ class PackageExecutionTests(unittest.TestCase):
             self.assertEqual(invoke.call_args.args[2], scenario)
             self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
 
+    def test_stale_owner_requires_bind_refusal_active_health_and_clean_restart(self):
+        from unittest.mock import Mock
+        for failure in [None, "success", "wrong-error", "old-exit", "health"]:
+            ns = self.directory_http_functions()
+            snapshot = self.workspace / "owner.json"
+            snapshot.write_text(json.dumps({"health_schema_version": 1, "pid": 321, "sequence": 2}))
+            snapshot.chmod(0o600)
+            old = Mock(pid=321); old.poll.return_value = 1 if failure == "old-exit" else None
+            new = Mock(pid=654)
+            contender = Mock(returncode=0 if failure == "success" else 1)
+            request = Mock(return_value=(503 if failure == "health" else 200,
+                {"ok": True, "version": "v0.1.15-rs"}))
+            ns["wait_snapshot_checkpoint"] = Mock(side_effect=[(2, b"old"), (3, b"old")])
+            ns["snapshot_checkpoint"] = Mock(return_value=(2, b"old"))
+            ns["crash_restart_snapshot_postcondition"] = Mock(return_value=new)
+            with tempfile.TemporaryFile() as log:
+                log.write(b"other failure" if failure == "wrong-error" else b"Address already in use")
+                log.flush()
+                with self.subTest(failure=failure):
+                    if failure:
+                        with self.assertRaises(ValueError):
+                            ns["stale_owner_postcondition"](old, snapshot, request, contender, log, Mock(), "0.1.15")
+                    else:
+                        self.assertIs(ns["stale_owner_postcondition"](old, snapshot, request, contender, log, Mock(), "0.1.15"), new)
+                        ns["crash_restart_snapshot_postcondition"].assert_called_once()
+            snapshot.unlink()
+
     def test_crash_restart_requires_new_snapshot_identity_health_and_progress(self):
         from unittest.mock import Mock
         import signal
@@ -494,7 +521,7 @@ class PackageExecutionTests(unittest.TestCase):
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
-                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart"]}}
+                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
