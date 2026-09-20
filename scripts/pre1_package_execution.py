@@ -890,7 +890,7 @@ def validate_management_binding(value, context, artifact, root):
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
-    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart"})
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed"})
@@ -1327,6 +1327,29 @@ def crash_restart_snapshot_postcondition(process, snapshot, request, restart, ve
         replacement.wait(timeout=10)
         raise
 
+def stale_owner_postcondition(process, snapshot, request, contender, contender_log, restart, version):
+    # A competing owner must fail closed without displacing the healthy writer.
+    sequence, _ = wait_snapshot_checkpoint(process, snapshot)
+    try:
+        contender.wait(timeout=10)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(contender.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        contender.wait(timeout=10)
+        raise ValueError("Directory competing owner did not terminate") from error
+    output = os.pread(contender_log.fileno(), 65537, 0)
+    if contender.returncode == 0 or len(output) > 65536 or b"Address already in use" not in output:
+        raise ValueError("Directory competing owner did not fail on the occupied endpoint")
+    if process.poll() is not None or snapshot_checkpoint(snapshot, process.pid)[0] < sequence:
+        raise ValueError("Directory competing owner displaced the active writer")
+    status, health = request("/health")
+    if status != 200 or health.get("ok") is not True or health.get("version") != "v" + version + "-rs":
+        raise ValueError("Directory active owner health changed after contention")
+    wait_snapshot_checkpoint(process, snapshot, sequence)
+    return crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
+
 def rust_http_case(binary, env, scenario, version, database=False):
     require_loopback_only()
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1381,12 +1404,20 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 permission_snapshot_postcondition(process, snapshot, log, request)
             elif scenario == "disk-full":
                 disk_full_snapshot_postcondition(process, snapshot, log, request)
-            elif scenario == "process-crash-restart":
+            elif scenario in {"process-crash-restart", "stale-pid-or-lock"}:
                 def restart():
                     return subprocess.Popen([str(binary)], cwd=binary.parent,
                         env=launch_env, stdout=log, stderr=subprocess.STDOUT,
                         start_new_session=True)
-                process = crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
+                if scenario == "stale-pid-or-lock":
+                    with tempfile.TemporaryDirectory(prefix="directory-contender-", dir=Path(env.get("TMPDIR", str(Path.cwd())))) as contender_dir, tempfile.TemporaryFile() as contender_log:
+                        contender_env = {**launch_env, "IICP_RUNTIME_HEALTH_FILE": str(Path(contender_dir) / "health.json")}
+                        contender = subprocess.Popen([str(binary)], cwd=binary.parent,
+                            env=contender_env, stdout=contender_log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+                        process = stale_owner_postcondition(process, snapshot, request, contender, contender_log, restart, version)
+                else:
+                    process = crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
             elif scenario == "credential-replayed":
                 credential_replay_postcondition(request, database_observation)
             else:
@@ -1522,7 +1553,7 @@ env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
-                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart"}:
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             database=(Path.cwd() / "directory-operator-fixture.json").exists())
