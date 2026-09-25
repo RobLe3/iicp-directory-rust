@@ -30,6 +30,29 @@ class PackageExecutionTests(unittest.TestCase):
         exec(compile(functions, "directory-probe.py", "exec"), namespace)
         return namespace
 
+    def test_offline_locked_install_executes_exact_installed_binary(self):
+        import hashlib
+        check = self.directory_http_functions()["offline_locked_install_postcondition"]
+        installed = self.workspace / "installed"
+        installed.mkdir()
+        binary = installed / "iicp-directory-rs"
+        binary.write_text("#!/bin/sh\nprintf 'iicp-directory-rs 0.1.15\\n'\n")
+        binary.chmod(0o700)
+        expected = "sha256:" + hashlib.sha256(binary.read_bytes()).hexdigest()
+        check(installed, "0.1.15", expected)
+        with self.assertRaisesRegex(ValueError, "self-report"):
+            check(installed, "0.1.16", expected)
+        with self.assertRaisesRegex(ValueError, "frozen artifact"):
+            check(installed, "0.1.15", "sha256:" + "0" * 64)
+        binary.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "payload boundary"):
+            check(installed, "0.1.15", expected)
+        binary.chmod(0o700)
+        binary.unlink()
+        binary.symlink_to(self.workspace / "outside")
+        with self.assertRaisesRegex(ValueError, "payload boundary"):
+            check(installed, "0.1.15", expected)
+
     def test_all_admitted_http_cases_reach_staged_runtime_dispatch(self):
         import ast
         from unittest.mock import Mock
@@ -520,6 +543,7 @@ class PackageExecutionTests(unittest.TestCase):
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
+                                  "offline-locked-install",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
                                   "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
@@ -700,6 +724,11 @@ class PackageExecutionTests(unittest.TestCase):
         self.assertEqual(cwd, self.workspace)
         self.assertNotIn("cargo", argv)
         self.assertNotIn(str(self.root), " ".join(argv))
+        argv, env, cwd, _proof = adapter.directory_package_command(self.root,
+            {**context, "scenario_id": "offline-locked-install"}, manifest, artifact_root, {}, value)
+        self.assertEqual(argv[-1], "offline-locked-install")
+        self.assertEqual(env["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"], adapter.file_digest(artifact))
+        self.assertEqual(cwd, self.workspace)
 
     def test_directory_http_commands_use_bound_installed_binary_not_source_tests(self):
         import shutil

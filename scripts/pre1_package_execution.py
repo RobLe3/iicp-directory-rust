@@ -893,7 +893,7 @@ DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-ve
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
-    "package-version-self-report", "config-missing", "config-malformed"})
+    "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -1099,6 +1099,29 @@ def database_fixture_inputs():
         or stat.S_IMODE(secret.stat().st_mode) != 0o600):
         raise ValueError("Directory database fixture configuration differs")
     return config, secret.read_text().strip()
+
+def offline_locked_install_postcondition(installed, version, artifact_sha256):
+    import hashlib, re, stat
+    binary = installed / "iicp-directory-rs"
+    if (installed.is_symlink() or binary.is_symlink() or not binary.is_file()
+            or stat.S_IMODE(binary.stat().st_mode) != 0o700
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_sha256)):
+        raise ValueError("Directory offline installed payload boundary differs")
+    digest = hashlib.sha256()
+    with binary.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if "sha256:" + digest.hexdigest() != artifact_sha256:
+        raise ValueError("Directory offline installed binary differs from frozen artifact")
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run([str(binary), "--version"], cwd=installed, env={
+            key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "TMPDIR"}
+        }, stdout=output, stderr=subprocess.DEVNULL, timeout=30, check=False)
+        output.seek(0)
+        reported = output.read(4097)
+    if (result.returncode != 0 or len(reported) > 4096
+            or reported.decode("utf-8", errors="replace").strip() != "iicp-directory-rs " + version):
+        raise ValueError("Directory offline installed binary did not self-report candidate version")
 
 def database_observation():
     require_loopback_only()
@@ -1552,6 +1575,11 @@ env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP") if k 
 env.update(APP_ENV="testing", NO_COLOR="1")
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
+    if scenario == "offline-locked-install":
+        offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
+            os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
                     "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
@@ -1855,7 +1883,8 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
         raise ValueError("Directory structural checks are not packaged operation evidence")
     env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
-           "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"]}
+           "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"],
+           "IICP_PRE1_DIRECTORY_ARTIFACT_SHA256": rows[0]["sha256"]}
     require_directory_database_fixture(component, scenario, workspace)
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
