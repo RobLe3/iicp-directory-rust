@@ -891,7 +891,7 @@ def validate_management_binding(value, context, artifact, root):
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
-DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted"})
+DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
 
@@ -1205,6 +1205,50 @@ def credential_replay_postcondition(request, observe):
     if (not recovered or recovered["verified_at"] is None or recovered["verified_at"] <= accepted["verified_at"]
         or recovered["challenge"] != fourth or fourth in {first, second, third}):
         raise ValueError("Directory replay fresh response recovery differs")
+
+def signature_mismatch_postcondition(request, observe):
+    # A heartbeat can accept metrics while refusing cryptographic liveness.
+    # Check persisted verification, not merely its HTTP success response.
+    import hmac, hashlib
+    if observe() is not None:
+        raise ValueError("Directory signature fixture identity already exists")
+    body = {"node_id": "fixture-replay", "endpoint": "http://127.0.0.1:1/v1/task",
+        "region": "eu-central", "nat_type": "public", "transport_method": "direct_ipv4",
+        "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
+    code, registered = request("/v1/register", body)
+    token, key = registered.get("node_token"), registered.get("node_hmac_key")
+    if code != 201 or registered.get("node_id") != body["node_id"] or not token or not key:
+        raise ValueError("Directory signature registration positive control differs")
+    def heartbeat(response=None):
+        payload = {"node_id": body["node_id"], "available": False}
+        if response is not None:
+            payload["challenge_response"] = response
+        status, value = request("/v1/heartbeat", payload, {"Authorization": "Bearer " + token})
+        challenge = value.get("challenge")
+        if status != 200 or value.get("ok") is not True or not isinstance(challenge, str) or not challenge:
+            raise ValueError("Directory signature heartbeat positive control differs")
+        return challenge
+    def answer(challenge):
+        return hmac.new(key.encode(), challenge.encode(), hashlib.sha256).hexdigest()
+    first = heartbeat()
+    if observe() != {"verified_at": None, "challenge": first}:
+        raise ValueError("Directory signature initial state differs")
+    second = heartbeat(answer(first))
+    accepted = observe()
+    if not accepted or accepted["verified_at"] is None or accepted["challenge"] != second or second == first:
+        raise ValueError("Directory signature valid response was not verified")
+    time.sleep(1.1)
+    valid = answer(second)
+    tampered = ("0" if valid[0] != "0" else "1") + valid[1:]
+    third = heartbeat(tampered)
+    if observe() != {"verified_at": accepted["verified_at"], "challenge": third} or third in {first, second}:
+        raise ValueError("Directory signature mismatch advanced verification or failed rotation")
+    time.sleep(1.1)
+    fourth = heartbeat(answer(third))
+    recovered = observe()
+    if (not recovered or recovered["verified_at"] is None or recovered["verified_at"] <= accepted["verified_at"]
+        or recovered["challenge"] != fourth or fourth in {first, second, third}):
+        raise ValueError("Directory signature valid recovery differs")
 
 def snapshot_checkpoint(path, pid):
     import stat
@@ -1742,6 +1786,8 @@ def rust_http_case(binary, env, scenario, version, database=False):
                         process = stale_owner_postcondition(process, snapshot, request, contender, contender_log, restart, version)
                 else:
                     process = crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
+            elif scenario == "signature-mismatch":
+                signature_mismatch_postcondition(scenario_request, database_observation)
             elif scenario == "credential-replayed":
                 credential_replay_postcondition(scenario_request, database_observation)
             else:
@@ -1917,8 +1963,14 @@ if component == "directory-rust":
             database=(Path.cwd() / "directory-operator-fixture.json").exists())
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
-    elif scenario == "credential-replayed":
-        rust_http_case(installed / "iicp-directory-rs", env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"], database=True)
+    elif scenario in {"credential-replayed", "signature-mismatch"}:
+        if scenario == "signature-mismatch":
+            reset_directory_database(env)
+        try:
+            rust_http_case(installed / "iicp-directory-rs", env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"], database=True)
+        finally:
+            if scenario == "signature-mismatch":
+                reset_directory_database(env)
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     elif scenario in {"package-version-self-report", "support"}:

@@ -180,7 +180,7 @@ class PackageExecutionTests(unittest.TestCase):
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
                 "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
-                "migration_interrupted_postcondition": invoke,
+                "migration_interrupted_postcondition": invoke, "reset_directory_database": Mock(),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
@@ -188,8 +188,26 @@ class PackageExecutionTests(unittest.TestCase):
             if scenario == "migration-interrupted":
                 invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
                 continue
+            self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
             self.assertEqual(invoke.call_args.args[2], scenario)
             self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
+
+    def test_signature_runtime_failure_still_resets_disposable_database(self):
+        import ast
+        from unittest.mock import Mock
+        tree = ast.parse(adapter.DIRECTORY_PROBE)
+        branch = next(n for n in tree.body if isinstance(n, ast.If)
+                      and ast.unparse(n.test) == "component == 'directory-rust'")
+        reset = Mock()
+        namespace = {"component": "directory-rust", "scenario": "signature-mismatch",
+            "installed": Path("/fixture"), "Path": Path, "env": {},
+            "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
+            "rust_http_case": Mock(side_effect=ValueError("injected scenario failure")),
+            "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
+            "reset_directory_database": reset, "context": {"mode": "local-only"}}
+        with self.assertRaisesRegex(ValueError, "injected scenario failure"):
+            exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
+        self.assertEqual(reset.call_count, 2)
 
     def test_stale_owner_requires_bind_refusal_active_health_and_clean_restart(self):
         from unittest.mock import Mock
@@ -397,6 +415,33 @@ class PackageExecutionTests(unittest.TestCase):
                 check(Mock(side_effect=copy.deepcopy(responses)), Mock(side_effect=mutated))
         with self.assertRaises(ValueError):
             check(Mock(), Mock(return_value={"verified_at": None, "challenge": "stale"}))
+
+    def test_signature_mismatch_requires_crypto_positive_negative_and_recovery(self):
+        from unittest.mock import Mock
+        import hashlib, hmac
+        check = self.directory_http_functions()["signature_mismatch_postcondition"]
+        responses = [(201, {"node_id": "fixture-replay", "node_token": "synthetic", "node_hmac_key": "fixture-key"}),
+                     *[(200, {"ok": True, "challenge": str(n)}) for n in range(1, 5)]]
+        observations = [None, {"verified_at": None, "challenge": "1"},
+            {"verified_at": 100, "challenge": "2"}, {"verified_at": 100, "challenge": "3"},
+            {"verified_at": 103, "challenge": "4"}]
+        with patch("time.sleep"):
+            request = Mock(side_effect=copy.deepcopy(responses))
+            check(request, Mock(side_effect=copy.deepcopy(observations)))
+        answer = lambda value: hmac.new(b"fixture-key", value.encode(), hashlib.sha256).hexdigest()
+        calls = request.call_args_list
+        self.assertEqual(calls[2].args[1]["challenge_response"], answer("1"))
+        tampered = calls[3].args[1]["challenge_response"]
+        self.assertEqual(len(tampered), 64)
+        self.assertEqual(tampered[1:], answer("2")[1:])
+        self.assertNotEqual(tampered[0], answer("2")[0])
+        self.assertEqual(calls[4].args[1]["challenge_response"], answer("3"))
+        for index, field, value in [(1, "verified_at", 100), (2, "verified_at", None),
+                (2, "challenge", "1"), (3, "verified_at", 101), (3, "challenge", "2"),
+                (4, "verified_at", 100), (4, "challenge", "3")]:
+            mutated = copy.deepcopy(observations); mutated[index][field] = value
+            with self.subTest(index=index, field=field), patch("time.sleep"), self.assertRaises(ValueError):
+                check(Mock(side_effect=copy.deepcopy(responses)), Mock(side_effect=mutated))
 
     def test_database_observation_uses_bounded_loopback_native_client(self):
         check = self.directory_http_functions()
