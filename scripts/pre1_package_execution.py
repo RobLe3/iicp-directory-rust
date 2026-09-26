@@ -890,7 +890,7 @@ def validate_management_binding(value, context, artifact, root):
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
-    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"})
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
@@ -1321,6 +1321,9 @@ def crash_restart_snapshot_postcondition(process, snapshot, request, restart, ve
     _, verified = snapshot_checkpoint(snapshot, process.pid)
     if snapshot.read_bytes() != verified:
         raise ValueError("Directory crashed snapshot is not stable")
+    return replacement_snapshot_postcondition(process, snapshot, request, restart, version)
+
+def replacement_snapshot_postcondition(process, snapshot, request, restart, version):
     replacement = restart()
     try:
         if replacement.pid == process.pid:
@@ -1349,6 +1352,82 @@ def crash_restart_snapshot_postcondition(process, snapshot, request, restart, ve
             pass
         replacement.wait(timeout=10)
         raise
+
+def wait_stopped_writer(process):
+    deadline = time.monotonic() + 2
+    while True:
+        pid, status = os.waitpid(process.pid, os.WUNTRACED | os.WNOHANG)
+        if pid == process.pid:
+            if not os.WIFSTOPPED(status):
+                raise ValueError("Directory writer exited before interruption boundary")
+            return
+        if time.monotonic() >= deadline:
+            raise ValueError("Directory writer pause timed out")
+        time.sleep(0.01)
+
+def pause_snapshot_writer(process, snapshot):
+    # Pause only this owned child, between writes. Never truncate an active file
+    # or mistake a concurrent committed generation for failed preservation.
+    deadline = time.monotonic() + 12
+    while True:
+        os.kill(process.pid, signal.SIGSTOP)
+        try:
+            wait_stopped_writer(process)
+            sequence, verified = snapshot_checkpoint(snapshot, process.pid)
+            if not snapshot.with_suffix('.tmp-' + str(process.pid)).exists():
+                return verified
+        except BaseException:
+            os.kill(process.pid, signal.SIGCONT)
+            raise
+        os.kill(process.pid, signal.SIGCONT)
+        wait_snapshot_checkpoint(process, snapshot, sequence)
+        if time.monotonic() >= deadline:
+            raise ValueError("Directory writer did not reach an interruption boundary")
+
+def partial_snapshot_reader_postcondition(binary, env, partial):
+    # Invoke the installed reader. A missing loader, unrelated error, accepted
+    # partial JSON, or unbounded output cannot satisfy this negative control.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        result = subprocess.run([str(binary), 'healthcheck', '--json', '--file', str(partial)],
+            cwd=binary.parent, env=env, stdout=stdout, stderr=stderr, timeout=10)
+        stdout.seek(0); out = stdout.read(4097)
+        stderr.seek(0); err = stderr.read(4097)
+    if (result.returncode != 2 or out or len(err) > 4096
+            or not err.startswith(b'INDETERMINATE: invalid snapshot:')):
+        raise ValueError("Directory installed reader did not reject the partial generation")
+
+def interrupted_snapshot_evidence(process, snapshot, verified):
+    import stat
+    if process.wait(timeout=12) != -signal.SIGXFSZ:
+        raise ValueError("Directory writer was not interrupted by the bounded file limit")
+    if snapshot_checkpoint(snapshot, process.pid)[1] != verified:
+        raise ValueError("Directory interrupted write changed the committed generation")
+    partial = snapshot.with_suffix('.tmp-' + str(process.pid))
+    info = partial.lstat()
+    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != os.getuid() or info.st_size != 64):
+        raise ValueError("Directory interrupted writer did not leave a private partial generation")
+    try:
+        json.loads(partial.read_bytes())
+    except (ValueError, UnicodeDecodeError):
+        return partial
+    raise ValueError("Directory interrupted generation was unexpectedly complete")
+
+def interrupted_snapshot_postcondition(process, snapshot, request, restart, version, binary, env):
+    wait_snapshot_checkpoint(process, snapshot)
+    verified = pause_snapshot_writer(process, snapshot)
+    try:
+        # Linux prlimit changes only the owned writer, not this controller or
+        # the replacement. The released serializer writes 64 real bytes before
+        # SIGXFSZ terminates it. Disable core dumps; retain bounded evidence.
+        resource.prlimit(process.pid, resource.RLIMIT_CORE, (0, 0))
+        resource.prlimit(process.pid, resource.RLIMIT_FSIZE, (64, 64))
+    finally:
+        os.kill(process.pid, signal.SIGCONT)
+    partial = interrupted_snapshot_evidence(process, snapshot, verified)
+    partial_snapshot_reader_postcondition(binary, env, partial)
+    partial.unlink()
+    return replacement_snapshot_postcondition(process, snapshot, request, restart, version)
 
 def stale_owner_postcondition(process, snapshot, request, contender, contender_log, restart, version):
     # A competing owner must fail closed without displacing the healthy writer.
@@ -1427,12 +1506,14 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 permission_snapshot_postcondition(process, snapshot, log, request)
             elif scenario == "disk-full":
                 disk_full_snapshot_postcondition(process, snapshot, log, request)
-            elif scenario in {"process-crash-restart", "stale-pid-or-lock"}:
+            elif scenario in {"process-crash-restart", "stale-pid-or-lock", "interrupted-write"}:
                 def restart():
                     return subprocess.Popen([str(binary)], cwd=binary.parent,
                         env=launch_env, stdout=log, stderr=subprocess.STDOUT,
                         start_new_session=True)
-                if scenario == "stale-pid-or-lock":
+                if scenario == "interrupted-write":
+                    process = interrupted_snapshot_postcondition(process, snapshot, request, restart, version, binary, env)
+                elif scenario == "stale-pid-or-lock":
                     with tempfile.TemporaryDirectory(prefix="directory-contender-", dir=Path(env.get("TMPDIR", str(Path.cwd())))) as contender_dir, tempfile.TemporaryFile() as contender_log:
                         contender_env = {**launch_env, "IICP_RUNTIME_HEALTH_FILE": str(Path(contender_dir) / "health.json")}
                         contender = subprocess.Popen([str(binary)], cwd=binary.parent,
@@ -1581,7 +1662,7 @@ if component == "directory-rust":
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
-                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"}:
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             database=(Path.cwd() / "directory-operator-fixture.json").exists())

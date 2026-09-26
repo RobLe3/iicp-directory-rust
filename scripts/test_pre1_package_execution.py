@@ -19,16 +19,130 @@ import pre1_package_execution as adapter
 class PackageExecutionTests(unittest.TestCase):
     def directory_http_functions(self):
         import ast
+        import resource
         import signal
         import time
         import urllib.request
         import urllib.error
         parsed = ast.parse(adapter.DIRECTORY_PROBE)
         functions = ast.Module(body=[n for n in parsed.body if isinstance(n, ast.FunctionDef)], type_ignores=[])
-        namespace = dict(json=json, os=os, signal=signal,
+        namespace = dict(json=json, os=os, signal=signal, resource=resource,
                          subprocess=subprocess, tempfile=tempfile, time=time, Path=Path, urllib=urllib)
         exec(compile(functions, "directory-probe.py", "exec"), namespace)
         return namespace
+
+    def test_interrupted_writer_requires_real_partial_file_and_preserved_commit(self):
+        import signal
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        snapshot = self.workspace / "interrupt.json"
+        partial = snapshot.with_suffix('.tmp-321')
+        verified = b'{"health_schema_version":1,"pid":321,"sequence":2}'
+        for bad in (None, "exit", "commit", "permission", "size", "complete", "symlink"):
+            snapshot.write_bytes(verified); snapshot.chmod(0o600)
+            partial.write_bytes(b'{}' + b' ' * 62 if bad == "complete" else b'{"partial":"' + b'x' * 52)
+            partial.chmod(0o644 if bad == "permission" else 0o600)
+            if bad == "size": partial.write_bytes(b'{')
+            if bad == "commit": snapshot.write_bytes(verified.replace(b':2', b':3'))
+            if bad == "symlink":
+                partial.unlink(); partial.symlink_to(snapshot)
+            process = Mock(pid=321)
+            process.wait.return_value = 0 if bad == "exit" else -signal.SIGXFSZ
+            with self.subTest(bad=bad):
+                if bad is None:
+                    self.assertEqual(ns["interrupted_snapshot_evidence"](process, snapshot, verified), partial)
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["interrupted_snapshot_evidence"](process, snapshot, verified)
+            partial.unlink()
+        snapshot.unlink()
+
+    def test_partial_reader_requires_installed_cli_parse_refusal_not_any_failure(self):
+        from unittest.mock import Mock
+        check = self.directory_http_functions()["partial_snapshot_reader_postcondition"]
+        binary = self.workspace / "iicp-directory-rs"
+        for code, out, err in [(2, b'', b'INDETERMINATE: invalid snapshot: EOF'),
+                               (0, b'', b'INDETERMINATE: invalid snapshot: EOF'),
+                               (2, b'{}', b'INDETERMINATE: invalid snapshot: EOF'),
+                               (2, b'', b'cannot read file'),
+                               (2, b'', b'INDETERMINATE: invalid snapshot:' + b'x' * 4096)]:
+            def execute(argv, **kwargs):
+                self.assertEqual(argv, [str(binary), 'healthcheck', '--json', '--file', str(self.workspace / 'partial')])
+                self.assertEqual(kwargs['env'], {'PATH': '/fixture'})
+                self.assertEqual(kwargs['timeout'], 10)
+                kwargs['stdout'].write(out); kwargs['stderr'].write(err)
+                return Mock(returncode=code)
+            with self.subTest(code=code, out=out, error_length=len(err)), patch('subprocess.run', side_effect=execute):
+                if code == 2 and not out and err == b'INDETERMINATE: invalid snapshot: EOF':
+                    check(binary, {'PATH': '/fixture'}, self.workspace / 'partial')
+                else:
+                    with self.assertRaises(ValueError): check(binary, {'PATH': '/fixture'}, self.workspace / 'partial')
+
+    def test_interruption_uses_child_only_limits_and_always_resumes_on_setup_failure(self):
+        import resource
+        import signal
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        old, new = Mock(pid=321), Mock(pid=654)
+        partial = self.workspace / 'partial'
+        ns['wait_snapshot_checkpoint'] = Mock()
+        ns['pause_snapshot_writer'] = Mock(return_value=b'verified')
+        ns['interrupted_snapshot_evidence'] = Mock(return_value=partial)
+        ns['partial_snapshot_reader_postcondition'] = Mock()
+        ns['replacement_snapshot_postcondition'] = Mock(return_value=new)
+        for error in (None, PermissionError('prlimit denied')):
+            partial.write_bytes(b'{')
+            with self.subTest(error=error), patch.object(resource, 'prlimit', create=True, side_effect=error) as limit, patch('os.kill') as kill:
+                if error is None:
+                    self.assertIs(ns['interrupted_snapshot_postcondition'](old, self.workspace / 'health.json', Mock(), Mock(), '0.1.15', self.workspace / 'iicp-directory-rs', {}), new)
+                    self.assertEqual(limit.call_args_list[0].args, (321, resource.RLIMIT_CORE, (0, 0)))
+                    self.assertEqual(limit.call_args_list[1].args, (321, resource.RLIMIT_FSIZE, (64, 64)))
+                    self.assertFalse(partial.exists())
+                else:
+                    with self.assertRaises(PermissionError):
+                        ns['interrupted_snapshot_postcondition'](old, self.workspace / 'health.json', Mock(), Mock(), '0.1.15', self.workspace / 'iicp-directory-rs', {})
+                    partial.unlink()
+                kill.assert_called_once_with(321, signal.SIGCONT)
+
+    def test_interruption_capture_failure_cannot_start_replacement(self):
+        import resource
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns['wait_snapshot_checkpoint'] = Mock()
+        ns['pause_snapshot_writer'] = Mock(return_value=b'verified')
+        restart = Mock()
+        ns['interrupted_snapshot_evidence'] = Mock(side_effect=ValueError('no partial generation'))
+        with patch.object(resource, 'prlimit', create=True), patch('os.kill'), self.assertRaises(ValueError):
+            ns['interrupted_snapshot_postcondition'](Mock(pid=321), self.workspace / 'health.json', Mock(), restart, '0.1.15', self.workspace / 'iicp-directory-rs', {})
+        restart.assert_not_called()
+
+    def test_writer_pause_retries_only_concurrent_write_and_resumes_on_error(self):
+        import signal
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns['wait_stopped_writer'] = Mock()
+        ns['snapshot_checkpoint'] = Mock(return_value=(2, b'verified'))
+        ns['wait_snapshot_checkpoint'] = Mock()
+        snapshot = self.workspace / 'pause.json'
+        partial = snapshot.with_suffix('.tmp-321')
+        with patch('os.kill') as kill, patch.object(Path, 'exists', side_effect=[True, False]):
+            self.assertEqual(ns['pause_snapshot_writer'](Mock(pid=321), snapshot), b'verified')
+            self.assertEqual([c.args for c in kill.call_args_list], [(321, signal.SIGSTOP), (321, signal.SIGCONT), (321, signal.SIGSTOP)])
+        ns['snapshot_checkpoint'] = Mock(side_effect=ValueError('partial canonical'))
+        with patch('os.kill') as kill, self.assertRaises(ValueError):
+            ns['pause_snapshot_writer'](Mock(pid=321), snapshot)
+        self.assertEqual(kill.call_args.args, (321, signal.SIGCONT))
+
+    def test_stopped_writer_requires_stop_not_exit_and_bounded_wait(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        for status in [0x137f, 0]:
+            with self.subTest(status=status), patch('os.waitpid', return_value=(321, status)), patch('os.WIFSTOPPED', return_value=status == 0x137f):
+                if status == 0x137f: ns['wait_stopped_writer'](Mock(pid=321))
+                else:
+                    with self.assertRaises(ValueError): ns['wait_stopped_writer'](Mock(pid=321))
+        with patch('os.waitpid', return_value=(0, 0)), patch.object(ns['time'], 'monotonic', side_effect=[0, 3]), self.assertRaisesRegex(ValueError, 'pause timed out'):
+            ns['wait_stopped_writer'](Mock(pid=321))
 
     def test_offline_locked_install_executes_exact_installed_binary(self):
         import hashlib
@@ -545,7 +659,7 @@ class PackageExecutionTests(unittest.TestCase):
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
                                   "offline-locked-install",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
-                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"]}}
+                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
