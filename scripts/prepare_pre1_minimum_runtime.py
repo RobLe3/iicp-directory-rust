@@ -24,6 +24,43 @@ RUNTIMES = {"msrv-1.88": "1.88.0", "rust-1.98.0": "1.98.0"}
 HOSTS = {"linux-aarch64": "aarch64-unknown-linux-gnu", "linux-x86_64": "x86_64-unknown-linux-gnu"}
 
 
+# Published predecessor identity is the crate's source commit, not an assumed
+# release-tag commit. This auxiliary input never substitutes a candidate asset.
+PREDECESSOR_VERSION = "0.1.14"
+PREDECESSOR_COMMIT = "5b5ed69b1070f1581f5576187fb13669f807088b"
+PREDECESSOR_CRATE_SHA256 = "caccc1a43f6f961593068016865cddbf3fc7cfbfbd8150c5e885e95c3098649a"
+PREDECESSOR_MANIFEST_SHA256 = "040f6ece1ccf2567ab8959ab4c16c7364cdf18f2a1a0f3b26f3a40d8d65e74d0"
+
+
+def predecessor_identity(crate, manifest):
+    """Verify exact published inputs before any predecessor preparation."""
+    crate, manifest = packages.safe_path(crate), packages.safe_path(manifest)
+    if (crate.stat().st_size > 64 * 1024 * 1024 or manifest.stat().st_size > 65536
+            or common.file_sha256(crate) != "sha256:" + PREDECESSOR_CRATE_SHA256
+            or common.file_sha256(manifest) != "sha256:" + PREDECESSOR_MANIFEST_SHA256):
+        raise ValueError("predecessor published asset identity differs")
+    value = json.loads(manifest.read_text())
+    if (value.get("schema") != "iicp.directory-rust-release.v1"
+            or value.get("version") != PREDECESSOR_VERSION
+            or value.get("commit") != PREDECESSOR_COMMIT
+            or value.get("crate_sha256") != PREDECESSOR_CRATE_SHA256
+            or value.get("production_authority") is not False
+            or value.get("genesis_cutover_authorized") is not False):
+        raise ValueError("predecessor release provenance differs")
+    with tarfile.open(crate, mode="r:gz") as archive:
+        name = "iicp-directory-rs-" + PREDECESSOR_VERSION + "/.cargo_vcs_info.json"
+        member = archive.getmember(name)
+        if not member.isfile() or member.size > 4096:
+            raise ValueError("predecessor crate source provenance is invalid")
+        vcs = json.loads(archive.extractfile(member).read())
+        if vcs.get("git", {}).get("sha1") != PREDECESSOR_COMMIT or vcs.get("path_in_vcs") != "":
+            raise ValueError("predecessor crate source provenance differs")
+    return {"source_version": PREDECESSOR_VERSION, "source_commit": PREDECESSOR_COMMIT,
+            "crate_sha256": common.file_sha256(crate),
+            "release_manifest_sha256": common.file_sha256(manifest),
+            "qualification_credit": False, "non_authorizing": True}
+
+
 def candidate_identity(path):
     path = packages.safe_path(path)
     candidate = json.loads(path.read_text())

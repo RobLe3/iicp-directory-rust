@@ -18,6 +18,50 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def test_predecessor_rejects_unpinned_assets_before_extraction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            crate, manifest = root / "old.crate", root / "release.json"
+            crate.write_bytes(b"not the published crate")
+            manifest.write_text("{}")
+            with patch.object(minimum_runtime.tarfile, "open") as extract:
+                with self.assertRaisesRegex(ValueError, "published asset identity"):
+                    minimum_runtime.predecessor_identity(crate, manifest)
+                extract.assert_not_called()
+
+    def test_predecessor_requires_release_and_embedded_source_agreement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            crate, manifest = root / "old.crate", root / "release.json"
+            value = {"schema": "iicp.directory-rust-release.v1", "version": "0.1.14",
+                     "commit": minimum_runtime.PREDECESSOR_COMMIT,
+                     "crate_sha256": minimum_runtime.PREDECESSOR_CRATE_SHA256,
+                     "production_authority": False, "genesis_cutover_authorized": False}
+            for commit in (minimum_runtime.PREDECESSOR_COMMIT, "0" * 40):
+                raw = json.dumps({"git": {"sha1": commit}, "path_in_vcs": ""}).encode()
+                with tarfile.open(crate, "w:gz") as archive:
+                    member = tarfile.TarInfo("iicp-directory-rs-0.1.14/.cargo_vcs_info.json")
+                    member.size = len(raw)
+                    archive.addfile(member, io.BytesIO(raw))
+                manifest.write_text(json.dumps(value))
+                with patch.object(minimum_runtime.common, "file_sha256", side_effect=lambda path:
+                        "sha256:" + (minimum_runtime.PREDECESSOR_CRATE_SHA256 if path == crate
+                                     else minimum_runtime.PREDECESSOR_MANIFEST_SHA256)):
+                    if commit == minimum_runtime.PREDECESSOR_COMMIT:
+                        result = minimum_runtime.predecessor_identity(crate, manifest)
+                        self.assertFalse(result["qualification_credit"])
+                        self.assertTrue(result["non_authorizing"])
+                    else:
+                        with self.assertRaisesRegex(ValueError, "source provenance differs"):
+                            minimum_runtime.predecessor_identity(crate, manifest)
+
+    def test_predecessor_identity_is_not_the_candidate_identity(self):
+        self.assertEqual(minimum_runtime.PREDECESSOR_VERSION, "0.1.14")
+        self.assertEqual(minimum_runtime.PREDECESSOR_COMMIT,
+                         "5b5ed69b1070f1581f5576187fb13669f807088b")
+        self.assertNotEqual(minimum_runtime.PREDECESSOR_COMMIT,
+                            "ce77bfb7c601cca98b71234cc886c833b33978f2")
+
     def test_harness_documentation_exception_preserves_released_bytes(self):
         import hashlib
         import pre1_harness_binding as harness
