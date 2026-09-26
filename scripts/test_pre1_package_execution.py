@@ -180,17 +180,99 @@ class PackageExecutionTests(unittest.TestCase):
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
                 "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
-                "migration_interrupted_postcondition": invoke, "reset_directory_database": Mock(),
+                "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke, "reset_directory_database": Mock(),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
             self.assertEqual(stopped.exception.code, 0)
-            if scenario == "migration-interrupted":
+            if scenario in {"migration-interrupted", "backup-restore"}:
                 invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
                 continue
             self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
             self.assertEqual(invoke.call_args.args[2], scenario)
             self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
+
+    def test_backup_restore_requires_identical_dump_and_real_http_readback(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        dump = b"CREATE TABLE nodes (id INT);"
+        for failure in (None, "export", "import", "schema-drift", "data-drift", "blind-oracle", "corrupt-recovery", "readback"):
+            ns["reset_directory_database"] = reset = Mock()
+            ns["directory_database_export"] = Mock(side_effect=ValueError("export") if failure == "export"
+                else [dump, dump + b"drift" if failure == "data-drift" else dump])
+            ns["directory_database_state"] = Mock(side_effect=[{"schema": b"schema", "rows": b"rows"},
+                {"schema": b"drift" if failure == "schema-drift" else b"schema", "rows": b"drift" if failure == "data-drift" else b"rows"},
+                {"schema": b"schema", "rows": b"rows" if failure == "blind-oracle" else b"corrupted"},
+                {"schema": b"schema", "rows": b"drift" if failure == "corrupt-recovery" else b"rows"}])
+            ns["directory_fixture_sql"] = Mock()
+            ns["directory_database_import"] = restore = Mock(side_effect=ValueError("import") if failure == "import" else None)
+            def execute(binary, env, scenario, version, **kwargs):
+                self.assertTrue(kwargs["database"])
+                def request(path, body=None, headers=None):
+                    if path == "/v1/register":
+                        return 201, {"node_id": "fixture-backup", "node_token": "synthetic"}
+                    if path == "/v1/node/fixture-backup":
+                        return 200, {"node_id": "fixture-backup", "reputation_score":
+                            0.5 if scenario == "backup-readback" and failure == "readback" else 0.8}
+                    raise AssertionError(path)
+                kwargs["postcondition"](request, request, binary, env)
+            ns["rust_http_case"] = Mock(side_effect=execute)
+            with self.subTest(failure=failure):
+                if failure is None:
+                    ns["backup_restore_postcondition"](Path("/fixture"), {}, "0.1.15")
+                    self.assertEqual(restore.call_args_list, [unittest.mock.call({}, dump), unittest.mock.call({}, dump)])
+                    self.assertEqual(ns["rust_http_case"].call_count, 2)
+                    self.assertEqual(reset.call_count, 4)
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["backup_restore_postcondition"](Path("/fixture"), {}, "0.1.15")
+                    self.assertGreaterEqual(reset.call_count, 2)
+
+    def test_backup_export_and_import_bound_private_credentials(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = Mock()
+        ns["database_fixture_inputs"] = Mock(return_value=({"username": "iicp_pre1_fixture",
+            "database": "iicp_pre1_" + "a" * 16}, "synthetic-private-password"))
+        tools = self.workspace / "directory-database-tools"; tools.mkdir()
+        (tools / "mysqldump").write_bytes(b"fixture")
+        backup = b"CREATE TABLE nodes (id INT);"
+        def export(argv, **kwargs):
+            self.assertNotIn("synthetic-private-password", " ".join(argv))
+            self.assertIn("--no-defaults", argv)
+            self.assertIn("--host=127.0.0.1", argv)
+            self.assertEqual(kwargs["timeout"], 20)
+            self.assertEqual(list(Path(kwargs["env"]["HOME"]).iterdir()), [])
+            self.assertTrue(callable(kwargs["preexec_fn"]))
+            kwargs["stdout"].write(backup)
+            return Mock(returncode=0)
+        with patch("subprocess.run", side_effect=export), patch.object(Path, "cwd", return_value=self.workspace):
+            self.assertEqual(ns["directory_database_export"]({"HOME": str(self.home)}), backup)
+        with patch("subprocess.run", return_value=Mock(returncode=0)) as run:
+            ns["directory_database_import"]({"HOME": str(self.home)}, backup)
+            self.assertEqual(run.call_args.kwargs["input"], backup)
+            self.assertNotIn("synthetic-private-password", " ".join(run.call_args.args[0]))
+        with patch("subprocess.run", return_value=Mock(returncode=1)), self.assertRaisesRegex(ValueError, "restore failed"):
+            ns["directory_database_import"]({"HOME": str(self.home)}, backup)
+        for value in (b"", "not-bytes", b"x" * (8 * 1024 * 1024 + 1)):
+            with self.subTest(value_type=type(value).__name__), self.assertRaisesRegex(ValueError, "bound"):
+                ns["directory_database_import"]({}, value)
+
+    def test_database_restore_oracle_compares_schema_collation_and_all_rows(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        oracle = Mock(side_effect=[b"schema", b"nodes\tid\nnodes\ttoken\n", b"31\tNULL\n"])
+        ns["directory_fixture_sql"] = oracle
+        self.assertEqual(ns["directory_database_state"]({}),
+                         {"schema": b"schema", "rows": {"nodes": b"31\tNULL\n"}})
+        self.assertIn("CHARACTER_SET_NAME", oracle.call_args_list[0].args[1])
+        self.assertIn("COLLATION_NAME", oracle.call_args_list[0].args[1])
+        self.assertIn("HEX(CAST(`token` AS BINARY))", oracle.call_args_list[2].args[1])
+        self.assertTrue(oracle.call_args_list[2].args[1].endswith("ORDER BY 1,2"))
+        for identifiers in (b"", b"nodes;DROP\tid\n", b"nodes\tx`\n", b"nodes\tid\textra\n"):
+            ns["directory_fixture_sql"] = Mock(side_effect=[b"schema", identifiers])
+            with self.subTest(identifiers=identifiers), self.assertRaises(ValueError):
+                ns["directory_database_state"]({})
 
     def test_signature_runtime_failure_still_resets_disposable_database(self):
         import ast

@@ -891,7 +891,7 @@ def validate_management_binding(value, context, artifact, root):
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
-DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch"})
+DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
 
@@ -1628,6 +1628,138 @@ def directory_fixture_sql(env, sql):
         raise ValueError("Directory isolated schema oracle failed")
     return observed
 
+def directory_database_export(env):
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    dump = tools / "mysqldump"
+    if not dump.is_file() or dump.is_symlink():
+        raise ValueError("Directory backup requires pinned mysqldump fixture")
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(dump),
+        "--no-defaults", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--user=" + config["username"], "--single-transaction",
+        "--skip-comments", "--skip-dump-date", "--skip-extended-insert", "--order-by-primary",
+        "--no-tablespaces", "--set-gtid-purged=OFF", config["database"]]
+    limit = 8 * 1024 * 1024
+    with tempfile.TemporaryDirectory(prefix="directory-backup-home-", dir=private_case_home(env)) as home, tempfile.TemporaryFile(dir=home) as output, tempfile.TemporaryFile(dir=home) as errors:
+        result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=output, stderr=errors, timeout=20, check=False,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)))
+        output.seek(0); value = output.read(limit + 1)
+        errors.seek(0); diagnostic = errors.read(4096).decode("utf-8", errors="replace").replace(password, "[REDACTED]")
+    if result.returncode or not value or len(value) > limit or b"CREATE TABLE" not in value:
+        raise ValueError("Directory bounded database export failed: exit=" + str(result.returncode) + " " + diagnostic)
+    return value
+
+def directory_database_import(env, backup):
+    require_loopback_only()
+    if not isinstance(backup, bytes) or not 0 < len(backup) <= 8 * 1024 * 1024:
+        raise ValueError("Directory restore input exceeds bound")
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--no-defaults", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--connect-timeout=3", "--user=" + config["username"], "--database=" + config["database"]]
+    with tempfile.TemporaryDirectory(prefix="directory-restore-home-", dir=private_case_home(env)) as home:
+        result = subprocess.run(argv, input=backup,
+            env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False)
+    if result.returncode:
+        raise ValueError("Directory isolated database restore failed")
+
+def directory_database_state(env):
+    # Compare actual schema/data, not mysqldump's optional CHARACTER SET spelling.
+    import re
+    schema = directory_fixture_sql(env,
+        "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'NULL'),COLUMN_DEFAULT IS NULL,EXTRA,GENERATION_EXPRESSION,"
+        "COALESCE(CHARACTER_SET_NAME,'NULL'),COALESCE(COLLATION_NAME,'NULL') "
+        "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION;"
+        "SELECT TABLE_NAME,INDEX_NAME,COLUMN_NAME,NON_UNIQUE,SEQ_IN_INDEX,SUB_PART,INDEX_TYPE,IS_VISIBLE,EXPRESSION FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX;"
+        "SELECT TABLE_NAME,TABLE_TYPE,ENGINE,TABLE_COLLATION,CREATE_OPTIONS FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME;"
+        "SELECT TABLE_NAME,CONSTRAINT_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME "
+        "FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION;"
+        "SELECT TABLE_NAME,CONSTRAINT_NAME,UPDATE_RULE,DELETE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS "
+        "WHERE CONSTRAINT_SCHEMA=DATABASE() ORDER BY TABLE_NAME,CONSTRAINT_NAME;"
+        "SELECT CONSTRAINT_NAME,CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS "
+        "WHERE CONSTRAINT_SCHEMA=DATABASE() ORDER BY CONSTRAINT_NAME;")
+    raw = directory_fixture_sql(env, "SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION;")
+    columns = {}
+    for line in raw.decode("ascii").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or any(not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) for name in parts):
+            raise ValueError("Directory database observation identifiers differ")
+        columns.setdefault(parts[0], []).append(parts[1])
+    if not columns or len(columns) > 64 or any(len(names) > 128 for names in columns.values()):
+        raise ValueError("Directory database observation exceeds table/column bounds")
+    rows = {}
+    for table, names in columns.items():
+        fields = ",".join("IF(`" + name + "` IS NULL,'NULL',HEX(CAST(`" + name + "` AS BINARY)))" for name in names)
+        rows[table] = directory_fixture_sql(env, "SELECT " + fields + " FROM `" + table + "` ORDER BY "
+            + ",".join(str(i + 1) for i in range(len(names))))
+    if len(schema) + sum(len(value) for value in rows.values()) > 8 * 1024 * 1024:
+        raise ValueError("Directory database state exceeds bound")
+    return {"schema": schema, "rows": rows}
+
+def backup_restore_postcondition(binary, env, version):
+    baseline = {}
+    def seed(request, scenario_request, binary, launch_env):
+        body = {"node_id": "fixture-backup", "endpoint": "http://127.0.0.1:1/v1/task",
+            "region": "eu-central", "nat_type": "public", "transport_method": "direct_ipv4",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
+        status, registered = scenario_request("/v1/register", body)
+        if status != 201 or registered.get("node_id") != body["node_id"] or not registered.get("node_token"):
+            raise ValueError("Directory backup registration positive control differs")
+        code, detail = request("/v1/node/fixture-backup")
+        if code != 200 or detail.get("node_id") != "fixture-backup":
+            raise ValueError("Directory backup HTTP observation differs")
+        baseline["detail"] = detail
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            for subject in ("fixture-backup-allowed", "fixture-backup-denied"):
+                token = restricted_membership_command(binary, launch_env, "issue", subject, "discovery")
+                baseline[subject] = {"X-IICP-Membership": token, "X-IICP-Subject-Id": subject}
+            restricted_membership_command(binary, launch_env, "revoke", "fixture-backup-denied", "discovery")
+            authorization(request)
+    def authorization(request):
+        for subject, expected in (("fixture-backup-allowed", 200), ("fixture-backup-denied", 401)):
+            code, value = request("/v1/discover?intent=urn:iicp:intent:llm:chat:v1", headers=baseline[subject])
+            if code != expected:
+                raise ValueError("Directory restored authorization or revocation differs")
+            if expected == 200:
+                decision = value.get("restricted_domain_decision", {})
+                if (decision.get("decision") != "eligible" or decision.get("domain_id") != "example.internal"
+                        or decision.get("authority_id") != "did:key:directory"):
+                    raise ValueError("Directory restored authority projection differs")
+            elif value.get("error", {}).get("code") != "restricted_domain_denied":
+                raise ValueError("Directory restore denial cause differs")
+    def readback(request, scenario_request, binary, launch_env):
+        code, detail = request("/v1/node/fixture-backup")
+        if code != 200 or detail != baseline["detail"]:
+            raise ValueError("Directory restored installed HTTP state differs")
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            authorization(request)
+    reset_directory_database(env)
+    try:
+        rust_http_case(binary, env, "backup-seed", version, database=True, postcondition=seed)
+        before = directory_database_state(env)
+        backup = directory_database_export(env)
+        reset_directory_database(env)
+        directory_database_import(env, backup)
+        if directory_database_state(env) != before:
+            raise ValueError("Directory restored schema or persistent data differs")
+        directory_fixture_sql(env, "UPDATE nodes SET endpoint='http://127.0.0.1:2/v1/task' WHERE id='fixture-backup';")
+        if directory_database_state(env) == before:
+            raise ValueError("Directory backup state oracle ignored deliberate corruption")
+        reset_directory_database(env)
+        directory_database_import(env, backup)
+        if directory_database_state(env) != before:
+            raise ValueError("Directory backup failed to recover deliberate corruption")
+        rust_http_case(binary, env, "backup-readback", version, database=True, postcondition=readback)
+    finally:
+        reset_directory_database(env)
+
 def migration_interrupted_postcondition(binary, env, version):
     # The released boundary is verify-only for an existing database. Never
     # simulate recovery by repairing it from the harness after startup.
@@ -1704,7 +1836,7 @@ def restricted_request_adapter(request, binary, env):
         return status, value
     return execute
 
-def rust_http_case(binary, env, scenario, version, database=False):
+def rust_http_case(binary, env, scenario, version, database=False, postcondition=None):
     require_loopback_only()
     if scenario == "environment-restricted" and (not database
             or env.get("IICP_RESTRICTED_DOMAIN_ENABLED") != "true"
@@ -1763,7 +1895,9 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 if time.monotonic() >= deadline:
                     raise ValueError("Directory HTTP fixture readiness timed out")
                 time.sleep(0.1)
-            if scenario == "environment-restricted":
+            if postcondition is not None:
+                postcondition(request, scenario_request, binary, launch_env)
+            elif scenario == "environment-restricted":
                 restricted_mode_postcondition(request, lambda action, subject, scope:
                     restricted_membership_command(binary, launch_env, action, subject, scope))
             elif scenario == "config-permission-denied":
@@ -1949,6 +2083,10 @@ if component == "directory-rust":
     if scenario == "offline-locked-install":
         offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    if scenario == "backup-restore":
+        backup_restore_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     if scenario == "migration-interrupted":
@@ -2202,7 +2340,7 @@ def directory_database_dependencies(workspace):
         raise ValueError("Directory database fixture dependency differs")
     files = tree(tools)
     if (not {"loader", "mysql"}.issubset(files) or not 3 <= len(files) <= 32
-        or any(not re.fullmatch(r"(?:loader|mysql|lib/[a-zA-Z0-9._+-]+)", name) for name in files)
+        or any(not re.fullmatch(r"(?:loader|mysql|mysqldump|lib/[a-zA-Z0-9._+-]+)", name) for name in files)
         or sum((tools / name).stat().st_size for name in files) > 64 * 1024 * 1024):
         raise ValueError("Directory database tool snapshot differs")
     return {"database-config": "sha256:" + hashlib.sha256(raw).hexdigest(),
@@ -2249,6 +2387,8 @@ def require_directory_database_fixture(component, scenario, workspace, mode="loc
     if component == "directory-rust" and (scenario in DIRECTORY_RUST_DATABASE_SCENARIOS or mode == "restricted"):
         if not directory_database_dependencies(workspace):
             raise ValueError("Directory packaged database fixture is missing")
+        if scenario == "backup-restore" and not (workspace / "directory-database-tools/mysqldump").is_file():
+            raise ValueError("Directory backup requires pinned mysqldump fixture")
 
 
 def directory_package_command(root, context, component_manifest, artifact_root, env, value):
