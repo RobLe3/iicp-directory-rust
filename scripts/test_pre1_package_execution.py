@@ -179,13 +179,117 @@ class PackageExecutionTests(unittest.TestCase):
                 "installed": Path("/fixture"), "Path": Path, "env": {},
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
                 "resource": Mock(RLIMIT_FSIZE=1),
-                "rust_http_case": invoke, "rust_mode_postcondition": Mock(),
+                "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
+                "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke, "reset_directory_database": Mock(),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
             self.assertEqual(stopped.exception.code, 0)
+            if scenario in {"migration-interrupted", "backup-restore"}:
+                invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
+                continue
+            self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
             self.assertEqual(invoke.call_args.args[2], scenario)
             self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
+
+    def test_backup_restore_requires_identical_dump_and_real_http_readback(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        dump = b"CREATE TABLE nodes (id INT);"
+        for failure in (None, "export", "import", "schema-drift", "data-drift", "blind-oracle", "corrupt-recovery", "readback"):
+            ns["reset_directory_database"] = reset = Mock()
+            ns["directory_database_export"] = Mock(side_effect=ValueError("export") if failure == "export"
+                else [dump, dump + b"drift" if failure == "data-drift" else dump])
+            ns["directory_database_state"] = Mock(side_effect=[{"schema": b"schema", "rows": b"rows"},
+                {"schema": b"drift" if failure == "schema-drift" else b"schema", "rows": b"drift" if failure == "data-drift" else b"rows"},
+                {"schema": b"schema", "rows": b"rows" if failure == "blind-oracle" else b"corrupted"},
+                {"schema": b"schema", "rows": b"drift" if failure == "corrupt-recovery" else b"rows"}])
+            ns["directory_fixture_sql"] = Mock()
+            ns["directory_database_import"] = restore = Mock(side_effect=ValueError("import") if failure == "import" else None)
+            def execute(binary, env, scenario, version, **kwargs):
+                self.assertTrue(kwargs["database"])
+                def request(path, body=None, headers=None):
+                    if path == "/v1/register":
+                        return 201, {"node_id": "fixture-backup", "node_token": "synthetic"}
+                    if path == "/v1/node/fixture-backup":
+                        return 200, {"node_id": "fixture-backup", "reputation_score":
+                            0.5 if scenario == "backup-readback" and failure == "readback" else 0.8}
+                    raise AssertionError(path)
+                kwargs["postcondition"](request, request, binary, env)
+            ns["rust_http_case"] = Mock(side_effect=execute)
+            with self.subTest(failure=failure):
+                if failure is None:
+                    ns["backup_restore_postcondition"](Path("/fixture"), {}, "0.1.15")
+                    self.assertEqual(restore.call_args_list, [unittest.mock.call({}, dump), unittest.mock.call({}, dump)])
+                    self.assertEqual(ns["rust_http_case"].call_count, 2)
+                    self.assertEqual(reset.call_count, 4)
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["backup_restore_postcondition"](Path("/fixture"), {}, "0.1.15")
+                    self.assertGreaterEqual(reset.call_count, 2)
+
+    def test_backup_export_and_import_bound_private_credentials(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = Mock()
+        ns["database_fixture_inputs"] = Mock(return_value=({"username": "iicp_pre1_fixture",
+            "database": "iicp_pre1_" + "a" * 16}, "synthetic-private-password"))
+        tools = self.workspace / "directory-database-tools"; tools.mkdir()
+        (tools / "mysqldump").write_bytes(b"fixture")
+        backup = b"CREATE TABLE nodes (id INT);"
+        def export(argv, **kwargs):
+            self.assertNotIn("synthetic-private-password", " ".join(argv))
+            self.assertIn("--no-defaults", argv)
+            self.assertIn("--host=127.0.0.1", argv)
+            self.assertEqual(kwargs["timeout"], 20)
+            self.assertEqual(list(Path(kwargs["env"]["HOME"]).iterdir()), [])
+            self.assertTrue(callable(kwargs["preexec_fn"]))
+            kwargs["stdout"].write(backup)
+            return Mock(returncode=0)
+        with patch("subprocess.run", side_effect=export), patch.object(Path, "cwd", return_value=self.workspace):
+            self.assertEqual(ns["directory_database_export"]({"HOME": str(self.home)}), backup)
+        with patch("subprocess.run", return_value=Mock(returncode=0)) as run:
+            ns["directory_database_import"]({"HOME": str(self.home)}, backup)
+            self.assertEqual(run.call_args.kwargs["input"], backup)
+            self.assertNotIn("synthetic-private-password", " ".join(run.call_args.args[0]))
+        with patch("subprocess.run", return_value=Mock(returncode=1)), self.assertRaisesRegex(ValueError, "restore failed"):
+            ns["directory_database_import"]({"HOME": str(self.home)}, backup)
+        for value in (b"", "not-bytes", b"x" * (8 * 1024 * 1024 + 1)):
+            with self.subTest(value_type=type(value).__name__), self.assertRaisesRegex(ValueError, "bound"):
+                ns["directory_database_import"]({}, value)
+
+    def test_database_restore_oracle_compares_schema_collation_and_all_rows(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        oracle = Mock(side_effect=[b"schema", b"nodes\tid\nnodes\ttoken\n", b"31\tNULL\n"])
+        ns["directory_fixture_sql"] = oracle
+        self.assertEqual(ns["directory_database_state"]({}),
+                         {"schema": b"schema", "rows": {"nodes": b"31\tNULL\n"}})
+        self.assertIn("CHARACTER_SET_NAME", oracle.call_args_list[0].args[1])
+        self.assertIn("COLLATION_NAME", oracle.call_args_list[0].args[1])
+        self.assertIn("HEX(CAST(`token` AS BINARY))", oracle.call_args_list[2].args[1])
+        self.assertTrue(oracle.call_args_list[2].args[1].endswith("ORDER BY 1,2"))
+        for identifiers in (b"", b"nodes;DROP\tid\n", b"nodes\tx`\n", b"nodes\tid\textra\n"):
+            ns["directory_fixture_sql"] = Mock(side_effect=[b"schema", identifiers])
+            with self.subTest(identifiers=identifiers), self.assertRaises(ValueError):
+                ns["directory_database_state"]({})
+
+    def test_signature_runtime_failure_still_resets_disposable_database(self):
+        import ast
+        from unittest.mock import Mock
+        tree = ast.parse(adapter.DIRECTORY_PROBE)
+        branch = next(n for n in tree.body if isinstance(n, ast.If)
+                      and ast.unparse(n.test) == "component == 'directory-rust'")
+        reset = Mock()
+        namespace = {"component": "directory-rust", "scenario": "signature-mismatch",
+            "installed": Path("/fixture"), "Path": Path, "env": {},
+            "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
+            "rust_http_case": Mock(side_effect=ValueError("injected scenario failure")),
+            "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
+            "reset_directory_database": reset, "context": {"mode": "local-only"}}
+        with self.assertRaisesRegex(ValueError, "injected scenario failure"):
+            exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
+        self.assertEqual(reset.call_count, 2)
 
     def test_stale_owner_requires_bind_refusal_active_health_and_clean_restart(self):
         from unittest.mock import Mock
@@ -394,6 +498,33 @@ class PackageExecutionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check(Mock(), Mock(return_value={"verified_at": None, "challenge": "stale"}))
 
+    def test_signature_mismatch_requires_crypto_positive_negative_and_recovery(self):
+        from unittest.mock import Mock
+        import hashlib, hmac
+        check = self.directory_http_functions()["signature_mismatch_postcondition"]
+        responses = [(201, {"node_id": "fixture-replay", "node_token": "synthetic", "node_hmac_key": "fixture-key"}),
+                     *[(200, {"ok": True, "challenge": str(n)}) for n in range(1, 5)]]
+        observations = [None, {"verified_at": None, "challenge": "1"},
+            {"verified_at": 100, "challenge": "2"}, {"verified_at": 100, "challenge": "3"},
+            {"verified_at": 103, "challenge": "4"}]
+        with patch("time.sleep"):
+            request = Mock(side_effect=copy.deepcopy(responses))
+            check(request, Mock(side_effect=copy.deepcopy(observations)))
+        answer = lambda value: hmac.new(b"fixture-key", value.encode(), hashlib.sha256).hexdigest()
+        calls = request.call_args_list
+        self.assertEqual(calls[2].args[1]["challenge_response"], answer("1"))
+        tampered = calls[3].args[1]["challenge_response"]
+        self.assertEqual(len(tampered), 64)
+        self.assertEqual(tampered[1:], answer("2")[1:])
+        self.assertNotEqual(tampered[0], answer("2")[0])
+        self.assertEqual(calls[4].args[1]["challenge_response"], answer("3"))
+        for index, field, value in [(1, "verified_at", 100), (2, "verified_at", None),
+                (2, "challenge", "1"), (3, "verified_at", 101), (3, "challenge", "2"),
+                (4, "verified_at", 100), (4, "challenge", "3")]:
+            mutated = copy.deepcopy(observations); mutated[index][field] = value
+            with self.subTest(index=index, field=field), patch("time.sleep"), self.assertRaises(ValueError):
+                check(Mock(side_effect=copy.deepcopy(responses)), Mock(side_effect=mutated))
+
     def test_database_observation_uses_bounded_loopback_native_client(self):
         check = self.directory_http_functions()
         config = {"username": "iicp_pre1_fixture", "database": "iicp_pre1_" + "a" * 16}
@@ -488,6 +619,281 @@ class PackageExecutionTests(unittest.TestCase):
             with self.subTest(index=index, replacement=replacement), self.assertRaises(ValueError):
                 check(Mock(side_effect=changed))
 
+    def restricted_mode_responses(self):
+        denied = (401, {"error": {"code": "restricted_domain_denied"}})
+        eligible = (200, {"nodes": [], "count": 0, "restricted_domain_decision": {
+            "schema": "iicp.restricted-trust-domain.directory-decision.v0",
+            "profile": "urn:iicp:profile:restricted-trust-domain:v1", "decision": "eligible",
+            "operation": "discovery", "domain_id": "example.internal", "authority_id": "did:key:directory",
+            "subject_kind": "client", "membership_generation": 1, "membership_expires_at": 2000}})
+        return [denied, eligible, denied, denied, denied, denied, denied, eligible, denied]
+
+    def test_restricted_mode_requires_full_membership_lifecycle(self):
+        from unittest.mock import Mock, call
+        ns = self.directory_http_functions()
+        ns["time"] = Mock(time=lambda: 1000)
+        request = Mock(side_effect=self.restricted_mode_responses())
+        first, wrong, rotated = ["iicp_mem_" + c * 64 for c in "123"]
+        administer = Mock(side_effect=[first, wrong, rotated, "revoked", "revoked"])
+        ns["restricted_mode_postcondition"](request, administer)
+        self.assertEqual(request.call_count, 9)
+        self.assertEqual(administer.call_args_list, [call("issue", "fixture-client", "discovery"),
+            call("issue", "fixture-other", "bootstrap"), call("issue", "fixture-client", "discovery"),
+            call("revoke", "fixture-client", "discovery"), call("revoke", "fixture-other", "bootstrap")])
+        self.assertEqual(request.call_args_list[3].kwargs["headers"]["X-IICP-Subject-Id"], "fixture-other")
+        self.assertEqual(request.call_args_list[6].kwargs["headers"]["X-IICP-Membership"], first)
+        self.assertEqual(request.call_args_list[7].kwargs["headers"]["X-IICP-Membership"], rotated)
+        self.assertNotEqual(request.call_args_list[4].kwargs["headers"]["X-IICP-Membership"], first)
+
+    def test_restricted_mode_rejects_every_incorrect_lifecycle_response(self):
+        from unittest.mock import Mock
+        for index in range(9):
+            ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+            responses = self.restricted_mode_responses()
+            responses[index] = (200, {})
+            administer = Mock(side_effect=["iicp_mem_" + c * 64 for c in "123"] + ["revoked", "revoked"])
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                ns["restricted_mode_postcondition"](Mock(side_effect=responses), administer)
+
+    def test_restricted_mode_rejects_wrong_projection_and_unchanged_rotation(self):
+        from unittest.mock import Mock
+        wrong = {"schema": "wrong", "profile": "wrong", "decision": "denied", "operation": "bootstrap",
+            "domain_id": "wrong", "authority_id": "wrong", "subject_kind": "node",
+            "membership_generation": False, "membership_expires_at": 999}
+        for field, value in wrong.items():
+            ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+            responses = copy.deepcopy(self.restricted_mode_responses())
+            responses[1][1]["restricted_domain_decision"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                ns["restricted_mode_postcondition"](Mock(side_effect=responses), Mock(return_value="token"))
+        ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+        with self.assertRaisesRegex(ValueError, "rotation"):
+            ns["restricted_mode_postcondition"](Mock(side_effect=self.restricted_mode_responses()), Mock(return_value="same-token"))
+
+    def test_restricted_mode_requires_database_exact_identity_and_no_replica(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        env = {"IICP_RESTRICTED_DOMAIN_ENABLED": "true", "IICP_REPLICA_MODE": "false",
+            "IICP_TRUST_DOMAIN_ID": "example.internal", "IICP_TRUST_DOMAIN_AUTHORITY_ID": "did:key:directory"}
+        for key in env:
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "exact mode"):
+                ns["rust_http_case"](Path("/binary"), {**env, key: "wrong"}, "environment-restricted", "0.1.15", database=True)
+        with self.assertRaisesRegex(ValueError, "isolated database"):
+            ns["rust_http_case"](Path("/binary"), env, "environment-restricted", "0.1.15")
+
+    def test_membership_admin_checks_exit_output_bounds_and_exact_cli(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        env = {"HOME": str(self.home)}
+        for action, code, raw, valid in [("issue", 0, b'iicp_mem_' + b'a' * 64 + b'\n', True),
+                ("revoke", 0, b'revoked\n', True), ("issue", 1, b'iicp_mem_' + b'a' * 64, False),
+                ("issue", 0, b'garbage', False), ("revoke", 0, b'not-revoked', False),
+                ("issue", 0, b'x' * 4097, False)]:
+            def run(argv, **kwargs):
+                expected = ["/fixture/iicp-directory-rs", "trust-domain-membership-" + action,
+                    "--kind", "client", "--subject", "fixture-client"]
+                if action == "issue": expected += ["--scopes", "discovery", "--ttl-seconds", "3600"]
+                self.assertEqual(argv, expected); self.assertEqual(kwargs["timeout"], 30)
+                self.assertEqual(kwargs["env"], env); self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                kwargs["stdout"].write(raw)
+                return Mock(returncode=code)
+            ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+            with self.subTest(action=action, code=code, length=len(raw)):
+                if valid:
+                    self.assertEqual(ns["restricted_membership_command"](Path("/fixture/iicp-directory-rs"), env, action, "fixture-client"), raw.decode().strip())
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["restricted_membership_command"](Path("/fixture/iicp-directory-rs"), env, action, "fixture-client")
+        for action, subject, scope in [("delete", "fixture-client", "discovery"), ("issue", "other", "discovery"), ("issue", "fixture-client", "*")]:
+            with self.assertRaises(ValueError):
+                ns["restricted_membership_command"](Path("/binary"), env, action, subject, scope)
+
+    def test_mode_environment_is_explicit_and_does_not_mutate_input(self):
+        ns = self.directory_http_functions()
+        original = {"IICP_REPLICA_MODE": "true", "HOME": str(self.home)}
+        result = ns["rust_mode_environment"](original, "restricted")
+        self.assertEqual(original["IICP_REPLICA_MODE"], "true")
+        self.assertEqual(result["IICP_REPLICA_MODE"], "false")
+        self.assertEqual(result["IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH"], "1")
+        self.assertEqual(ns["rust_mode_environment"](result, "public")["IICP_RESTRICTED_DOMAIN_ENABLED"], "false")
+        self.assertEqual(ns["rust_mode_environment"](original, "local-only"), original)
+        with self.assertRaises(ValueError): ns["rust_mode_environment"](original, "unknown")
+
+    def test_support_requires_both_pinned_fixtures_not_just_version_metadata(self):
+        import shutil
+        ns = self.directory_http_functions()
+        source = Path(adapter.__file__).resolve().parents[1] / "parity"
+        for name, original in (("contract", "contract-v1.10.80.json"), ("behavior", "behavior-contract-v1.json"), ("http", "http-contract-v1.json")):
+            shutil.copyfile(source / original, self.workspace / ("directory-support-" + name + ".json"))
+        with patch.object(Path, "cwd", return_value=self.workspace):
+            ns["directory_support_postcondition"]()
+            for name in ("contract", "behavior", "http"):
+                path = self.workspace / ("directory-support-" + name + ".json")
+                original = path.read_bytes()
+                path.write_bytes(b'{}')
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    ns["directory_support_postcondition"]()
+                path.write_bytes(original)
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, "missing"):
+                ns["directory_support_postcondition"]()
+
+    def test_restricted_malformed_config_requires_specific_federation_refusal(self):
+        import ast
+        tree = ast.parse(adapter.DIRECTORY_PROBE)
+        branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "scenario == 'config-malformed'")
+        for mode, expected in (("restricted", "restricted trust-domain federation is not implemented; replica mode cannot be combined with restricted-domain mode"),
+                ("public", "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID"), ("local-only", "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID")):
+            namespace = {"env": {"IICP_RESTRICTED_DOMAIN_ENABLED": "true" if mode == "restricted" else "false"}, "context": {"mode": mode}}
+            exec(compile(ast.Module(body=branch.body, type_ignores=[]), "probe", "exec"), namespace)
+            self.assertEqual(namespace["expected"], expected)
+            self.assertEqual(namespace["expected_code"], 1)
+            self.assertEqual(namespace["env"]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true" if mode == "restricted" else "false")
+
+    def test_restricted_request_preserves_inner_credentials_and_scenario_error(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        administer = Mock(return_value="synthetic-membership")
+        ns["restricted_membership_command"] = administer
+        raw = Mock(return_value=(401, {"error": {"code": "unauthorized"}}))
+        env = {"HOME": str(self.home)}
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), env)
+        headers = {"Authorization": "Bearer synthetic-node-token"}
+        body = {"node_id": "fixture-replay"}
+        self.assertEqual(request("/v1/heartbeat", body, headers)[0], 401)
+        self.assertEqual(administer.call_args.args, (Path("/binary"), env, "issue", "fixture-replay", "heartbeat", "node"))
+        forwarded = raw.call_args.args[2]
+        self.assertEqual(forwarded["Authorization"], headers["Authorization"])
+        self.assertEqual(forwarded["X-IICP-Subject-Id"], "fixture-replay")
+        self.assertEqual(headers, {"Authorization": "Bearer synthetic-node-token"})
+        administer.reset_mock()
+        request("/health")
+        administer.assert_not_called()
+
+    def test_restricted_request_refuses_membership_masking_and_overrides(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["restricted_membership_command"] = Mock(return_value="synthetic")
+        for code in ("restricted_domain_denied", "restricted_domain_unavailable"):
+            raw = Mock(return_value=(401, {"error": {"code": code}}))
+            request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, "masked scenario"):
+                request("/v1/peers", {"node_id": "fixture"})
+        raw = Mock()
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+        for name in ("X-IICP-Membership", "x-iicp-subject-id"):
+            with self.assertRaisesRegex(ValueError, "override"):
+                request("/v1/peers", {"node_id": "fixture"}, {name: "injected"})
+        raw.assert_not_called()
+
+    def test_restricted_success_requires_operation_specific_projection(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["restricted_membership_command"] = Mock(return_value="synthetic")
+        result = {"restricted_domain_decision": {"decision": "eligible", "operation": "discovery",
+            "domain_id": "example.internal", "authority_id": "did:key:directory", "subject_kind": "client"}}
+        raw = Mock(return_value=(200, result))
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+        self.assertEqual(request("/v1/discover?intent=fixture"), (200, result))
+        for key in result["restricted_domain_decision"]:
+            changed = copy.deepcopy(result); changed["restricted_domain_decision"][key] = "wrong"
+            raw.return_value = (200, changed)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "projection"):
+                request("/v1/discover?intent=fixture")
+
+    def test_restricted_mode_requires_database_for_every_assigned_case(self):
+        with patch.object(adapter, "directory_database_dependencies", return_value={}) as inputs:
+            with self.assertRaisesRegex(ValueError, "missing"):
+                adapter.require_directory_database_fixture("directory-rust", "package-version-self-report", self.workspace, "restricted")
+            inputs.assert_called_once_with(self.workspace)
+
+    def test_database_reset_uses_validated_run_owned_namespace_and_private_secret(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        config = {"database": "iicp_pre1_" + "a" * 16, "username": "iicp_pre1_fixture"}
+        ns["database_fixture_inputs"] = Mock(return_value=(config, "synthetic-private-password"))
+        run = Mock(return_value=Mock(returncode=0))
+        ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+        ns["reset_directory_database"]({"HOME": str(self.home), "PATH": "/fixture"})
+        argv = run.call_args.args[0]
+        self.assertNotIn("synthetic-private-password", " ".join(argv))
+        self.assertEqual(argv[-1], "DROP DATABASE IF EXISTS `iicp_pre1_" + "a" * 16 + "`; CREATE DATABASE `iicp_pre1_" + "a" * 16 + "`")
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+        self.assertEqual(run.call_args.kwargs["env"]["MYSQL_PWD"], "synthetic-private-password")
+        run.return_value.returncode = 1
+        with self.assertRaisesRegex(ValueError, "reset failed"):
+            ns["reset_directory_database"]({"HOME": str(self.home)})
+
+    def test_interrupted_schema_requires_real_startup_refusal_and_unchanged_state(self):
+        from unittest.mock import Mock
+        baseline = b"nodes\tid\tvarchar(128)\tNO\tNULL\t\nfixture-interrupted-schema\n"
+        refusal = b"FATAL: MySQL schema verification failed: schema incompatible (1 required contract differences); nodes.region missing\n"
+        for name, code, output, after in [
+                ("valid", 1, refusal, baseline),
+                ("wrong-exit", 0, refusal, baseline),
+                ("wrong-error", 1, b"FATAL: configured MySQL connection failed", baseline),
+                ("unrelated-membership", 1, b"restricted_domain_denied", baseline),
+                ("listening", 1, refusal + b"listening on 0.0.0.0", baseline),
+                ("memory-downgrade", 1, refusal + b"using InMemoryRepo", baseline),
+                ("oversize", 1, refusal + b"x" * 65537, baseline),
+                ("mutated", 1, refusal, baseline + b"mutation"),
+            ]:
+            with self.subTest(name=name):
+                ns = self.directory_http_functions()
+                ns["require_loopback_only"] = Mock()
+                ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+                    "username": "iicp_pre1_fixture"}, "synthetic password"))
+                ns["reset_directory_database"] = Mock()
+                ns["rust_http_case"] = Mock()
+                ns["directory_fixture_sql"] = Mock(side_effect=[b"", baseline, after])
+                def run(argv, **kwargs):
+                    self.assertEqual(argv, ["/fixture/iicp-directory-rs"])
+                    self.assertEqual(kwargs["timeout"], 30)
+                    self.assertEqual(kwargs["env"]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true")
+                    self.assertIn("synthetic%20password@127.0.0.1", kwargs["env"]["DATABASE_URL"])
+                    kwargs["stdout"].write(output)
+                    return Mock(returncode=code)
+                ns["subprocess"] = Mock(run=run, STDOUT=subprocess.STDOUT)
+                call = lambda: ns["migration_interrupted_postcondition"](Path("/fixture/iicp-directory-rs"),
+                    {"HOME": str(self.home), "IICP_RESTRICTED_DOMAIN_ENABLED": "true"}, "0.1.15")
+                if name == "valid": call()
+                else:
+                    with self.assertRaisesRegex(ValueError, "preserve and reject"): call()
+                self.assertEqual(ns["reset_directory_database"].call_count, 3)
+                ns["rust_http_case"].assert_called_once_with(Path("/fixture/iicp-directory-rs"),
+                    {"HOME": str(self.home), "IICP_RESTRICTED_DOMAIN_ENABLED": "true"},
+                    "credential-missing", "0.1.15", database=True)
+
+    def test_schema_oracle_is_bounded_loopback_and_keeps_secret_out_of_argv(self):
+        from unittest.mock import Mock
+        for code, payload in [(0, b"fixture"), (1, b""), (0, b"x" * 65537)]:
+            ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+            ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+                "username": "iicp_pre1_fixture"}, "synthetic-private-password"))
+            def run(argv, **kwargs):
+                self.assertNotIn("synthetic-private-password", " ".join(argv))
+                self.assertIn("--host=127.0.0.1", argv)
+                self.assertEqual(kwargs["timeout"], 10)
+                self.assertEqual(kwargs["env"]["MYSQL_PWD"], "synthetic-private-password")
+                kwargs["stdout"].write(payload)
+                return Mock(returncode=code)
+            ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+            if not code and len(payload) <= 65536:
+                self.assertEqual(ns["directory_fixture_sql"]({"HOME": str(self.home)}, "SELECT 1"), payload)
+            else:
+                with self.assertRaisesRegex(ValueError, "oracle failed"):
+                    ns["directory_fixture_sql"]({"HOME": str(self.home)}, "SELECT 1")
+
+    def test_interrupted_schema_cleanup_on_failed_positive_control(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+            "username": "iicp_pre1_fixture"}, "synthetic"))
+        ns["reset_directory_database"] = Mock()
+        ns["rust_http_case"] = Mock(side_effect=ValueError("positive control failed"))
+        with self.assertRaisesRegex(ValueError, "positive control failed"):
+            ns["migration_interrupted_postcondition"](Path("/binary"), {"HOME": str(self.home)}, "0.1.15")
+        self.assertEqual(ns["reset_directory_database"].call_count, 2)
+
     def test_public_mode_requires_both_fresh_environment_variants(self):
         from unittest.mock import Mock
         ns = self.directory_http_functions()
@@ -503,8 +909,13 @@ class PackageExecutionTests(unittest.TestCase):
         runner.reset_mock()
         ns["rust_mode_postcondition"](Path("/binary"), original, "local-only", "0.1.15")
         runner.assert_not_called()
-        with self.assertRaisesRegex(ValueError, "restricted mode remains unimplemented"):
-            ns["rust_mode_postcondition"](Path("/binary"), original, "restricted", "0.1.15")
+        ns["rust_mode_postcondition"](Path("/binary"), original, "restricted", "0.1.15")
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args.args[1]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true")
+        self.assertTrue(runner.call_args.kwargs["database"])
+        self.assertEqual(runner.call_args.args[2], "environment-restricted")
+        with self.assertRaises(ValueError):
+            ns["rust_mode_postcondition"](Path("/binary"), original, "unknown", "0.1.15")
 
     def test_public_mode_rejects_false_positive_discovery(self):
         check = self.directory_http_functions()["http_postcondition"]
@@ -692,6 +1103,9 @@ class PackageExecutionTests(unittest.TestCase):
         shutil.rmtree(self.workspace)
         self.workspace.mkdir()
         (self.root / "qualification").mkdir(exist_ok=True)
+        (self.root / "parity").mkdir(exist_ok=True)
+        for name in ("contract-v1.10.80.json", "behavior-contract-v1.json", "http-contract-v1.json"):
+            shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "parity" / name, self.root / "parity" / name)
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
