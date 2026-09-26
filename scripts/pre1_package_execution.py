@@ -893,7 +893,7 @@ DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-ve
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
-    "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
+    "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -1465,12 +1465,15 @@ def stale_owner_postcondition(process, snapshot, request, contender, contender_l
     wait_snapshot_checkpoint(process, snapshot, sequence)
     return crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
 
-def restricted_membership_command(binary, env, action, subject, scope="discovery"):
+def restricted_membership_command(binary, env, action, subject, scope="discovery", kind="client"):
     import re
-    if action not in {"issue", "revoke"} or subject not in {"fixture-client", "fixture-other"} or scope not in {"discovery", "bootstrap"}:
+    if (action not in {"issue", "revoke"} or kind not in {"node", "client"}
+            or not isinstance(subject, str) or len(subject) > 128
+            or not re.fullmatch(r"fixture(?:-[a-z0-9-]+)?|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", subject)
+            or scope not in {"registration", "discovery", "bootstrap", "heartbeat", "peers", "consumer_token", "dispatch", "relay"}):
         raise ValueError("Directory membership fixture command differs")
     argv = [str(binary), "trust-domain-membership-" + action,
-        "--kind", "client", "--subject", subject]
+        "--kind", kind, "--subject", subject]
     if action == "issue":
         argv += ["--scopes", scope, "--ttl-seconds", "3600"]
     with tempfile.TemporaryFile(dir=private_case_home(env)) as output:
@@ -1526,6 +1529,77 @@ def restricted_mode_postcondition(request, administer):
     denied({**headers, "X-IICP-Membership": rotated})
     administer("revoke", "fixture-other", "bootstrap")
 
+def directory_support_postcondition():
+    import hashlib
+    workspace = Path.cwd()
+    paths = [workspace / ("directory-support-" + name + ".json") for name in ("contract", "behavior", "http")]
+    if any(path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 1024 * 1024 for path in paths):
+        raise ValueError("Directory support fixtures are missing or unsafe")
+    contract = json.loads(paths[0].read_text())
+    expected = {"behavior-contract-v1.json": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+        "http-contract-v1.json": "62fad592a33305a754353c43f6476d257f01ccf6e3cfdbf391d03717ce4796b5"}
+    if (contract.get("contract_version") != "v1.10.80" or contract.get("fixtures") != expected
+            or [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths[1:]] != list(expected.values())):
+        raise ValueError("Directory support fixture contract differs")
+
+def rust_mode_environment(env, mode):
+    result = dict(env)
+    if mode == "restricted":
+        result.update(IICP_RESTRICTED_DOMAIN_ENABLED="true", IICP_REPLICA_MODE="false",
+            IICP_TRUST_DOMAIN_ID="example.internal", IICP_TRUST_DOMAIN_AUTHORITY_ID="did:key:directory",
+            IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH="1")
+    elif mode == "public":
+        result["IICP_RESTRICTED_DOMAIN_ENABLED"] = "false"
+    elif mode != "local-only":
+        raise ValueError("Directory mode differs")
+    return result
+
+def reset_directory_database(env):
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    sql = "DROP DATABASE IF EXISTS `" + config["database"] + "`; CREATE DATABASE `" + config["database"] + "`"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--no-defaults", "--batch", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--connect-timeout=3", "--user=" + config["username"], "--execute", sql]
+    with tempfile.TemporaryDirectory(prefix="directory-reset-home-", dir=private_case_home(env)) as home:
+        result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+    if result.returncode:
+        raise ValueError("Directory disposable database reset failed")
+
+def restricted_request_adapter(request, binary, env):
+    operations = {("POST", "/v1/register"): "registration", ("GET", "/v1/discover"): "discovery",
+        ("GET", "/v1/bootstrap"): "bootstrap", ("POST", "/v1/heartbeat"): "heartbeat",
+        ("POST", "/v1/peers"): "peers", ("POST", "/v1/consumer-token"): "consumer_token",
+        ("POST", "/v1/dispatch/ticket"): "dispatch", ("POST", "/v1/relay/ticket"): "relay"}
+    projected = {"registration": "registration", "discovery": "discovery", "bootstrap": "bootstrap",
+        "consumer_token": "consumer_token", "dispatch": "dispatch_ticket"}
+    def execute(path, body=None, headers=None):
+        operation = operations.get(("GET" if body is None else "POST", path.split("?", 1)[0]))
+        if operation is None:
+            return request(path, body, headers)
+        supplied = dict(headers or {})
+        if any(key.lower() in {"x-iicp-membership", "x-iicp-subject-id"} for key in supplied):
+            raise ValueError("Directory scenario must not override fixture membership")
+        subject = body.get("node_id", "fixture-client") if isinstance(body, dict) else "fixture-client"
+        kind = "node" if operation in {"registration", "heartbeat", "peers"} else "client"
+        token = restricted_membership_command(binary, env, "issue", subject, operation, kind)
+        status, value = request(path, body, {**supplied, "X-IICP-Membership": token, "X-IICP-Subject-Id": subject})
+        error = value.get("error")
+        if isinstance(error, dict) and error.get("code") in {"restricted_domain_denied", "restricted_domain_unavailable"}:
+            raise ValueError("Directory membership rejection masked scenario behavior")
+        if 200 <= status < 300 and operation in projected:
+            decision = value.get("restricted_domain_decision")
+            if (not isinstance(decision, dict) or decision.get("decision") != "eligible"
+                    or decision.get("operation") != projected[operation]
+                    or decision.get("domain_id") != "example.internal"
+                    or decision.get("authority_id") != "did:key:directory"
+                    or decision.get("subject_kind") != kind):
+                raise ValueError("Directory scenario restricted projection differs")
+        return status, value
+    return execute
+
 def rust_http_case(binary, env, scenario, version, database=False):
     require_loopback_only()
     if scenario == "environment-restricted" and (not database
@@ -1562,6 +1636,9 @@ def rust_http_case(binary, env, scenario, version, database=False):
             + "@127.0.0.1:3306/" + config["database"])
     else:
         launch_env["IICP_ALLOW_IN_MEMORY"] = "true"
+    scenario_request = (restricted_request_adapter(request, binary, launch_env)
+        if env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true" and scenario != "environment-restricted"
+        else request)
     with tempfile.TemporaryDirectory(prefix="directory-health-", dir=private_case_home(env)) as health_dir, tempfile.TemporaryFile(dir=private_case_home(env)) as log:
         snapshot = Path(health_dir) / "health.json"
         launch_env["IICP_RUNTIME_HEALTH_FILE"] = str(snapshot)
@@ -1606,9 +1683,9 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 else:
                     process = crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
             elif scenario == "credential-replayed":
-                credential_replay_postcondition(request, database_observation)
+                credential_replay_postcondition(scenario_request, database_observation)
             else:
-                http_postcondition(request, scenario)
+                http_postcondition(scenario_request, scenario)
         finally:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -1618,6 +1695,9 @@ def rust_http_case(binary, env, scenario, version, database=False):
 
 def rust_mode_postcondition(binary, env, mode, version):
     if mode == "local-only":
+        return
+    if mode == "restricted":
+        rust_http_case(binary, rust_mode_environment(env, mode), "environment-restricted", version, database=True)
         return
     if mode != "public":
         raise ValueError("Directory restricted mode remains unimplemented")
@@ -1744,7 +1824,7 @@ def interrupt_migration(installed, workspace, php, env, command, helper):
 
 context = json.loads(os.environ["IICP_PRE1_EXECUTION_CONTEXT"])
 component, scenario = context["component"], context["scenario_id"]
-if ((component == "directory-rust" and context["mode"] not in {"local-only", "public"})
+if ((component == "directory-rust" and context["mode"] not in {"local-only", "public", "restricted"})
         or (component != "directory-rust" and context["mode"] != "local-only")):
     raise ValueError("Directory packaged mode is not implemented")
 installed = Path(os.environ["IICP_PRE1_DIRECTORY_INSTALLED"])
@@ -1754,9 +1834,12 @@ env.update(APP_ENV="testing", NO_COLOR="1")
 case_home = private_case_home(env)
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
+    env = rust_mode_environment(env, context["mode"])
+    if context["mode"] == "restricted":
+        reset_directory_database(env)
     rust_mode_postcondition(Path(argv[0]), env, context["mode"], os.environ["IICP_PRE1_DIRECTORY_VERSION"])
-    if context["mode"] == "public":
-        env["IICP_RESTRICTED_DOMAIN_ENABLED"] = "false"
+    if context["mode"] == "restricted":
+        reset_directory_database(env)
     if scenario == "offline-locked-install":
         offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
@@ -1773,7 +1856,9 @@ if component == "directory-rust":
         rust_http_case(installed / "iicp-directory-rs", env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"], database=True)
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
-    elif scenario == "package-version-self-report":
+    elif scenario in {"package-version-self-report", "support"}:
+        if scenario == "support":
+            directory_support_postcondition()
         argv.append("--version")
         expected = "iicp-directory-rs " + os.environ["IICP_PRE1_DIRECTORY_VERSION"]
         expected_code = 0
@@ -1785,7 +1870,8 @@ if component == "directory-rust":
             IICP_SEED_URL="https://seed.invalid/v1", IICP_SEED_DID="did:web:seed.invalid",
             IICP_REPLICA_DID="did:web:replica.invalid", IICP_REPLICA_ENDPOINT="https://replica.invalid/v1",
             IICP_DIRECTORY_DID="did:web:other.invalid")
-        expected = "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID"
+        expected = ("restricted trust-domain federation is not implemented; replica mode cannot be combined with restricted-domain mode"
+            if context["mode"] == "restricted" else "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID")
         expected_code = 1
     else:
         raise ValueError("Directory packaged scenario is not implemented")
@@ -1827,7 +1913,7 @@ with tempfile.NamedTemporaryFile(prefix="directory-output-", dir=case_home, dele
     log.seek(0)
     output = log.read().decode("utf-8", errors="replace")
 if process.returncode != expected_code or (expected is not None and expected not in output) or (
-    component == "directory-rust" and scenario == "package-version-self-report" and output.strip() != expected
+    component == "directory-rust" and scenario in {"package-version-self-report", "support"} and output.strip() != expected
 ):
     raise ValueError("Directory packaged postcondition failed")
 if component == "directory-php":
@@ -1941,6 +2027,9 @@ def directory_fixtures(root, component):
               "directory-case-map.json": safe_path(root / "qualification/pre1-cases.json").read_bytes()}
     if component == "directory-php":
         result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
+    elif component == "directory-rust":
+        for name, source in {"contract": "contract-v1.10.80.json", "behavior": "behavior-contract-v1.json", "http": "http-contract-v1.json"}.items():
+            result["directory-support-" + name + ".json"] = safe_path(root / "parity" / source).read_bytes()
     return result
 
 
@@ -2039,15 +2128,15 @@ def validate_directory_binding(value, context, artifact, root):
 
 
 
-def require_directory_database_fixture(component, scenario, workspace):
-    if component == "directory-rust" and scenario in DIRECTORY_RUST_DATABASE_SCENARIOS:
+def require_directory_database_fixture(component, scenario, workspace, mode="local-only"):
+    if component == "directory-rust" and (scenario in DIRECTORY_RUST_DATABASE_SCENARIOS or mode == "restricted"):
         if not directory_database_dependencies(workspace):
             raise ValueError("Directory packaged database fixture is missing")
 
 
 def directory_package_command(root, context, component_manifest, artifact_root, env, value):
     component, scenario = context["component"], context["scenario_id"]
-    if ((component == "directory-rust" and context["mode"] not in {"local-only", "public"})
+    if ((component == "directory-rust" and context["mode"] not in {"local-only", "public", "restricted"})
             or (component != "directory-rust" and context["mode"] != "local-only")):
         raise ValueError("Directory packaged mode remains unimplemented")
     kind = "release-artifact" if component == "directory-rust" else "release-archive"
@@ -2068,7 +2157,7 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
            "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"],
            "IICP_PRE1_DIRECTORY_ARTIFACT_SHA256": rows[0]["sha256"]}
-    require_directory_database_fixture(component, scenario, workspace)
+    require_directory_database_fixture(component, scenario, workspace, context["mode"])
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]

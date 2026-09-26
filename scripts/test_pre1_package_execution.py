@@ -179,7 +179,7 @@ class PackageExecutionTests(unittest.TestCase):
                 "installed": Path("/fixture"), "Path": Path, "env": {},
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
                 "resource": Mock(RLIMIT_FSIZE=1),
-                "rust_http_case": invoke, "rust_mode_postcondition": Mock(),
+                "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
@@ -577,6 +577,121 @@ class PackageExecutionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ns["restricted_membership_command"](Path("/binary"), env, action, subject, scope)
 
+    def test_mode_environment_is_explicit_and_does_not_mutate_input(self):
+        ns = self.directory_http_functions()
+        original = {"IICP_REPLICA_MODE": "true", "HOME": str(self.home)}
+        result = ns["rust_mode_environment"](original, "restricted")
+        self.assertEqual(original["IICP_REPLICA_MODE"], "true")
+        self.assertEqual(result["IICP_REPLICA_MODE"], "false")
+        self.assertEqual(result["IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH"], "1")
+        self.assertEqual(ns["rust_mode_environment"](result, "public")["IICP_RESTRICTED_DOMAIN_ENABLED"], "false")
+        self.assertEqual(ns["rust_mode_environment"](original, "local-only"), original)
+        with self.assertRaises(ValueError): ns["rust_mode_environment"](original, "unknown")
+
+    def test_support_requires_both_pinned_fixtures_not_just_version_metadata(self):
+        import shutil
+        ns = self.directory_http_functions()
+        source = Path(adapter.__file__).resolve().parents[1] / "parity"
+        for name, original in (("contract", "contract-v1.10.80.json"), ("behavior", "behavior-contract-v1.json"), ("http", "http-contract-v1.json")):
+            shutil.copyfile(source / original, self.workspace / ("directory-support-" + name + ".json"))
+        with patch.object(Path, "cwd", return_value=self.workspace):
+            ns["directory_support_postcondition"]()
+            for name in ("contract", "behavior", "http"):
+                path = self.workspace / ("directory-support-" + name + ".json")
+                original = path.read_bytes()
+                path.write_bytes(b'{}')
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    ns["directory_support_postcondition"]()
+                path.write_bytes(original)
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, "missing"):
+                ns["directory_support_postcondition"]()
+
+    def test_restricted_malformed_config_requires_specific_federation_refusal(self):
+        import ast
+        tree = ast.parse(adapter.DIRECTORY_PROBE)
+        branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "scenario == 'config-malformed'")
+        for mode, expected in (("restricted", "restricted trust-domain federation is not implemented; replica mode cannot be combined with restricted-domain mode"),
+                ("public", "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID"), ("local-only", "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID")):
+            namespace = {"env": {"IICP_RESTRICTED_DOMAIN_ENABLED": "true" if mode == "restricted" else "false"}, "context": {"mode": mode}}
+            exec(compile(ast.Module(body=branch.body, type_ignores=[]), "probe", "exec"), namespace)
+            self.assertEqual(namespace["expected"], expected)
+            self.assertEqual(namespace["expected_code"], 1)
+            self.assertEqual(namespace["env"]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true" if mode == "restricted" else "false")
+
+    def test_restricted_request_preserves_inner_credentials_and_scenario_error(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        administer = Mock(return_value="synthetic-membership")
+        ns["restricted_membership_command"] = administer
+        raw = Mock(return_value=(401, {"error": {"code": "unauthorized"}}))
+        env = {"HOME": str(self.home)}
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), env)
+        headers = {"Authorization": "Bearer synthetic-node-token"}
+        body = {"node_id": "fixture-replay"}
+        self.assertEqual(request("/v1/heartbeat", body, headers)[0], 401)
+        self.assertEqual(administer.call_args.args, (Path("/binary"), env, "issue", "fixture-replay", "heartbeat", "node"))
+        forwarded = raw.call_args.args[2]
+        self.assertEqual(forwarded["Authorization"], headers["Authorization"])
+        self.assertEqual(forwarded["X-IICP-Subject-Id"], "fixture-replay")
+        self.assertEqual(headers, {"Authorization": "Bearer synthetic-node-token"})
+        administer.reset_mock()
+        request("/health")
+        administer.assert_not_called()
+
+    def test_restricted_request_refuses_membership_masking_and_overrides(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["restricted_membership_command"] = Mock(return_value="synthetic")
+        for code in ("restricted_domain_denied", "restricted_domain_unavailable"):
+            raw = Mock(return_value=(401, {"error": {"code": code}}))
+            request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, "masked scenario"):
+                request("/v1/peers", {"node_id": "fixture"})
+        raw = Mock()
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+        for name in ("X-IICP-Membership", "x-iicp-subject-id"):
+            with self.assertRaisesRegex(ValueError, "override"):
+                request("/v1/peers", {"node_id": "fixture"}, {name: "injected"})
+        raw.assert_not_called()
+
+    def test_restricted_success_requires_operation_specific_projection(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["restricted_membership_command"] = Mock(return_value="synthetic")
+        result = {"restricted_domain_decision": {"decision": "eligible", "operation": "discovery",
+            "domain_id": "example.internal", "authority_id": "did:key:directory", "subject_kind": "client"}}
+        raw = Mock(return_value=(200, result))
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+        self.assertEqual(request("/v1/discover?intent=fixture"), (200, result))
+        for key in result["restricted_domain_decision"]:
+            changed = copy.deepcopy(result); changed["restricted_domain_decision"][key] = "wrong"
+            raw.return_value = (200, changed)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "projection"):
+                request("/v1/discover?intent=fixture")
+
+    def test_restricted_mode_requires_database_for_every_assigned_case(self):
+        with patch.object(adapter, "directory_database_dependencies", return_value={}) as inputs:
+            with self.assertRaisesRegex(ValueError, "missing"):
+                adapter.require_directory_database_fixture("directory-rust", "package-version-self-report", self.workspace, "restricted")
+            inputs.assert_called_once_with(self.workspace)
+
+    def test_database_reset_uses_validated_run_owned_namespace_and_private_secret(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        config = {"database": "iicp_pre1_" + "a" * 16, "username": "iicp_pre1_fixture"}
+        ns["database_fixture_inputs"] = Mock(return_value=(config, "synthetic-private-password"))
+        run = Mock(return_value=Mock(returncode=0))
+        ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+        ns["reset_directory_database"]({"HOME": str(self.home), "PATH": "/fixture"})
+        argv = run.call_args.args[0]
+        self.assertNotIn("synthetic-private-password", " ".join(argv))
+        self.assertEqual(argv[-1], "DROP DATABASE IF EXISTS `iicp_pre1_" + "a" * 16 + "`; CREATE DATABASE `iicp_pre1_" + "a" * 16 + "`")
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+        self.assertEqual(run.call_args.kwargs["env"]["MYSQL_PWD"], "synthetic-private-password")
+        run.return_value.returncode = 1
+        with self.assertRaisesRegex(ValueError, "reset failed"):
+            ns["reset_directory_database"]({"HOME": str(self.home)})
+
     def test_public_mode_requires_both_fresh_environment_variants(self):
         from unittest.mock import Mock
         ns = self.directory_http_functions()
@@ -592,8 +707,13 @@ class PackageExecutionTests(unittest.TestCase):
         runner.reset_mock()
         ns["rust_mode_postcondition"](Path("/binary"), original, "local-only", "0.1.15")
         runner.assert_not_called()
-        with self.assertRaisesRegex(ValueError, "restricted mode remains unimplemented"):
-            ns["rust_mode_postcondition"](Path("/binary"), original, "restricted", "0.1.15")
+        ns["rust_mode_postcondition"](Path("/binary"), original, "restricted", "0.1.15")
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args.args[1]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true")
+        self.assertTrue(runner.call_args.kwargs["database"])
+        self.assertEqual(runner.call_args.args[2], "environment-restricted")
+        with self.assertRaises(ValueError):
+            ns["rust_mode_postcondition"](Path("/binary"), original, "unknown", "0.1.15")
 
     def test_public_mode_rejects_false_positive_discovery(self):
         check = self.directory_http_functions()["http_postcondition"]
@@ -781,6 +901,9 @@ class PackageExecutionTests(unittest.TestCase):
         shutil.rmtree(self.workspace)
         self.workspace.mkdir()
         (self.root / "qualification").mkdir(exist_ok=True)
+        (self.root / "parity").mkdir(exist_ok=True)
+        for name in ("contract-v1.10.80.json", "behavior-contract-v1.json", "http-contract-v1.json"):
+            shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "parity" / name, self.root / "parity" / name)
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
