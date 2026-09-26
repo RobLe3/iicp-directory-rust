@@ -180,10 +180,14 @@ class PackageExecutionTests(unittest.TestCase):
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
                 "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
+                "migration_interrupted_postcondition": invoke,
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
             self.assertEqual(stopped.exception.code, 0)
+            if scenario == "migration-interrupted":
+                invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
+                continue
             self.assertEqual(invoke.call_args.args[2], scenario)
             self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
 
@@ -691,6 +695,77 @@ class PackageExecutionTests(unittest.TestCase):
         run.return_value.returncode = 1
         with self.assertRaisesRegex(ValueError, "reset failed"):
             ns["reset_directory_database"]({"HOME": str(self.home)})
+
+    def test_interrupted_schema_requires_real_startup_refusal_and_unchanged_state(self):
+        from unittest.mock import Mock
+        baseline = b"nodes\tid\tvarchar(128)\tNO\tNULL\t\nfixture-interrupted-schema\n"
+        refusal = b"FATAL: MySQL schema verification failed: schema incompatible (1 required contract differences); nodes.region missing\n"
+        for name, code, output, after in [
+                ("valid", 1, refusal, baseline),
+                ("wrong-exit", 0, refusal, baseline),
+                ("wrong-error", 1, b"FATAL: configured MySQL connection failed", baseline),
+                ("unrelated-membership", 1, b"restricted_domain_denied", baseline),
+                ("listening", 1, refusal + b"listening on 0.0.0.0", baseline),
+                ("memory-downgrade", 1, refusal + b"using InMemoryRepo", baseline),
+                ("oversize", 1, refusal + b"x" * 65537, baseline),
+                ("mutated", 1, refusal, baseline + b"mutation"),
+            ]:
+            with self.subTest(name=name):
+                ns = self.directory_http_functions()
+                ns["require_loopback_only"] = Mock()
+                ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+                    "username": "iicp_pre1_fixture"}, "synthetic password"))
+                ns["reset_directory_database"] = Mock()
+                ns["rust_http_case"] = Mock()
+                ns["directory_fixture_sql"] = Mock(side_effect=[b"", baseline, after])
+                def run(argv, **kwargs):
+                    self.assertEqual(argv, ["/fixture/iicp-directory-rs"])
+                    self.assertEqual(kwargs["timeout"], 30)
+                    self.assertEqual(kwargs["env"]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true")
+                    self.assertIn("synthetic%20password@127.0.0.1", kwargs["env"]["DATABASE_URL"])
+                    kwargs["stdout"].write(output)
+                    return Mock(returncode=code)
+                ns["subprocess"] = Mock(run=run, STDOUT=subprocess.STDOUT)
+                call = lambda: ns["migration_interrupted_postcondition"](Path("/fixture/iicp-directory-rs"),
+                    {"HOME": str(self.home), "IICP_RESTRICTED_DOMAIN_ENABLED": "true"}, "0.1.15")
+                if name == "valid": call()
+                else:
+                    with self.assertRaisesRegex(ValueError, "preserve and reject"): call()
+                self.assertEqual(ns["reset_directory_database"].call_count, 3)
+                ns["rust_http_case"].assert_called_once_with(Path("/fixture/iicp-directory-rs"),
+                    {"HOME": str(self.home), "IICP_RESTRICTED_DOMAIN_ENABLED": "true"},
+                    "credential-missing", "0.1.15", database=True)
+
+    def test_schema_oracle_is_bounded_loopback_and_keeps_secret_out_of_argv(self):
+        from unittest.mock import Mock
+        for code, payload in [(0, b"fixture"), (1, b""), (0, b"x" * 65537)]:
+            ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+            ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+                "username": "iicp_pre1_fixture"}, "synthetic-private-password"))
+            def run(argv, **kwargs):
+                self.assertNotIn("synthetic-private-password", " ".join(argv))
+                self.assertIn("--host=127.0.0.1", argv)
+                self.assertEqual(kwargs["timeout"], 10)
+                self.assertEqual(kwargs["env"]["MYSQL_PWD"], "synthetic-private-password")
+                kwargs["stdout"].write(payload)
+                return Mock(returncode=code)
+            ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+            if not code and len(payload) <= 65536:
+                self.assertEqual(ns["directory_fixture_sql"]({"HOME": str(self.home)}, "SELECT 1"), payload)
+            else:
+                with self.assertRaisesRegex(ValueError, "oracle failed"):
+                    ns["directory_fixture_sql"]({"HOME": str(self.home)}, "SELECT 1")
+
+    def test_interrupted_schema_cleanup_on_failed_positive_control(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+            "username": "iicp_pre1_fixture"}, "synthetic"))
+        ns["reset_directory_database"] = Mock()
+        ns["rust_http_case"] = Mock(side_effect=ValueError("positive control failed"))
+        with self.assertRaisesRegex(ValueError, "positive control failed"):
+            ns["migration_interrupted_postcondition"](Path("/binary"), {"HOME": str(self.home)}, "0.1.15")
+        self.assertEqual(ns["reset_directory_database"].call_count, 2)
 
     def test_public_mode_requires_both_fresh_environment_variants(self):
         from unittest.mock import Mock

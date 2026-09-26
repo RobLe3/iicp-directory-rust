@@ -891,7 +891,7 @@ def validate_management_binding(value, context, artifact, root):
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
-DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
+DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
 
@@ -1568,6 +1568,66 @@ def reset_directory_database(env):
     if result.returncode:
         raise ValueError("Directory disposable database reset failed")
 
+def directory_fixture_sql(env, sql):
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--no-defaults", "--batch", "--raw", "--skip-column-names", "--protocol=TCP",
+        "--host=127.0.0.1", "--port=3306", "--connect-timeout=3",
+        "--user=" + config["username"], "--database=" + config["database"], "--execute", sql]
+    with tempfile.TemporaryDirectory(prefix="directory-schema-home-", dir=private_case_home(env)) as home, tempfile.TemporaryFile() as output:
+        result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=output, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        output.seek(0); observed = output.read(65537)
+    if result.returncode or len(observed) > 65536:
+        raise ValueError("Directory isolated schema oracle failed")
+    return observed
+
+def migration_interrupted_postcondition(binary, env, version):
+    # The released boundary is verify-only for an existing database. Never
+    # simulate recovery by repairing it from the harness after startup.
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    from urllib.parse import quote
+    launch_env = {**env, "APP_KEY": "iicp-pre1-isolated-synthetic-key",
+        "DATABASE_URL": "mysql://" + config["username"] + ":" + quote(password, safe="")
+            + "@127.0.0.1:3306/" + config["database"]}
+    observation = (
+        "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'NULL'),EXTRA "
+        "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION;"
+        "SELECT TABLE_NAME,INDEX_NAME,COLUMN_NAME,NON_UNIQUE FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX;"
+        "SELECT TABLE_NAME,TABLE_TYPE,ENGINE,TABLE_COLLATION,CREATE_OPTIONS FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME;"
+        "SELECT TABLE_NAME,CONSTRAINT_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME "
+        "FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() "
+        "ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION;"
+        "SELECT id FROM nodes ORDER BY id;")
+    reset_directory_database(env)
+    try:
+        # Same installed binary must first bootstrap an empty, valid fixture
+        # and serve its real HTTP contract before the negative control.
+        rust_http_case(binary, env, "credential-missing", version, database=True)
+        reset_directory_database(env)
+        directory_fixture_sql(env, "CREATE TABLE nodes (id VARCHAR(128) NOT NULL PRIMARY KEY);"
+            "INSERT INTO nodes (id) VALUES ('fixture-interrupted-schema');")
+        before = directory_fixture_sql(env, observation)
+        if not before.startswith(b"nodes\tid\t") or not before.endswith(b"fixture-interrupted-schema\n"):
+            raise ValueError("Directory interrupted schema fixture differs")
+        with tempfile.TemporaryFile(dir=private_case_home(env)) as log:
+            result = subprocess.run([str(binary)], cwd=binary.parent, env=launch_env,
+                stdout=log, stderr=subprocess.STDOUT, timeout=30, check=False)
+            log.seek(0); output = log.read(65537)
+        after = directory_fixture_sql(env, observation)
+        if (result.returncode != 1 or len(output) > 65536
+                or b"FATAL: MySQL schema verification failed: schema incompatible (" not in output
+                or b"listening on" in output or b"using InMemoryRepo" in output
+                or before != after):
+            raise ValueError("Directory installed startup did not preserve and reject the interrupted schema")
+    finally:
+        reset_directory_database(env)
+
 def restricted_request_adapter(request, binary, env):
     operations = {("POST", "/v1/register"): "registration", ("GET", "/v1/discover"): "discovery",
         ("GET", "/v1/bootstrap"): "bootstrap", ("POST", "/v1/heartbeat"): "heartbeat",
@@ -1843,6 +1903,11 @@ if component == "directory-rust":
     if scenario == "offline-locked-install":
         offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    if scenario == "migration-interrupted":
+        resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
+        migration_interrupted_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
