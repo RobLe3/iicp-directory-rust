@@ -1465,8 +1465,75 @@ def stale_owner_postcondition(process, snapshot, request, contender, contender_l
     wait_snapshot_checkpoint(process, snapshot, sequence)
     return crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
 
+def restricted_membership_command(binary, env, action, subject, scope="discovery"):
+    import re
+    if action not in {"issue", "revoke"} or subject not in {"fixture-client", "fixture-other"} or scope not in {"discovery", "bootstrap"}:
+        raise ValueError("Directory membership fixture command differs")
+    argv = [str(binary), "trust-domain-membership-" + action,
+        "--kind", "client", "--subject", subject]
+    if action == "issue":
+        argv += ["--scopes", scope, "--ttl-seconds", "3600"]
+    with tempfile.TemporaryFile(dir=private_case_home(env)) as output:
+        result = subprocess.run(argv, cwd=binary.parent, env=env, stdout=output,
+            stderr=subprocess.DEVNULL, timeout=30, check=False)
+        output.seek(0)
+        raw = output.read(4097)
+    if result.returncode != 0 or len(raw) > 4096:
+        raise ValueError("Directory membership fixture administration failed")
+    value = raw.decode("utf-8").strip()
+    if ((action == "issue" and not re.fullmatch(r"iicp_mem_[0-9a-f]{64}", value))
+            or (action == "revoke" and value != "revoked")):
+        raise ValueError("Directory membership fixture output differs")
+    return value
+
+def restricted_mode_postcondition(request, administer):
+    discover = "/v1/discover?intent=urn:iicp:intent:llm:chat:v1"
+    def denied(headers=None, path=discover):
+        status, body = request(path, headers=headers)
+        if (status != 401 or body.get("error", {}).get("code") != "restricted_domain_denied"
+                or "restricted_domain_decision" in body):
+            raise ValueError("Directory restricted-mode denial differs")
+    denied()
+    token = administer("issue", "fixture-client", "discovery")
+    headers = {"X-IICP-Membership": token, "X-IICP-Subject-Id": "fixture-client"}
+    def eligible(credential):
+        status, body = request(discover, headers={**headers, "X-IICP-Membership": credential})
+        decision = body.get("restricted_domain_decision", {})
+        if (status != 200 or body.get("nodes") != [] or type(body.get("count")) is not int
+                or body["count"] != 0 or "error" in body
+                or decision.get("schema") != "iicp.restricted-trust-domain.directory-decision.v0"
+                or decision.get("profile") != "urn:iicp:profile:restricted-trust-domain:v1"
+                or decision.get("decision") != "eligible" or decision.get("operation") != "discovery"
+                or decision.get("domain_id") != "example.internal"
+                or decision.get("authority_id") != "did:key:directory"
+                or decision.get("subject_kind") != "client"
+                or type(decision.get("membership_generation")) is not int or decision["membership_generation"] < 1
+                or type(decision.get("membership_expires_at")) is not int
+                or decision["membership_expires_at"] <= int(time.time())):
+            raise ValueError("Directory restricted-mode eligibility differs")
+    eligible(token)
+    denied(headers, "/v1/bootstrap")
+    denied({**headers, "X-IICP-Subject-Id": "fixture-other"})
+    denied({**headers, "X-IICP-Membership": token[:-1] + ("a" if token[-1] != "a" else "b")})
+    wrong_scope = administer("issue", "fixture-other", "bootstrap")
+    denied({"X-IICP-Membership": wrong_scope, "X-IICP-Subject-Id": "fixture-other"})
+    rotated = administer("issue", "fixture-client", "discovery")
+    if rotated == token:
+        raise ValueError("Directory membership rotation did not replace credential")
+    denied(headers)
+    eligible(rotated)
+    administer("revoke", "fixture-client", "discovery")
+    denied({**headers, "X-IICP-Membership": rotated})
+    administer("revoke", "fixture-other", "bootstrap")
+
 def rust_http_case(binary, env, scenario, version, database=False):
     require_loopback_only()
+    if scenario == "environment-restricted" and (not database
+            or env.get("IICP_RESTRICTED_DOMAIN_ENABLED") != "true"
+            or env.get("IICP_REPLICA_MODE") != "false"
+            or env.get("IICP_TRUST_DOMAIN_ID") != "example.internal"
+            or env.get("IICP_TRUST_DOMAIN_AUTHORITY_ID") != "did:key:directory"):
+        raise ValueError("Directory restricted fixture requires isolated database and exact mode")
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
@@ -1515,7 +1582,10 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 if time.monotonic() >= deadline:
                     raise ValueError("Directory HTTP fixture readiness timed out")
                 time.sleep(0.1)
-            if scenario == "config-permission-denied":
+            if scenario == "environment-restricted":
+                restricted_mode_postcondition(request, lambda action, subject, scope:
+                    restricted_membership_command(binary, launch_env, action, subject, scope))
+            elif scenario == "config-permission-denied":
                 permission_snapshot_postcondition(process, snapshot, log, request)
             elif scenario == "disk-full":
                 disk_full_snapshot_postcondition(process, snapshot, log, request)

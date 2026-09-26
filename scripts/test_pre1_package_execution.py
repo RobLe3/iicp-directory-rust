@@ -488,6 +488,95 @@ class PackageExecutionTests(unittest.TestCase):
             with self.subTest(index=index, replacement=replacement), self.assertRaises(ValueError):
                 check(Mock(side_effect=changed))
 
+    def restricted_mode_responses(self):
+        denied = (401, {"error": {"code": "restricted_domain_denied"}})
+        eligible = (200, {"nodes": [], "count": 0, "restricted_domain_decision": {
+            "schema": "iicp.restricted-trust-domain.directory-decision.v0",
+            "profile": "urn:iicp:profile:restricted-trust-domain:v1", "decision": "eligible",
+            "operation": "discovery", "domain_id": "example.internal", "authority_id": "did:key:directory",
+            "subject_kind": "client", "membership_generation": 1, "membership_expires_at": 2000}})
+        return [denied, eligible, denied, denied, denied, denied, denied, eligible, denied]
+
+    def test_restricted_mode_requires_full_membership_lifecycle(self):
+        from unittest.mock import Mock, call
+        ns = self.directory_http_functions()
+        ns["time"] = Mock(time=lambda: 1000)
+        request = Mock(side_effect=self.restricted_mode_responses())
+        first, wrong, rotated = ["iicp_mem_" + c * 64 for c in "123"]
+        administer = Mock(side_effect=[first, wrong, rotated, "revoked", "revoked"])
+        ns["restricted_mode_postcondition"](request, administer)
+        self.assertEqual(request.call_count, 9)
+        self.assertEqual(administer.call_args_list, [call("issue", "fixture-client", "discovery"),
+            call("issue", "fixture-other", "bootstrap"), call("issue", "fixture-client", "discovery"),
+            call("revoke", "fixture-client", "discovery"), call("revoke", "fixture-other", "bootstrap")])
+        self.assertEqual(request.call_args_list[3].kwargs["headers"]["X-IICP-Subject-Id"], "fixture-other")
+        self.assertEqual(request.call_args_list[6].kwargs["headers"]["X-IICP-Membership"], first)
+        self.assertEqual(request.call_args_list[7].kwargs["headers"]["X-IICP-Membership"], rotated)
+        self.assertNotEqual(request.call_args_list[4].kwargs["headers"]["X-IICP-Membership"], first)
+
+    def test_restricted_mode_rejects_every_incorrect_lifecycle_response(self):
+        from unittest.mock import Mock
+        for index in range(9):
+            ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+            responses = self.restricted_mode_responses()
+            responses[index] = (200, {})
+            administer = Mock(side_effect=["iicp_mem_" + c * 64 for c in "123"] + ["revoked", "revoked"])
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                ns["restricted_mode_postcondition"](Mock(side_effect=responses), administer)
+
+    def test_restricted_mode_rejects_wrong_projection_and_unchanged_rotation(self):
+        from unittest.mock import Mock
+        wrong = {"schema": "wrong", "profile": "wrong", "decision": "denied", "operation": "bootstrap",
+            "domain_id": "wrong", "authority_id": "wrong", "subject_kind": "node",
+            "membership_generation": False, "membership_expires_at": 999}
+        for field, value in wrong.items():
+            ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+            responses = copy.deepcopy(self.restricted_mode_responses())
+            responses[1][1]["restricted_domain_decision"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                ns["restricted_mode_postcondition"](Mock(side_effect=responses), Mock(return_value="token"))
+        ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+        with self.assertRaisesRegex(ValueError, "rotation"):
+            ns["restricted_mode_postcondition"](Mock(side_effect=self.restricted_mode_responses()), Mock(return_value="same-token"))
+
+    def test_restricted_mode_requires_database_exact_identity_and_no_replica(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        env = {"IICP_RESTRICTED_DOMAIN_ENABLED": "true", "IICP_REPLICA_MODE": "false",
+            "IICP_TRUST_DOMAIN_ID": "example.internal", "IICP_TRUST_DOMAIN_AUTHORITY_ID": "did:key:directory"}
+        for key in env:
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "exact mode"):
+                ns["rust_http_case"](Path("/binary"), {**env, key: "wrong"}, "environment-restricted", "0.1.15", database=True)
+        with self.assertRaisesRegex(ValueError, "isolated database"):
+            ns["rust_http_case"](Path("/binary"), env, "environment-restricted", "0.1.15")
+
+    def test_membership_admin_checks_exit_output_bounds_and_exact_cli(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        env = {"HOME": str(self.home)}
+        for action, code, raw, valid in [("issue", 0, b'iicp_mem_' + b'a' * 64 + b'\n', True),
+                ("revoke", 0, b'revoked\n', True), ("issue", 1, b'iicp_mem_' + b'a' * 64, False),
+                ("issue", 0, b'garbage', False), ("revoke", 0, b'not-revoked', False),
+                ("issue", 0, b'x' * 4097, False)]:
+            def run(argv, **kwargs):
+                expected = ["/fixture/iicp-directory-rs", "trust-domain-membership-" + action,
+                    "--kind", "client", "--subject", "fixture-client"]
+                if action == "issue": expected += ["--scopes", "discovery", "--ttl-seconds", "3600"]
+                self.assertEqual(argv, expected); self.assertEqual(kwargs["timeout"], 30)
+                self.assertEqual(kwargs["env"], env); self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                kwargs["stdout"].write(raw)
+                return Mock(returncode=code)
+            ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+            with self.subTest(action=action, code=code, length=len(raw)):
+                if valid:
+                    self.assertEqual(ns["restricted_membership_command"](Path("/fixture/iicp-directory-rs"), env, action, "fixture-client"), raw.decode().strip())
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["restricted_membership_command"](Path("/fixture/iicp-directory-rs"), env, action, "fixture-client")
+        for action, subject, scope in [("delete", "fixture-client", "discovery"), ("issue", "other", "discovery"), ("issue", "fixture-client", "*")]:
+            with self.assertRaises(ValueError):
+                ns["restricted_membership_command"](Path("/binary"), env, action, subject, scope)
+
     def test_public_mode_requires_both_fresh_environment_variants(self):
         from unittest.mock import Mock
         ns = self.directory_http_functions()
