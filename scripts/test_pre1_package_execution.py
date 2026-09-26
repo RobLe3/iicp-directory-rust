@@ -18,6 +18,29 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def test_harness_documentation_exception_preserves_released_bytes(self):
+        import hashlib
+        import pre1_harness_binding as harness
+        before, appendix = b"released requirements\n", b"\nqualification diagnosis\n"
+        expected = {"base_sha256": hashlib.sha256(before).hexdigest(),
+                    "append_sha256": hashlib.sha256(appendix).hexdigest()}
+        with patch.dict(harness.REVIEWED_DOCUMENT_APPENDICES, {"OPERATIONS.md": expected}, clear=True):
+            for content in (before + appendix, b"changed\n" + appendix,
+                            before + appendix + b"unreviewed", before):
+                with self.subTest(content=content), patch.object(harness, "git", side_effect=[before, content]):
+                    if content == before + appendix:
+                        harness.validate_document_appendix(Path("/fixture"), "OPERATIONS.md", "base", "head")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "reviewed append-only"):
+                            harness.validate_document_appendix(Path("/fixture"), "OPERATIONS.md", "base", "head")
+
+    def test_harness_documentation_exception_is_not_a_document_wildcard(self):
+        import pre1_harness_binding as harness
+        self.assertEqual(set(harness.REVIEWED_DOCUMENT_APPENDICES), {"OPERATIONS.md"})
+        self.assertNotIn("OPERATIONS.md", harness.TOOL_ONLY_PATHS | harness.CI_ONLY_PATHS)
+        self.assertIn("scripts/prepare_pre1_minimum_runtime.py", harness.TOOL_ONLY_PATHS)
+        self.assertNotIn("scripts/prepare_pre1_unreviewed.py", harness.TOOL_ONLY_PATHS)
+
     def test_runtime_dependencies_are_optional_but_partial_fixtures_fail(self):
         self.assertEqual(adapter.directory_runtime_dependencies(self.workspace, self.bindings), {})
         (self.workspace / "directory-runtime-fixture").mkdir()
