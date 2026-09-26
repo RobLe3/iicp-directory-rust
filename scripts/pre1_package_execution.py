@@ -1703,6 +1703,101 @@ def directory_database_state(env):
         raise ValueError("Directory database state exceeds bound")
     return {"schema": schema, "rows": rows}
 
+def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256):
+    # The caller must supply a preparation-bound predecessor. This probe is not
+    # admitted into qualification until its fixture is in the package binding.
+    import hashlib
+    import re
+    if (predecessor.is_symlink() or not predecessor.is_file()
+            or not re.fullmatch(r"sha256:[a-f0-9]{64}", predecessor_sha256)
+            or "sha256:" + hashlib.sha256(predecessor.read_bytes()).hexdigest() != predecessor_sha256):
+        raise ValueError("Directory rollback predecessor binding differs")
+    observed = subprocess.check_output([str(predecessor), "--version"], env=env, text=True, timeout=10)
+    if observed.strip() != "iicp-directory-rs 0.1.14":
+        raise ValueError("Directory rollback predecessor version differs")
+    baseline = {}
+    def authorization(request):
+        for subject, expected in (("fixture-rollback-allowed", 200), ("fixture-rollback-denied", 401)):
+            code, result = request("/v1/discover?intent=urn:iicp:intent:llm:chat:v1", headers=baseline[subject])
+            if code != expected:
+                raise ValueError("Directory rollback authorization or revocation differs")
+            if expected == 200:
+                decision = result.get("restricted_domain_decision", {})
+                if (decision.get("decision") != "eligible" or decision.get("domain_id") != "example.internal"
+                        or decision.get("authority_id") != "did:key:directory"):
+                    raise ValueError("Directory rollback authority projection differs")
+            elif result.get("error", {}).get("code") != "restricted_domain_denied":
+                raise ValueError("Directory rollback denial cause differs")
+    def seed(request, scenario_request, executable, launch_env):
+        body = {"node_id": "fixture-rollback", "endpoint": "http://127.0.0.1:1/v1/task",
+            "region": "eu-central", "nat_type": "public", "transport_method": "direct_ipv4",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
+        code, registered = scenario_request("/v1/register", body)
+        if code != 201 or registered.get("node_id") != body["node_id"] or not registered.get("node_token"):
+            raise ValueError("Directory rollback registration positive control differs")
+        code, detail = request("/v1/node/fixture-rollback")
+        if code != 200 or detail.get("node_id") != body["node_id"]:
+            raise ValueError("Directory rollback seed observation differs")
+        baseline["detail"] = detail
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            for subject in ("fixture-rollback-allowed", "fixture-rollback-denied"):
+                token = restricted_membership_command(executable, launch_env, "issue", subject, "discovery")
+                baseline[subject] = {"X-IICP-Membership": token, "X-IICP-Subject-Id": subject}
+            restricted_membership_command(executable, launch_env, "revoke", "fixture-rollback-denied", "discovery")
+            authorization(request)
+    def readback(request, scenario_request, executable, launch_env):
+        code, detail = request("/v1/node/fixture-rollback")
+        if code != 200 or detail != baseline["detail"]:
+            raise ValueError("Directory rollback persistent HTTP state differs")
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            authorization(request)
+    reset_directory_database(env)
+    try:
+        with tempfile.TemporaryDirectory(prefix="directory-rollback-", dir=private_case_home(env)) as directory:
+            active = Path(directory) / "current"
+            def select(executable):
+                pending = active.with_name("next")
+                pending.symlink_to(executable)
+                os.replace(pending, active)
+            select(predecessor)
+            rust_http_case(active, env, "rollback-seed", "0.1.14", database=True, postcondition=seed)
+            before = directory_database_state(env)
+            select(binary)
+            rust_http_case(active, env, "rollback-upgrade", version, database=True, postcondition=readback)
+            if directory_database_state(env) != before:
+                raise ValueError("Directory upgrade changed rollback persistent state")
+            failure_env = {**env, "APP_ENV": "local", "IICP_ALLOW_IN_MEMORY": "false"}
+            failure_env.pop("DATABASE_URL", None)
+            # Do not accept an arbitrary crash as the intended failed upgrade.
+            with tempfile.TemporaryFile(dir=private_case_home(env)) as log:
+                result = subprocess.run([str(active)], cwd=active.parent, env=failure_env,
+                    stdout=log, stderr=subprocess.STDOUT, timeout=10, check=False)
+                output = os.pread(log.fileno(), 65537, 0)
+                evidence = os.environ.get("IICP_PRE1_CASE_EVIDENCE_ROOT")
+                if evidence:
+                    destination = Path(tempfile.mkdtemp(prefix="directory-rollback-failure-", dir=evidence))
+                    (destination / "stdout.log").write_bytes(output[:65536])
+                    (destination / "result.json").write_text(json.dumps({"exit_code": result.returncode,
+                        "qualification_credit": False, "stage": "failed-upgrade"}) + "\n")
+                    for item in destination.iterdir():
+                        item.chmod(0o600)
+                refusal = (b"restricted trust-domain mode requires DATABASE_URL-backed membership persistence"
+                    if env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true" else b"FATAL: DATABASE_URL is required")
+                if (result.returncode != 1 or len(output) > 65536
+                        or refusal not in output
+                        or b"listening on" in output):
+                    raise ValueError("Directory failed-upgrade cause differs")
+            if directory_database_state(env) != before:
+                raise ValueError("Directory failed upgrade changed persistent state")
+            select(predecessor)
+            if active.resolve() != predecessor.resolve():
+                raise ValueError("Directory predecessor managed path was not restored")
+            rust_http_case(active, env, "rollback-restart", "0.1.14", database=True, postcondition=readback)
+            if directory_database_state(env) != before:
+                raise ValueError("Directory rollback changed schema or persistent data")
+    finally:
+        reset_directory_database(env)
+
 def backup_restore_postcondition(binary, env, version):
     baseline = {}
     def seed(request, scenario_request, binary, launch_env):
