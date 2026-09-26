@@ -608,7 +608,7 @@ class PackageExecutionTests(unittest.TestCase):
         with self.directory_network({"lo", "eth0"}), \
              patch.object(subprocess, "Popen") as launch:
             with self.assertRaisesRegex(ValueError, "loopback-only"):
-                run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+                run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
             launch.assert_not_called()
 
     def test_directory_http_fixture_wrong_identity_kills_owned_process(self):
@@ -627,7 +627,7 @@ class PackageExecutionTests(unittest.TestCase):
              patch.object(urllib.request, "build_opener") as opener:
             opener.return_value.open.return_value = response
             with self.assertRaisesRegex(ValueError, "identity differs"):
-                run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+                run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
             kill.assert_called_once()
             process.wait.assert_called_once_with(timeout=10)
 
@@ -645,7 +645,7 @@ class PackageExecutionTests(unittest.TestCase):
                  patch.object(os, "killpg", create=True) as kill, \
                  patch.object(time, "monotonic", side_effect=[0, 31]):
                 with self.assertRaisesRegex(ValueError, cause):
-                    run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+                    run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
                 kill.assert_called_once()
                 process.wait.assert_called_once_with(timeout=10)
 
@@ -783,6 +783,94 @@ class PackageExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a directory"):
             adapter.provision_directory_runtime_paths(installed)
 
+    def test_directory_private_case_home_rejects_package_storage_and_unsafe_paths(self):
+        validate = self.directory_http_functions()["private_case_home"]
+        with patch.object(Path, "cwd", return_value=self.workspace):
+            self.assertEqual(validate({"HOME": str(self.home)}), self.home)
+            nested = self.workspace / "case-home"
+            nested.mkdir(mode=0o700)
+            link = self.home / "home-link"
+            link.symlink_to(self.home, target_is_directory=True)
+            public = self.home / "public-home"
+            public.mkdir(mode=0o755)
+            for home in ("relative", str(self.workspace), str(nested), str(link), str(public)):
+                with self.subTest(home=home), self.assertRaisesRegex(ValueError, "private case HOME"):
+                    validate({"HOME": home})
+
+    def test_database_oracle_home_is_private_and_outside_read_only_workspace(self):
+        config = {"schema": "iicp.pre1-directory-operator-fixture.v1",
+                  "database": "iicp_pre1_" + "a" * 16, "username": "iicp_pre1_fixture", "port": 3306}
+        (self.workspace / "directory-operator-fixture.json").write_text(json.dumps(config))
+        secret = self.workspace / "directory-operator-password"
+        secret.write_text("test-only-not-a-credential")
+        secret.chmod(0o600)
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = lambda: None
+        seen = []
+        def observe(argv, **kwargs):
+            home = Path(kwargs["env"]["HOME"])
+            self.assertEqual(home.parent, self.home)
+            self.assertEqual(home.stat().st_mode & 0o077, 0)
+            seen.append(home)
+            kwargs["stdout"].write(b"NULL\tfixture-challenge\n")
+            return subprocess.CompletedProcess(argv, 0)
+        self.workspace.chmod(0o500)
+        try:
+            with patch.object(Path, "cwd", return_value=self.workspace), \
+                    patch.object(subprocess, "run", side_effect=observe):
+                self.assertEqual(ns["database_observation"](),
+                    {"verified_at": None, "challenge": "fixture-challenge"})
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(seen[0].exists())
+        finally:
+            self.workspace.chmod(0o700)
+
+    def test_migration_checkpoint_uses_private_home_and_real_child_is_reaped(self):
+        import sys
+        ns = self.directory_http_functions()
+        runtime = self.home / "fake-migration"
+        runtime.write_text("#!" + sys.executable + "\nimport os,time\nfrom pathlib import Path\n"
+            "checkpoint=Path(os.environ['IICP_PRE1_INTERRUPTION_READY'])\n"
+            "assert checkpoint.parent == Path(os.environ['HOME'])\n"
+            "checkpoint.write_text('transaction-open')\ntime.sleep(30)\n")
+        runtime.chmod(0o700)
+        self.workspace.chmod(0o500)
+        try:
+            with patch.object(Path, "cwd", return_value=self.workspace):
+                ns["interrupt_migration"](self.workspace, self.workspace, str(runtime),
+                    {"HOME": str(self.home), "PATH": os.environ.get("PATH", "")}, None, None)
+            self.assertFalse((self.home / "directory-interruption-ready").exists())
+            self.assertFalse((self.workspace / "directory-interruption-ready").exists())
+        finally:
+            self.workspace.chmod(0o700)
+
+    def test_directory_php_generated_probe_keeps_read_only_workspace_unchanged(self):
+        import sys
+        _artifact, installed, _binding, context = self.directory_inputs("directory-php")
+        context["scenario_id"] = "package-version-self-report"
+        runtime = self.home / "fake-php-readonly"
+        runtime.write_text("#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n"
+            "report=Path(sys.argv[sys.argv.index('--log-junit')+1])\n"
+            "report.write_text('<testsuite><testcase name=\"package-version-self-report\"/></testsuite>')\n")
+        runtime.chmod(0o700)
+        snapshot = lambda: {str(p.relative_to(self.workspace)): p.read_bytes() if p.is_file() else None
+                            for p in self.workspace.rglob("*")}
+        before = snapshot()
+        self.workspace.chmod(0o500)
+        try:
+            result = subprocess.run([sys.executable, "-I", "-S", str(self.workspace / "directory-probe.py"),
+                "package-version-self-report"], cwd=self.workspace,
+                env={**os.environ, "HOME": str(self.home), "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context),
+                     "IICP_PRE1_DIRECTORY_INSTALLED": str(installed), "IICP_PRE1_DIRECTORY_PHP": str(runtime)},
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("IICP_PRE1_DIRECTORY_ASSERTION_PASS", result.stdout)
+            self.assertEqual(snapshot(), before)
+            self.assertFalse((self.home / "directory-junit.xml").exists())
+            self.assertEqual(list(self.home.glob("directory-output-*")), [])
+        finally:
+            self.workspace.chmod(0o700)
+
     def test_directory_php_probe_self_report_and_junit_fail_closed(self):
         import sys
         artifact, installed, value, context = self.directory_inputs("directory-php")
@@ -802,7 +890,7 @@ class PackageExecutionTests(unittest.TestCase):
             ('<testsuite><testcase name="wrong"/></testsuite>', 1),
             ('<testsuite><testcase name="package-version-self-report"/><testcase name="extra"/></testsuite>', 1),
         ]:
-            (self.workspace / "directory-junit.xml").unlink(missing_ok=True)
+            (self.home / "directory-junit.xml").unlink(missing_ok=True)
             # The child environment is intentionally sanitized; vary the fake
             # runtime itself instead of relying on inherited environment values.
             runtime.write_text("#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n" +
