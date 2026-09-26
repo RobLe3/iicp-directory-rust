@@ -1049,7 +1049,12 @@ def duplicate_registration_postcondition(request):
         raise ValueError("duplicate registration reset reputation or changed endpoint")
 
 def http_postcondition(request, scenario):
-    if scenario == "credential-missing":
+    if scenario == "environment-public":
+        status, value = request("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+        if (status != 200 or value.get("nodes") != [] or type(value.get("count")) is not int
+                or value["count"] != 0 or "restricted_domain_decision" in value or "error" in value):
+            raise ValueError("Directory public-mode discovery differs")
+    elif scenario == "credential-missing":
         status, value = request("/v1/peers", {"node_id": "fixture", "known_peers": []})
         if status != 401:
             raise ValueError("unauthenticated peer access was not refused")
@@ -1541,6 +1546,19 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 pass
             process.wait(timeout=10)
 
+def rust_mode_postcondition(binary, env, mode, version):
+    if mode == "local-only":
+        return
+    if mode != "public":
+        raise ValueError("Directory restricted mode remains unimplemented")
+    # Independent fresh children prove both released default and explicit input.
+    for enabled in (None, "false"):
+        launch_env = dict(env)
+        launch_env.pop("IICP_RESTRICTED_DOMAIN_ENABLED", None)
+        if enabled is not None:
+            launch_env["IICP_RESTRICTED_DOMAIN_ENABLED"] = enabled
+        rust_http_case(binary, launch_env, "environment-public", version)
+
 def php_operator_case(installed, env, scenario, version):
     require_loopback_only()
     import hashlib, re, stat
@@ -1656,7 +1674,8 @@ def interrupt_migration(installed, workspace, php, env, command, helper):
 
 context = json.loads(os.environ["IICP_PRE1_EXECUTION_CONTEXT"])
 component, scenario = context["component"], context["scenario_id"]
-if context["mode"] != "local-only":
+if ((component == "directory-rust" and context["mode"] not in {"local-only", "public"})
+        or (component != "directory-rust" and context["mode"] != "local-only")):
     raise ValueError("Directory packaged mode is not implemented")
 installed = Path(os.environ["IICP_PRE1_DIRECTORY_INSTALLED"])
 assertion = sys.argv[1]
@@ -1665,6 +1684,9 @@ env.update(APP_ENV="testing", NO_COLOR="1")
 case_home = private_case_home(env)
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
+    rust_mode_postcondition(Path(argv[0]), env, context["mode"], os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+    if context["mode"] == "public":
+        env["IICP_RESTRICTED_DOMAIN_ENABLED"] = "false"
     if scenario == "offline-locked-install":
         offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
@@ -1955,7 +1977,8 @@ def require_directory_database_fixture(component, scenario, workspace):
 
 def directory_package_command(root, context, component_manifest, artifact_root, env, value):
     component, scenario = context["component"], context["scenario_id"]
-    if context["mode"] != "local-only":
+    if ((component == "directory-rust" and context["mode"] not in {"local-only", "public"})
+            or (component != "directory-rust" and context["mode"] != "local-only")):
         raise ValueError("Directory packaged mode remains unimplemented")
     kind = "release-artifact" if component == "directory-rust" else "release-archive"
     rows = [r for r in component_manifest["artifacts"] if r["kind"] == kind and r["target"] in {context["target"], "any"}]

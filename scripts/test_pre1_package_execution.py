@@ -179,7 +179,8 @@ class PackageExecutionTests(unittest.TestCase):
                 "installed": Path("/fixture"), "Path": Path, "env": {},
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
                 "resource": Mock(RLIMIT_FSIZE=1),
-                "rust_http_case": invoke, "assertion": "fixture", "print": Mock()}
+                "rust_http_case": invoke, "rust_mode_postcondition": Mock(),
+                "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
             self.assertEqual(stopped.exception.code, 0)
@@ -486,6 +487,43 @@ class PackageExecutionTests(unittest.TestCase):
             changed = list(rows); changed[index] = replacement
             with self.subTest(index=index, replacement=replacement), self.assertRaises(ValueError):
                 check(Mock(side_effect=changed))
+
+    def test_public_mode_requires_both_fresh_environment_variants(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        runner = Mock()
+        ns["rust_http_case"] = runner
+        original = {"HOME": str(self.home), "IICP_RESTRICTED_DOMAIN_ENABLED": "true"}
+        ns["rust_mode_postcondition"](Path("/binary"), original, "public", "0.1.15")
+        self.assertEqual(runner.call_count, 2)
+        self.assertNotIn("IICP_RESTRICTED_DOMAIN_ENABLED", runner.call_args_list[0].args[1])
+        self.assertEqual(runner.call_args_list[1].args[1]["IICP_RESTRICTED_DOMAIN_ENABLED"], "false")
+        self.assertEqual(original["IICP_RESTRICTED_DOMAIN_ENABLED"], "true")
+        self.assertTrue(all(call.args[2:] == ("environment-public", "0.1.15") for call in runner.call_args_list))
+        runner.reset_mock()
+        ns["rust_mode_postcondition"](Path("/binary"), original, "local-only", "0.1.15")
+        runner.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "restricted mode remains unimplemented"):
+            ns["rust_mode_postcondition"](Path("/binary"), original, "restricted", "0.1.15")
+
+    def test_public_mode_rejects_false_positive_discovery(self):
+        check = self.directory_http_functions()["http_postcondition"]
+        check(lambda path: (200, {"nodes": [], "count": 0}), "environment-public")
+        for status, body in [(401, {}), (200, {}), (200, {"nodes": [], "count": False}),
+                (200, {"nodes": [], "count": 1}), (200, {"nodes": [], "count": 0, "error": {}}),
+                (200, {"nodes": [], "count": 0, "restricted_domain_decision": {}})]:
+            with self.subTest(status=status, body=body), self.assertRaises(ValueError):
+                check(lambda path: (status, body), "environment-public")
+
+    def test_public_mode_does_not_swallow_failed_variant(self):
+        from unittest.mock import Mock
+        for failure in (0, 1):
+            ns = self.directory_http_functions()
+            runner = Mock(side_effect=[ValueError("bad mode"), None] if failure == 0 else [None, ValueError("bad mode")])
+            ns["rust_http_case"] = runner
+            with self.assertRaisesRegex(ValueError, "bad mode"):
+                ns["rust_mode_postcondition"](Path("/binary"), {}, "public", "0.1.15")
+            self.assertEqual(runner.call_count, failure + 1)
 
     def test_directory_http_postconditions_reject_status_only_false_positives(self):
         check = self.directory_http_functions()["http_postcondition"]
@@ -919,9 +957,14 @@ class PackageExecutionTests(unittest.TestCase):
         (artifact_root / "directory-rust").mkdir(parents=True)
         import shutil
         shutil.copyfile(artifact, artifact_root / "directory-rust" / artifact.name)
-        for mutation in [{"mode": "restricted"}, {"mode": "public"}, {"scenario_id": "backup-restore"}]:
+        for mutation in [{"mode": "restricted"}, {"mode": "unknown"}, {"scenario_id": "backup-restore"}]:
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 adapter.directory_package_command(self.root, {**context, **mutation}, manifest, artifact_root, {}, value)
+        public_argv, public_env, public_cwd, _ = adapter.directory_package_command(
+            self.root, {**context, "mode": "public"}, manifest, artifact_root, {}, value)
+        self.assertEqual(json.loads(public_env["IICP_PRE1_EXECUTION_CONTEXT"])["mode"], "public")
+        self.assertEqual(public_cwd, self.workspace)
+        self.assertEqual(Path(public_argv[3]), self.workspace / "directory-probe.py")
         argv, env, cwd, proof = adapter.directory_package_command(self.root, context, manifest, artifact_root, {}, value)
         self.assertEqual(cwd, self.workspace)
         self.assertNotIn("cargo", argv)
