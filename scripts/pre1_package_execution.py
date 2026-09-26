@@ -890,10 +890,10 @@ def validate_management_binding(value, context, artifact, root):
 # Directory adapters deliberately refuse unimplemented cases and modes. A
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
-    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"})
+    "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
-    "package-version-self-report", "config-missing", "config-malformed"})
+    "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -1082,6 +1082,14 @@ def require_loopback_only():
     if active != {"lo"}:
         raise ValueError("Directory HTTP fixture requires loopback-only isolation")
 
+def private_case_home(env):
+    home = Path(env["HOME"])
+    workspace = Path.cwd().resolve()
+    if (not home.is_absolute() or home.is_symlink() or not home.is_dir()
+        or home.stat().st_mode & 0o077 or home == workspace or workspace in home.parents):
+        raise ValueError("Directory state requires a private case HOME outside the prepared workspace")
+    return home
+
 def database_fixture_inputs():
     import re, stat
     workspace = Path.cwd()
@@ -1100,6 +1108,29 @@ def database_fixture_inputs():
         raise ValueError("Directory database fixture configuration differs")
     return config, secret.read_text().strip()
 
+def offline_locked_install_postcondition(installed, version, artifact_sha256):
+    import hashlib, re, stat
+    binary = installed / "iicp-directory-rs"
+    if (installed.is_symlink() or binary.is_symlink() or not binary.is_file()
+            or stat.S_IMODE(binary.stat().st_mode) != 0o700
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_sha256)):
+        raise ValueError("Directory offline installed payload boundary differs")
+    digest = hashlib.sha256()
+    with binary.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if "sha256:" + digest.hexdigest() != artifact_sha256:
+        raise ValueError("Directory offline installed binary differs from frozen artifact")
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run([str(binary), "--version"], cwd=installed, env={
+            key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "TMPDIR"}
+        }, stdout=output, stderr=subprocess.DEVNULL, timeout=30, check=False)
+        output.seek(0)
+        reported = output.read(4097)
+    if (result.returncode != 0 or len(reported) > 4096
+            or reported.decode("utf-8", errors="replace").strip() != "iicp-directory-rs " + version):
+        raise ValueError("Directory offline installed binary did not self-report candidate version")
+
 def database_observation():
     require_loopback_only()
     config, password = database_fixture_inputs()
@@ -1109,7 +1140,7 @@ def database_observation():
         "--port=3306", "--connect-timeout=3", "--user=" + config["username"],
         "--database=" + config["database"], "--execute",
         "SELECT UNIX_TIMESTAMP(liveness_verified_at), liveness_challenge FROM nodes WHERE id = 'fixture-replay'"]
-    with tempfile.TemporaryDirectory(prefix="directory-oracle-home-", dir=Path.cwd()) as private_home, tempfile.TemporaryFile() as output:
+    with tempfile.TemporaryDirectory(prefix="directory-oracle-home-", dir=private_case_home(os.environ)) as private_home, tempfile.TemporaryFile() as output:
         result = subprocess.run(argv, env={"PATH": os.environ.get("PATH", ""), "MYSQL_PWD": password, "HOME": private_home},
             stdout=output, stderr=subprocess.DEVNULL, timeout=10)
         output.seek(0); raw = output.read(4097)
@@ -1298,6 +1329,9 @@ def crash_restart_snapshot_postcondition(process, snapshot, request, restart, ve
     _, verified = snapshot_checkpoint(snapshot, process.pid)
     if snapshot.read_bytes() != verified:
         raise ValueError("Directory crashed snapshot is not stable")
+    return replacement_snapshot_postcondition(process, snapshot, request, restart, version)
+
+def replacement_snapshot_postcondition(process, snapshot, request, restart, version):
     replacement = restart()
     try:
         if replacement.pid == process.pid:
@@ -1326,6 +1360,82 @@ def crash_restart_snapshot_postcondition(process, snapshot, request, restart, ve
             pass
         replacement.wait(timeout=10)
         raise
+
+def wait_stopped_writer(process):
+    deadline = time.monotonic() + 2
+    while True:
+        pid, status = os.waitpid(process.pid, os.WUNTRACED | os.WNOHANG)
+        if pid == process.pid:
+            if not os.WIFSTOPPED(status):
+                raise ValueError("Directory writer exited before interruption boundary")
+            return
+        if time.monotonic() >= deadline:
+            raise ValueError("Directory writer pause timed out")
+        time.sleep(0.01)
+
+def pause_snapshot_writer(process, snapshot):
+    # Pause only this owned child, between writes. Never truncate an active file
+    # or mistake a concurrent committed generation for failed preservation.
+    deadline = time.monotonic() + 12
+    while True:
+        os.kill(process.pid, signal.SIGSTOP)
+        try:
+            wait_stopped_writer(process)
+            sequence, verified = snapshot_checkpoint(snapshot, process.pid)
+            if not snapshot.with_suffix('.tmp-' + str(process.pid)).exists():
+                return verified
+        except BaseException:
+            os.kill(process.pid, signal.SIGCONT)
+            raise
+        os.kill(process.pid, signal.SIGCONT)
+        wait_snapshot_checkpoint(process, snapshot, sequence)
+        if time.monotonic() >= deadline:
+            raise ValueError("Directory writer did not reach an interruption boundary")
+
+def partial_snapshot_reader_postcondition(binary, env, partial):
+    # Invoke the installed reader. A missing loader, unrelated error, accepted
+    # partial JSON, or unbounded output cannot satisfy this negative control.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        result = subprocess.run([str(binary), 'healthcheck', '--json', '--file', str(partial)],
+            cwd=binary.parent, env=env, stdout=stdout, stderr=stderr, timeout=10)
+        stdout.seek(0); out = stdout.read(4097)
+        stderr.seek(0); err = stderr.read(4097)
+    if (result.returncode != 2 or out or len(err) > 4096
+            or not err.startswith(b'INDETERMINATE: invalid snapshot:')):
+        raise ValueError("Directory installed reader did not reject the partial generation")
+
+def interrupted_snapshot_evidence(process, snapshot, verified):
+    import stat
+    if process.wait(timeout=12) != -signal.SIGXFSZ:
+        raise ValueError("Directory writer was not interrupted by the bounded file limit")
+    if snapshot_checkpoint(snapshot, process.pid)[1] != verified:
+        raise ValueError("Directory interrupted write changed the committed generation")
+    partial = snapshot.with_suffix('.tmp-' + str(process.pid))
+    info = partial.lstat()
+    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != os.getuid() or info.st_size != 64):
+        raise ValueError("Directory interrupted writer did not leave a private partial generation")
+    try:
+        json.loads(partial.read_bytes())
+    except (ValueError, UnicodeDecodeError):
+        return partial
+    raise ValueError("Directory interrupted generation was unexpectedly complete")
+
+def interrupted_snapshot_postcondition(process, snapshot, request, restart, version, binary, env):
+    wait_snapshot_checkpoint(process, snapshot)
+    verified = pause_snapshot_writer(process, snapshot)
+    try:
+        # Linux prlimit changes only the owned writer, not this controller or
+        # the replacement. The released serializer writes 64 real bytes before
+        # SIGXFSZ terminates it. Disable core dumps; retain bounded evidence.
+        resource.prlimit(process.pid, resource.RLIMIT_CORE, (0, 0))
+        resource.prlimit(process.pid, resource.RLIMIT_FSIZE, (64, 64))
+    finally:
+        os.kill(process.pid, signal.SIGCONT)
+    partial = interrupted_snapshot_evidence(process, snapshot, verified)
+    partial_snapshot_reader_postcondition(binary, env, partial)
+    partial.unlink()
+    return replacement_snapshot_postcondition(process, snapshot, request, restart, version)
 
 def stale_owner_postcondition(process, snapshot, request, contender, contender_log, restart, version):
     # A competing owner must fail closed without displacing the healthy writer.
@@ -1380,7 +1490,7 @@ def rust_http_case(binary, env, scenario, version, database=False):
             + "@127.0.0.1:3306/" + config["database"])
     else:
         launch_env["IICP_ALLOW_IN_MEMORY"] = "true"
-    with tempfile.TemporaryDirectory(prefix="directory-health-", dir=Path(env.get("TMPDIR", str(Path.cwd())))) as health_dir, tempfile.TemporaryFile(dir=binary.parent if scenario == "disk-full" else None) as log:
+    with tempfile.TemporaryDirectory(prefix="directory-health-", dir=private_case_home(env)) as health_dir, tempfile.TemporaryFile(dir=private_case_home(env)) as log:
         snapshot = Path(health_dir) / "health.json"
         launch_env["IICP_RUNTIME_HEALTH_FILE"] = str(snapshot)
         process = subprocess.Popen([str(binary)], cwd=binary.parent,
@@ -1404,13 +1514,15 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 permission_snapshot_postcondition(process, snapshot, log, request)
             elif scenario == "disk-full":
                 disk_full_snapshot_postcondition(process, snapshot, log, request)
-            elif scenario in {"process-crash-restart", "stale-pid-or-lock"}:
+            elif scenario in {"process-crash-restart", "stale-pid-or-lock", "interrupted-write"}:
                 def restart():
                     return subprocess.Popen([str(binary)], cwd=binary.parent,
                         env=launch_env, stdout=log, stderr=subprocess.STDOUT,
                         start_new_session=True)
-                if scenario == "stale-pid-or-lock":
-                    with tempfile.TemporaryDirectory(prefix="directory-contender-", dir=Path(env.get("TMPDIR", str(Path.cwd())))) as contender_dir, tempfile.TemporaryFile() as contender_log:
+                if scenario == "interrupted-write":
+                    process = interrupted_snapshot_postcondition(process, snapshot, request, restart, version, binary, env)
+                elif scenario == "stale-pid-or-lock":
+                    with tempfile.TemporaryDirectory(prefix="directory-contender-", dir=private_case_home(env)) as contender_dir, tempfile.TemporaryFile() as contender_log:
                         contender_env = {**launch_env, "IICP_RUNTIME_HEALTH_FILE": str(Path(contender_dir) / "health.json")}
                         contender = subprocess.Popen([str(binary)], cwd=binary.parent,
                             env=contender_env, stdout=contender_log, stderr=subprocess.STDOUT,
@@ -1480,7 +1592,7 @@ def php_operator_case(installed, env, scenario, version):
     # Each case gets an empty, disposable schema. Never erase a pre-existing schema.
     if command(installed, [helper, "empty"]).strip() != "true":
         raise ValueError("Directory operator database is not empty")
-    backup = workspace / "directory-backup.json"
+    backup = private_case_home(env) / "directory-backup.json"
     if backup.exists() or backup.is_symlink():
         raise ValueError("Directory operator backup already exists")
     try:
@@ -1516,7 +1628,7 @@ def php_operator_case(installed, env, scenario, version):
         backup.unlink(missing_ok=True)
 
 def interrupt_migration(installed, workspace, php, env, command, helper):
-    checkpoint = workspace / "directory-interruption-ready"
+    checkpoint = private_case_home(env) / "directory-interruption-ready"
     if checkpoint.exists() or checkpoint.is_symlink():
         raise ValueError("Directory interruption checkpoint already exists")
     with tempfile.TemporaryFile() as output:
@@ -1550,10 +1662,16 @@ installed = Path(os.environ["IICP_PRE1_DIRECTORY_INSTALLED"])
 assertion = sys.argv[1]
 env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP") if k in os.environ}
 env.update(APP_ENV="testing", NO_COLOR="1")
+case_home = private_case_home(env)
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
+    if scenario == "offline-locked-install":
+        offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
+            os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
-                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"}:
+                    "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"}:
         resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
         rust_http_case(Path(argv[0]), env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             database=(Path.cwd() / "directory-operator-fixture.json").exists())
@@ -1590,7 +1708,7 @@ else:
     argv = [os.environ["IICP_PRE1_DIRECTORY_PHP"], *case["command"][1:]]
     if case["command"][0] != "@php" or case["assertion"] != assertion:
         raise ValueError("structural Python checks are not packaged Directory operations")
-    report = Path("directory-junit.xml").resolve()
+    report = case_home / "directory-junit.xml"
     if report.exists():
         raise ValueError("Directory case result already exists")
     argv.extend(["--do-not-cache-result", "--bootstrap", str(Path("directory-origin.php").resolve()),
@@ -1599,7 +1717,7 @@ else:
     expected_code, expected = 0, None
 limit = 32 * 1024 * 1024
 resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
-with tempfile.NamedTemporaryFile(prefix="directory-output-", dir=Path.cwd(), delete=False) as log:
+with tempfile.NamedTemporaryFile(prefix="directory-output-", dir=case_home, delete=False) as log:
     output_file = Path(log.name)
     process = subprocess.Popen(argv, cwd=installed, env=env, stdout=log, stderr=subprocess.STDOUT,
                                start_new_session=True)
@@ -1855,7 +1973,8 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
         raise ValueError("Directory structural checks are not packaged operation evidence")
     env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
-           "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"]}
+           "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"],
+           "IICP_PRE1_DIRECTORY_ARTIFACT_SHA256": rows[0]["sha256"]}
     require_directory_database_fixture(component, scenario, workspace)
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())

@@ -19,16 +19,153 @@ import pre1_package_execution as adapter
 class PackageExecutionTests(unittest.TestCase):
     def directory_http_functions(self):
         import ast
+        import resource
         import signal
         import time
         import urllib.request
         import urllib.error
         parsed = ast.parse(adapter.DIRECTORY_PROBE)
         functions = ast.Module(body=[n for n in parsed.body if isinstance(n, ast.FunctionDef)], type_ignores=[])
-        namespace = dict(json=json, os=os, signal=signal,
+        namespace = dict(json=json, os=os, signal=signal, resource=resource,
                          subprocess=subprocess, tempfile=tempfile, time=time, Path=Path, urllib=urllib)
         exec(compile(functions, "directory-probe.py", "exec"), namespace)
         return namespace
+
+    def test_interrupted_writer_requires_real_partial_file_and_preserved_commit(self):
+        import signal
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        snapshot = self.workspace / "interrupt.json"
+        partial = snapshot.with_suffix('.tmp-321')
+        verified = b'{"health_schema_version":1,"pid":321,"sequence":2}'
+        for bad in (None, "exit", "commit", "permission", "size", "complete", "symlink"):
+            snapshot.write_bytes(verified); snapshot.chmod(0o600)
+            partial.write_bytes(b'{}' + b' ' * 62 if bad == "complete" else b'{"partial":"' + b'x' * 52)
+            partial.chmod(0o644 if bad == "permission" else 0o600)
+            if bad == "size": partial.write_bytes(b'{')
+            if bad == "commit": snapshot.write_bytes(verified.replace(b':2', b':3'))
+            if bad == "symlink":
+                partial.unlink(); partial.symlink_to(snapshot)
+            process = Mock(pid=321)
+            process.wait.return_value = 0 if bad == "exit" else -signal.SIGXFSZ
+            with self.subTest(bad=bad):
+                if bad is None:
+                    self.assertEqual(ns["interrupted_snapshot_evidence"](process, snapshot, verified), partial)
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["interrupted_snapshot_evidence"](process, snapshot, verified)
+            partial.unlink()
+        snapshot.unlink()
+
+    def test_partial_reader_requires_installed_cli_parse_refusal_not_any_failure(self):
+        from unittest.mock import Mock
+        check = self.directory_http_functions()["partial_snapshot_reader_postcondition"]
+        binary = self.workspace / "iicp-directory-rs"
+        for code, out, err in [(2, b'', b'INDETERMINATE: invalid snapshot: EOF'),
+                               (0, b'', b'INDETERMINATE: invalid snapshot: EOF'),
+                               (2, b'{}', b'INDETERMINATE: invalid snapshot: EOF'),
+                               (2, b'', b'cannot read file'),
+                               (2, b'', b'INDETERMINATE: invalid snapshot:' + b'x' * 4096)]:
+            def execute(argv, **kwargs):
+                self.assertEqual(argv, [str(binary), 'healthcheck', '--json', '--file', str(self.workspace / 'partial')])
+                self.assertEqual(kwargs['env'], {'PATH': '/fixture'})
+                self.assertEqual(kwargs['timeout'], 10)
+                kwargs['stdout'].write(out); kwargs['stderr'].write(err)
+                return Mock(returncode=code)
+            with self.subTest(code=code, out=out, error_length=len(err)), patch('subprocess.run', side_effect=execute):
+                if code == 2 and not out and err == b'INDETERMINATE: invalid snapshot: EOF':
+                    check(binary, {'PATH': '/fixture'}, self.workspace / 'partial')
+                else:
+                    with self.assertRaises(ValueError): check(binary, {'PATH': '/fixture'}, self.workspace / 'partial')
+
+    def test_interruption_uses_child_only_limits_and_always_resumes_on_setup_failure(self):
+        import resource
+        import signal
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        old, new = Mock(pid=321), Mock(pid=654)
+        partial = self.workspace / 'partial'
+        ns['wait_snapshot_checkpoint'] = Mock()
+        ns['pause_snapshot_writer'] = Mock(return_value=b'verified')
+        ns['interrupted_snapshot_evidence'] = Mock(return_value=partial)
+        ns['partial_snapshot_reader_postcondition'] = Mock()
+        ns['replacement_snapshot_postcondition'] = Mock(return_value=new)
+        for error in (None, PermissionError('prlimit denied')):
+            partial.write_bytes(b'{')
+            with self.subTest(error=error), patch.object(resource, 'prlimit', create=True, side_effect=error) as limit, patch('os.kill') as kill:
+                if error is None:
+                    self.assertIs(ns['interrupted_snapshot_postcondition'](old, self.workspace / 'health.json', Mock(), Mock(), '0.1.15', self.workspace / 'iicp-directory-rs', {}), new)
+                    self.assertEqual(limit.call_args_list[0].args, (321, resource.RLIMIT_CORE, (0, 0)))
+                    self.assertEqual(limit.call_args_list[1].args, (321, resource.RLIMIT_FSIZE, (64, 64)))
+                    self.assertFalse(partial.exists())
+                else:
+                    with self.assertRaises(PermissionError):
+                        ns['interrupted_snapshot_postcondition'](old, self.workspace / 'health.json', Mock(), Mock(), '0.1.15', self.workspace / 'iicp-directory-rs', {})
+                    partial.unlink()
+                kill.assert_called_once_with(321, signal.SIGCONT)
+
+    def test_interruption_capture_failure_cannot_start_replacement(self):
+        import resource
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns['wait_snapshot_checkpoint'] = Mock()
+        ns['pause_snapshot_writer'] = Mock(return_value=b'verified')
+        restart = Mock()
+        ns['interrupted_snapshot_evidence'] = Mock(side_effect=ValueError('no partial generation'))
+        with patch.object(resource, 'prlimit', create=True), patch('os.kill'), self.assertRaises(ValueError):
+            ns['interrupted_snapshot_postcondition'](Mock(pid=321), self.workspace / 'health.json', Mock(), restart, '0.1.15', self.workspace / 'iicp-directory-rs', {})
+        restart.assert_not_called()
+
+    def test_writer_pause_retries_only_concurrent_write_and_resumes_on_error(self):
+        import signal
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns['wait_stopped_writer'] = Mock()
+        ns['snapshot_checkpoint'] = Mock(return_value=(2, b'verified'))
+        ns['wait_snapshot_checkpoint'] = Mock()
+        snapshot = self.workspace / 'pause.json'
+        partial = snapshot.with_suffix('.tmp-321')
+        with patch('os.kill') as kill, patch.object(Path, 'exists', side_effect=[True, False]):
+            self.assertEqual(ns['pause_snapshot_writer'](Mock(pid=321), snapshot), b'verified')
+            self.assertEqual([c.args for c in kill.call_args_list], [(321, signal.SIGSTOP), (321, signal.SIGCONT), (321, signal.SIGSTOP)])
+        ns['snapshot_checkpoint'] = Mock(side_effect=ValueError('partial canonical'))
+        with patch('os.kill') as kill, self.assertRaises(ValueError):
+            ns['pause_snapshot_writer'](Mock(pid=321), snapshot)
+        self.assertEqual(kill.call_args.args, (321, signal.SIGCONT))
+
+    def test_stopped_writer_requires_stop_not_exit_and_bounded_wait(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        for status in [0x137f, 0]:
+            with self.subTest(status=status), patch('os.waitpid', return_value=(321, status)), patch('os.WIFSTOPPED', return_value=status == 0x137f):
+                if status == 0x137f: ns['wait_stopped_writer'](Mock(pid=321))
+                else:
+                    with self.assertRaises(ValueError): ns['wait_stopped_writer'](Mock(pid=321))
+        with patch('os.waitpid', return_value=(0, 0)), patch.object(ns['time'], 'monotonic', side_effect=[0, 3]), self.assertRaisesRegex(ValueError, 'pause timed out'):
+            ns['wait_stopped_writer'](Mock(pid=321))
+
+    def test_offline_locked_install_executes_exact_installed_binary(self):
+        import hashlib
+        check = self.directory_http_functions()["offline_locked_install_postcondition"]
+        installed = self.workspace / "installed"
+        installed.mkdir()
+        binary = installed / "iicp-directory-rs"
+        binary.write_text("#!/bin/sh\nprintf 'iicp-directory-rs 0.1.15\\n'\n")
+        binary.chmod(0o700)
+        expected = "sha256:" + hashlib.sha256(binary.read_bytes()).hexdigest()
+        check(installed, "0.1.15", expected)
+        with self.assertRaisesRegex(ValueError, "self-report"):
+            check(installed, "0.1.16", expected)
+        with self.assertRaisesRegex(ValueError, "frozen artifact"):
+            check(installed, "0.1.15", "sha256:" + "0" * 64)
+        binary.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "payload boundary"):
+            check(installed, "0.1.15", expected)
+        binary.chmod(0o700)
+        binary.unlink()
+        binary.symlink_to(self.workspace / "outside")
+        with self.assertRaisesRegex(ValueError, "payload boundary"):
+            check(installed, "0.1.15", expected)
 
     def test_all_admitted_http_cases_reach_staged_runtime_dispatch(self):
         import ast
@@ -471,7 +608,7 @@ class PackageExecutionTests(unittest.TestCase):
         with self.directory_network({"lo", "eth0"}), \
              patch.object(subprocess, "Popen") as launch:
             with self.assertRaisesRegex(ValueError, "loopback-only"):
-                run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+                run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
             launch.assert_not_called()
 
     def test_directory_http_fixture_wrong_identity_kills_owned_process(self):
@@ -490,7 +627,7 @@ class PackageExecutionTests(unittest.TestCase):
              patch.object(urllib.request, "build_opener") as opener:
             opener.return_value.open.return_value = response
             with self.assertRaisesRegex(ValueError, "identity differs"):
-                run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+                run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
             kill.assert_called_once()
             process.wait.assert_called_once_with(timeout=10)
 
@@ -508,7 +645,7 @@ class PackageExecutionTests(unittest.TestCase):
                  patch.object(os, "killpg", create=True) as kill, \
                  patch.object(time, "monotonic", side_effect=[0, 31]):
                 with self.assertRaisesRegex(ValueError, cause):
-                    run(Path("/fixture/binary"), {}, "credential-missing", "0.1.15")
+                    run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
                 kill.assert_called_once()
                 process.wait.assert_called_once_with(timeout=10)
 
@@ -520,8 +657,9 @@ class PackageExecutionTests(unittest.TestCase):
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
+                                  "offline-locked-install",
                                   "credential-missing", "unsupported-version", "credential-expired", "credential-rotated",
-                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock"]}}
+                                  "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"]}}
         (self.root / "qualification/pre1-cases.json").write_text(json.dumps(mapping))
         if component == "directory-rust":
             artifact = self.home / "iicp-directory-rs-0.1.15-linux-aarch64"
@@ -645,6 +783,94 @@ class PackageExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a directory"):
             adapter.provision_directory_runtime_paths(installed)
 
+    def test_directory_private_case_home_rejects_package_storage_and_unsafe_paths(self):
+        validate = self.directory_http_functions()["private_case_home"]
+        with patch.object(Path, "cwd", return_value=self.workspace):
+            self.assertEqual(validate({"HOME": str(self.home)}), self.home)
+            nested = self.workspace / "case-home"
+            nested.mkdir(mode=0o700)
+            link = self.home / "home-link"
+            link.symlink_to(self.home, target_is_directory=True)
+            public = self.home / "public-home"
+            public.mkdir(mode=0o755)
+            for home in ("relative", str(self.workspace), str(nested), str(link), str(public)):
+                with self.subTest(home=home), self.assertRaisesRegex(ValueError, "private case HOME"):
+                    validate({"HOME": home})
+
+    def test_database_oracle_home_is_private_and_outside_read_only_workspace(self):
+        config = {"schema": "iicp.pre1-directory-operator-fixture.v1",
+                  "database": "iicp_pre1_" + "a" * 16, "username": "iicp_pre1_fixture", "port": 3306}
+        (self.workspace / "directory-operator-fixture.json").write_text(json.dumps(config))
+        secret = self.workspace / "directory-operator-password"
+        secret.write_text("test-only-not-a-credential")
+        secret.chmod(0o600)
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = lambda: None
+        seen = []
+        def observe(argv, **kwargs):
+            home = Path(kwargs["env"]["HOME"])
+            self.assertEqual(home.parent, self.home)
+            self.assertEqual(home.stat().st_mode & 0o077, 0)
+            seen.append(home)
+            kwargs["stdout"].write(b"NULL\tfixture-challenge\n")
+            return subprocess.CompletedProcess(argv, 0)
+        self.workspace.chmod(0o500)
+        try:
+            with patch.object(Path, "cwd", return_value=self.workspace), \
+                    patch.object(subprocess, "run", side_effect=observe):
+                self.assertEqual(ns["database_observation"](),
+                    {"verified_at": None, "challenge": "fixture-challenge"})
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(seen[0].exists())
+        finally:
+            self.workspace.chmod(0o700)
+
+    def test_migration_checkpoint_uses_private_home_and_real_child_is_reaped(self):
+        import sys
+        ns = self.directory_http_functions()
+        runtime = self.home / "fake-migration"
+        runtime.write_text("#!" + sys.executable + "\nimport os,time\nfrom pathlib import Path\n"
+            "checkpoint=Path(os.environ['IICP_PRE1_INTERRUPTION_READY'])\n"
+            "assert checkpoint.parent == Path(os.environ['HOME'])\n"
+            "checkpoint.write_text('transaction-open')\ntime.sleep(30)\n")
+        runtime.chmod(0o700)
+        self.workspace.chmod(0o500)
+        try:
+            with patch.object(Path, "cwd", return_value=self.workspace):
+                ns["interrupt_migration"](self.workspace, self.workspace, str(runtime),
+                    {"HOME": str(self.home), "PATH": os.environ.get("PATH", "")}, None, None)
+            self.assertFalse((self.home / "directory-interruption-ready").exists())
+            self.assertFalse((self.workspace / "directory-interruption-ready").exists())
+        finally:
+            self.workspace.chmod(0o700)
+
+    def test_directory_php_generated_probe_keeps_read_only_workspace_unchanged(self):
+        import sys
+        _artifact, installed, _binding, context = self.directory_inputs("directory-php")
+        context["scenario_id"] = "package-version-self-report"
+        runtime = self.home / "fake-php-readonly"
+        runtime.write_text("#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n"
+            "report=Path(sys.argv[sys.argv.index('--log-junit')+1])\n"
+            "report.write_text('<testsuite><testcase name=\"package-version-self-report\"/></testsuite>')\n")
+        runtime.chmod(0o700)
+        snapshot = lambda: {str(p.relative_to(self.workspace)): p.read_bytes() if p.is_file() else None
+                            for p in self.workspace.rglob("*")}
+        before = snapshot()
+        self.workspace.chmod(0o500)
+        try:
+            result = subprocess.run([sys.executable, "-I", "-S", str(self.workspace / "directory-probe.py"),
+                "package-version-self-report"], cwd=self.workspace,
+                env={**os.environ, "HOME": str(self.home), "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context),
+                     "IICP_PRE1_DIRECTORY_INSTALLED": str(installed), "IICP_PRE1_DIRECTORY_PHP": str(runtime)},
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("IICP_PRE1_DIRECTORY_ASSERTION_PASS", result.stdout)
+            self.assertEqual(snapshot(), before)
+            self.assertFalse((self.home / "directory-junit.xml").exists())
+            self.assertEqual(list(self.home.glob("directory-output-*")), [])
+        finally:
+            self.workspace.chmod(0o700)
+
     def test_directory_php_probe_self_report_and_junit_fail_closed(self):
         import sys
         artifact, installed, value, context = self.directory_inputs("directory-php")
@@ -664,7 +890,7 @@ class PackageExecutionTests(unittest.TestCase):
             ('<testsuite><testcase name="wrong"/></testsuite>', 1),
             ('<testsuite><testcase name="package-version-self-report"/><testcase name="extra"/></testsuite>', 1),
         ]:
-            (self.workspace / "directory-junit.xml").unlink(missing_ok=True)
+            (self.home / "directory-junit.xml").unlink(missing_ok=True)
             # The child environment is intentionally sanitized; vary the fake
             # runtime itself instead of relying on inherited environment values.
             runtime.write_text("#!" + sys.executable + "\nimport sys\nfrom pathlib import Path\n" +
@@ -700,6 +926,11 @@ class PackageExecutionTests(unittest.TestCase):
         self.assertEqual(cwd, self.workspace)
         self.assertNotIn("cargo", argv)
         self.assertNotIn(str(self.root), " ".join(argv))
+        argv, env, cwd, _proof = adapter.directory_package_command(self.root,
+            {**context, "scenario_id": "offline-locked-install"}, manifest, artifact_root, {}, value)
+        self.assertEqual(argv[-1], "offline-locked-install")
+        self.assertEqual(env["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"], adapter.file_digest(artifact))
+        self.assertEqual(cwd, self.workspace)
 
     def test_directory_http_commands_use_bound_installed_binary_not_source_tests(self):
         import shutil
