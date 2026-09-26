@@ -893,7 +893,7 @@ DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-ve
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
-    "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
+    "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install", "minimum-version"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -1933,6 +1933,61 @@ def rust_http_case(binary, env, scenario, version, database=False, postcondition
                 pass
             process.wait(timeout=10)
 
+def retain_runtime_evidence(helper, output, env):
+    import shutil
+    root = helper.packages.safe_path(Path(os.environ["IICP_PRE1_CASE_EVIDENCE_ROOT"]))
+    destination_root = Path(tempfile.mkdtemp(prefix="directory-runtime-", dir=root))
+    (destination_root / "context.json").write_text(json.dumps(context, sort_keys=True) + "\n")
+    (destination_root / "context.json").chmod(0o600)
+    for name, limit in (("result.json", 65536), ("build.log", 8 * 1024 * 1024)):
+        source = output / name
+        if source.exists():
+            helper.packages.safe_path(source)
+            if source.stat().st_size > limit:
+                raise ValueError("runtime evidence exceeds private retention bound")
+            destination = destination_root / name
+            if destination.exists() or destination.is_symlink():
+                raise ValueError("runtime evidence destination already exists")
+            shutil.copyfile(source, destination)
+            destination.chmod(0o600)
+
+def minimum_runtime_postcondition(binary, env, version):
+    import importlib
+    workspace = Path.cwd()
+    tools = workspace / "directory-runtime-tools"
+    # These exact owning sources are staged and hashed by the package binding.
+    sys.path.insert(0, str(tools))
+    previous_bytecode_policy = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        helper = importlib.import_module("prepare_pre1_minimum_runtime")
+        cache = Path(os.environ["IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT"])
+        helper.packages.safe_path(cache)
+        if not cache.is_absolute() or cache.is_relative_to(workspace):
+            raise ValueError("runtime build storage must be separate from prepared inputs")
+        with tempfile.TemporaryDirectory(prefix="directory-runtime-", dir=cache) as temporary:
+            output = Path(temporary) / "build"
+            try:
+                result = helper.verify(workspace / "directory-runtime-fixture",
+                    workspace / "directory-runtime-candidate.json", output,
+                    Path(os.environ["IICP_PRE1_DIRECTORY_CARGO"]),
+                    Path(os.environ["IICP_PRE1_DIRECTORY_RUSTC"]),
+                    context["runtime"], context["target"],
+                    os.environ["IICP_PRE1_DIRECTORY_RUNTIME_FIXTURE_SHA256"], build_timeout=150)
+                if result["status"] != "PASS" or result["qualification_credit"] is not False:
+                    raise ValueError("runtime source diagnosis is not a passing non-authorizing proof")
+            finally:
+                retain_runtime_evidence(helper, output, env)
+    finally:
+        sys.path.pop(0)
+        sys.dont_write_bytecode = previous_bytecode_policy
+    # A source build never substitutes for the immutable installed artifact.
+    reported = subprocess.check_output([str(binary), "--version"], env=env, text=True, timeout=10)
+    if reported.strip() != "iicp-directory-rs " + version:
+        raise ValueError("installed minimum-runtime Directory identity differs")
+    rust_http_case(binary, env, "credential-missing", version,
+                   database=context["mode"] == "restricted")
+
 def rust_mode_postcondition(binary, env, mode, version):
     if mode == "local-only":
         return
@@ -2080,6 +2135,10 @@ if component == "directory-rust":
     rust_mode_postcondition(Path(argv[0]), env, context["mode"], os.environ["IICP_PRE1_DIRECTORY_VERSION"])
     if context["mode"] == "restricted":
         reset_directory_database(env)
+    if scenario == "minimum-version":
+        minimum_runtime_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
     if scenario == "offline-locked-install":
         offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
@@ -2288,6 +2347,18 @@ def directory_fixtures(root, component):
     return result
 
 
+def directory_runtime_dependencies(workspace, bindings):
+    fixture = workspace / "directory-runtime-fixture"
+    candidate = workspace / "directory-runtime-candidate.json"
+    if not any(path.exists() or path.is_symlink() for path in (fixture, candidate)):
+        return {}
+    import prepare_pre1_minimum_runtime as helper
+    value = helper.validate_fixture(fixture, candidate)
+    if json.loads(candidate.read_text()).get("manifest_sha256") != bindings["candidate_manifest_sha256"]:
+        raise ValueError("runtime fixture candidate differs from installed package binding")
+    return {"runtime-fixture": value["fixture_sha256"], "runtime-candidate": file_digest(candidate)}
+
+
 def directory_payload(artifact, installed, component, target):
     files = tree(installed)
     if component == "directory-rust":
@@ -2352,10 +2423,15 @@ def create_directory_binding(root, workspace, installed, artifact, component, ru
     payload, deps = directory_payload(artifact, installed, component, target)
     if component == "directory-rust":
         deps.update(directory_database_dependencies(workspace))
+        deps.update(directory_runtime_dependencies(workspace, bindings))
     fixtures = directory_fixtures(root, component)
+    if "runtime-fixture" in deps:
+        for name in ("prepare_pre1_minimum_runtime.py", "pre1_package_execution.py", "pre1_artifact_common.py"):
+            fixtures["directory-runtime-tools/" + name] = safe_path(root / "scripts" / name).read_bytes()
     for name, data in fixtures.items():
         dest = workspace / name
         if not dest.exists() and stage_fixtures:
+            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             with dest.open("xb") as output:
                 output.write(data)
             dest.chmod(0o600)
@@ -2415,8 +2491,34 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
            "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"],
            "IICP_PRE1_DIRECTORY_ARTIFACT_SHA256": rows[0]["sha256"]}
     require_directory_database_fixture(component, scenario, workspace, context["mode"])
+    if component == "directory-rust" and scenario == "minimum-version":
+        env = directory_minimum_runtime_environment(workspace, context, env)
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
     argv = [sys.executable, "-I", "-S", str(workspace / "directory-probe.py"), case["assertion"]]
     return argv, env, workspace, {"value": value, "artifact": artifact, "vendor_artifact": None}
+
+
+def directory_minimum_runtime_environment(workspace, context, env):
+    deps = directory_runtime_dependencies(workspace, {key: context[key] for key in BINDINGS})
+    if not deps:
+        raise ValueError("Directory minimum runtime requires the pinned frozen-source fixture")
+    runtime_map = json.loads(safe_path(Path(env["IICP_PRE1_RUNTIME_MAP"])).read_text())
+    if (runtime_map.get("target") != context["target"]
+            or runtime_map.get("map_sha256") != context["runtime_map_sha256"]):
+        raise ValueError("Directory runtime map binding differs")
+    row = runtime_map["runtimes"][context["runtime"]]
+    programs = row["programs"]
+    import prepare_pre1_minimum_runtime as helper
+    for name in ("cargo", "rustc"):
+        helper.executable(Path(programs[name]))
+    output = safe_path(Path(env["IICP_PRE1_RUN_ROOT"]))
+    evidence = safe_path(Path(env["IICP_PRE1_CASE_EVIDENCE_ROOT"]))
+    home = safe_path(Path(env["HOME"]))
+    if any(path.is_relative_to(workspace) or path.is_relative_to(home) for path in (output, evidence)):
+        raise ValueError("Directory runtime output cannot mutate prepared inputs")
+    return {**env, "IICP_PRE1_DIRECTORY_CARGO": programs["cargo"],
+            "IICP_PRE1_DIRECTORY_RUSTC": programs["rustc"],
+            "IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT": str(output),
+            "IICP_PRE1_DIRECTORY_RUNTIME_FIXTURE_SHA256": deps["runtime-fixture"]}

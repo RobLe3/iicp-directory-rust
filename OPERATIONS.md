@@ -334,7 +334,13 @@ binary's version and rechecks immutable fixture bytes. Compiler temporary files
 and build outputs stay outside the source fixture. Bounded logs and the result
 are streamed before container exit so tmpfs teardown cannot erase the evidence.
 
-This is source-build diagnosis only. It does not replace the frozen installed
-artifact, execute the installed-package qualification case or grant campaign
-credit. Binding this fixture into the existing qualification adapter and
-completing the remaining runtime/target executions are still required.
+The standalone command remains source-build diagnosis only and grants no
+campaign credit. The installed `minimum-version` adapter additionally consumes
+the source fixture, candidate file and exact owning tools through its package
+binding, verifies the frozen installed binary's version and exercises HTTP
+behavior. Compiler outputs use separate writable storage; bounded diagnostics
+are retained beside shard output before build storage is removed. Its build
+budget is 150 seconds within the existing 210-second packaged-case deadline.
+Missing fixtures, changed inputs, wrong compilers or installed failures cannot
+fall back to a source-unit test. Final qualification still requires clean,
+candidate-bound execution on every declared runtime and native target.

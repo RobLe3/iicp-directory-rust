@@ -18,6 +18,127 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def test_runtime_dependencies_are_optional_but_partial_fixtures_fail(self):
+        self.assertEqual(adapter.directory_runtime_dependencies(self.workspace, self.bindings), {})
+        (self.workspace / "directory-runtime-fixture").mkdir()
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            adapter.directory_runtime_dependencies(self.workspace, self.bindings)
+
+    def test_minimum_runtime_fixture_stages_and_hashes_exact_owning_tools(self):
+        scripts = self.root / "scripts"; scripts.mkdir()
+        names = ("prepare_pre1_minimum_runtime.py", "pre1_package_execution.py", "pre1_artifact_common.py")
+        for name in names:
+            (scripts / name).write_text("# bound owning tool: " + name)
+        with patch.object(adapter, "directory_payload", return_value=({}, {})), \
+                patch.object(adapter, "directory_fixtures", return_value={}), \
+                patch.object(adapter, "directory_database_dependencies", return_value={}), \
+                patch.object(adapter, "directory_runtime_dependencies", return_value={"runtime-fixture": "sha256:" + "b" * 64}):
+            value = adapter.create_directory_binding(self.root, self.workspace, self.installed, self.artifact,
+                "directory-rust", "msrv-1.88", "linux-aarch64", self.bindings)
+            for name in names:
+                self.assertEqual((self.workspace / "directory-runtime-tools" / name).read_bytes(),
+                    (scripts / name).read_bytes())
+            (self.workspace / "directory-runtime-tools" / names[0]).write_text("tampered")
+            with self.assertRaisesRegex(ValueError, "fixtures changed"):
+                adapter.create_directory_binding(self.root, self.workspace, self.installed, self.artifact,
+                    "directory-rust", "msrv-1.88", "linux-aarch64", self.bindings, stage_fixtures=False)
+
+    def test_runtime_dependency_candidate_must_match_installed_binding(self):
+        candidate = self.workspace / "directory-runtime-candidate.json"
+        candidate.write_text(json.dumps({"manifest_sha256": self.bindings["candidate_manifest_sha256"]}))
+        with patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "b" * 64}):
+            deps = adapter.directory_runtime_dependencies(self.workspace, self.bindings)
+            self.assertEqual(deps["runtime-candidate"], adapter.file_digest(candidate))
+            candidate.write_text(json.dumps({"manifest_sha256": "sha256:" + "c" * 64}))
+            with self.assertRaisesRegex(ValueError, "candidate differs"):
+                adapter.directory_runtime_dependencies(self.workspace, self.bindings)
+
+    def test_minimum_runtime_never_falls_back_without_source_fixture(self):
+        with self.assertRaisesRegex(ValueError, "pinned frozen-source fixture"):
+            adapter.directory_minimum_runtime_environment(self.workspace, self.context, {})
+
+    def test_minimum_runtime_requires_bound_map_and_separate_build_storage(self):
+        path = self.home / "runtime-map.json"
+        context = {**self.context, "runtime": "msrv-1.88", "target": "linux-aarch64"}
+        value = {"target": context["target"], "map_sha256": context["runtime_map_sha256"],
+            "runtimes": {context["runtime"]: {"programs": {"cargo": "/tool/cargo", "rustc": "/tool/rustc"}}}}
+        path.write_text(json.dumps(value))
+        case_home = self.home / "case-home"; case_home.mkdir()
+        env = {"IICP_PRE1_RUNTIME_MAP": str(path), "IICP_PRE1_RUN_ROOT": str(self.home),
+               "IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home), "HOME": str(case_home)}
+        with patch.object(adapter, "directory_runtime_dependencies", return_value={"runtime-fixture": "sha256:" + "b" * 64}), \
+                patch.object(minimum_runtime, "executable") as executable:
+            selected = adapter.directory_minimum_runtime_environment(self.workspace, context, env)
+            self.assertEqual(selected["IICP_PRE1_DIRECTORY_CARGO"], "/tool/cargo")
+            self.assertEqual(selected["IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT"], str(self.home))
+            self.assertEqual(executable.call_count, 2)
+            with self.assertRaisesRegex(ValueError, "mutate prepared inputs"):
+                adapter.directory_minimum_runtime_environment(self.workspace, context,
+                    {**env, "IICP_PRE1_RUN_ROOT": str(self.workspace)})
+            for key in ("target", "map_sha256"):
+                path.write_text(json.dumps({**value, key: "wrong"}))
+                with self.assertRaisesRegex(ValueError, "runtime map binding"):
+                    adapter.directory_minimum_runtime_environment(self.workspace, context, env)
+
+    def test_runtime_evidence_is_retained_privately_and_never_overwritten(self):
+        ns = self.directory_http_functions()
+        output = self.workspace / "runtime-output"; output.mkdir()
+        (output / "result.json").write_text('{"status":"FAIL"}')
+        (output / "build.log").write_text("compiler failure")
+        env = {"HOME": str(self.home)}
+        ns["context"] = {"mode": "fixture"}
+        with patch.dict(os.environ, {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home)}):
+            ns["retain_runtime_evidence"](minimum_runtime, output, env)
+        retained = next(self.home.glob("directory-runtime-*"))
+        for name in ("result.json", "build.log"):
+            dest = retained / name
+            self.assertEqual(dest.read_bytes(), (output / name).read_bytes())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o600)
+        with patch.dict(os.environ, {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home)}):
+            ns["retain_runtime_evidence"](minimum_runtime, output, env)
+        self.assertEqual(len(list(self.home.glob("directory-runtime-*"))), 2)
+
+    def test_runtime_build_budget_cannot_escape_reviewed_deadline(self):
+        with self.assertRaisesRegex(ValueError, "execution budgets"):
+            minimum_runtime.verify(self.workspace, self.workspace, self.workspace,
+                Path("/cargo"), Path("/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64,
+                build_timeout=9999)
+
+    def test_minimum_runtime_requires_source_build_and_real_installed_postcondition(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        cache = self.home / "build-cache"; cache.mkdir()
+        ns = self.directory_http_functions()
+        ns.update(sys=sys, context={"runtime": "msrv-1.88", "target": "linux-aarch64", "mode": "local-only"})
+        ns["private_case_home"] = Mock(return_value=self.home)
+        ns["rust_http_case"] = Mock()
+        ns["subprocess"] = Mock(check_output=Mock(return_value="iicp-directory-rs 0.1.15\n"))
+        env = {"HOME": str(self.home)}
+        values = {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home), "IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT": str(cache),
+            "IICP_PRE1_DIRECTORY_CARGO": "/tool/cargo", "IICP_PRE1_DIRECTORY_RUSTC": "/tool/rustc",
+            "IICP_PRE1_DIRECTORY_RUNTIME_FIXTURE_SHA256": "sha256:" + "a" * 64}
+        def verify(*args, **kwargs):
+            self.assertEqual(kwargs["build_timeout"], 150)
+            self.assertFalse(args[2].is_relative_to(args[0]))
+            return {"status": "PASS", "qualification_credit": False}
+        helper = SimpleNamespace(packages=adapter, verify=Mock(side_effect=verify))
+        with patch.dict(os.environ, values), patch("importlib.import_module", return_value=helper):
+            ns["minimum_runtime_postcondition"](Path("/installed/iicp-directory-rs"), env, "0.1.15")
+            ns["rust_http_case"].assert_called_once_with(Path("/installed/iicp-directory-rs"), env,
+                "credential-missing", "0.1.15", database=False)
+            ns["rust_http_case"].reset_mock()
+            helper.verify.side_effect = ValueError("offline compiler failure")
+            with self.assertRaisesRegex(ValueError, "compiler failure"):
+                ns["minimum_runtime_postcondition"](Path("/installed/iicp-directory-rs"), env, "0.1.15")
+            ns["rust_http_case"].assert_not_called()
+            helper.verify.side_effect = verify
+            ns["subprocess"].check_output.return_value = "iicp-directory-rs 9.9.9\n"
+            with self.assertRaisesRegex(ValueError, "installed minimum-runtime"):
+                ns["minimum_runtime_postcondition"](Path("/installed/iicp-directory-rs"), env, "0.1.15")
+            ns["rust_http_case"].assert_not_called()
+        self.assertFalse(list(cache.iterdir()))
+
     def test_runtime_source_rejects_archive_escapes_links_and_missing_lock(self):
         for bad in ("../escape", "symlink", "hardlink", "missing-lock", "duplicate"):
             raw = io.BytesIO()

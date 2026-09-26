@@ -168,7 +168,9 @@ def compiler_identity(rustc, env, runtime, target):
     return observed
 
 
-def verify(fixture, candidate, output, cargo, rustc, runtime, target, expected_fixture_sha256):
+def verify(fixture, candidate, output, cargo, rustc, runtime, target, expected_fixture_sha256, *, build_timeout=1800):
+    if build_timeout not in (150, 1800):
+        raise ValueError("runtime build timeout is outside the reviewed execution budgets")
     value = validate_fixture(fixture, candidate)
     if (not re.fullmatch(r"sha256:[a-f0-9]{64}", expected_fixture_sha256)
             or value["fixture_sha256"] != expected_fixture_sha256):
@@ -185,7 +187,7 @@ def verify(fixture, candidate, output, cargo, rustc, runtime, target, expected_f
     try:
         with (output / "build.log").open("xb") as log:
             result = subprocess.run(argv, cwd=fixture / "source", env=env, stdout=log,
-                                    stderr=subprocess.STDOUT, timeout=1800, check=False)
+                                    stderr=subprocess.STDOUT, timeout=build_timeout, check=False)
         receipt["build_exit_code"] = result.returncode
         if result.returncode:
             raise ValueError("offline locked minimum-runtime build failed; retain build.log")
