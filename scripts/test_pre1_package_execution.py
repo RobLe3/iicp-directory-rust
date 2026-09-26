@@ -14,9 +14,204 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pre1_package_execution as adapter
+import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def test_runtime_source_rejects_archive_escapes_links_and_missing_lock(self):
+        for bad in ("../escape", "symlink", "hardlink", "missing-lock", "duplicate"):
+            raw = io.BytesIO()
+            with tarfile.open(fileobj=raw, mode="w") as archive:
+                for name in ("Cargo.toml", "Cargo.lock", "src/main.rs"):
+                    if bad == "missing-lock" and name == "Cargo.lock":
+                        continue
+                    member = tarfile.TarInfo(name); member.size = 1
+                    archive.addfile(member, io.BytesIO(b"x"))
+                if bad != "missing-lock":
+                    member = tarfile.TarInfo("Cargo.lock" if bad == "duplicate" else bad)
+                    member.size = 1
+                    if bad in {"symlink", "hardlink"}:
+                        member.type = tarfile.SYMTYPE if bad == "symlink" else tarfile.LNKTYPE
+                        member.linkname = "/outside"
+                    archive.addfile(member, io.BytesIO(b"x"))
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                minimum_runtime.extract_source(raw.getvalue(), self.workspace / "source-rejected")
+            self.assertFalse((self.workspace / "source-rejected").exists())
+
+    def test_runtime_fixture_binds_candidate_source_and_all_vendor_bytes(self):
+        fixture = self.workspace / "runtime-fixture"; fixture.mkdir()
+        for name in ("source", "vendor"):
+            (fixture / name).mkdir(); (fixture / name / "fixture").write_text("bound")
+        identity = {"candidate_file_sha256": "sha256:" + "a" * 64,
+                    "source_commit": "b" * 40, "source_version": "0.1.15"}
+        value = {"schema": minimum_runtime.SCHEMA, **identity,
+                 "files": minimum_runtime.fixture_tree(fixture),
+                 "qualification_credit": False, "non_authorizing": True}
+        value["fixture_sha256"] = adapter.digest(value)
+        manifest = fixture / "fixture.json"; manifest.write_text(json.dumps(value))
+        with patch.object(minimum_runtime, "candidate_identity", return_value=identity):
+            self.assertEqual(minimum_runtime.validate_fixture(fixture, self.workspace / "candidate"), value)
+            for name in ("source", "vendor"):
+                (fixture / name / "fixture").write_text("tampered")
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    minimum_runtime.validate_fixture(fixture, self.workspace / "candidate")
+                (fixture / name / "fixture").write_text("bound")
+            altered = {**identity, "source_commit": "c" * 40}
+            with patch.object(minimum_runtime, "candidate_identity", return_value=altered), self.assertRaises(ValueError):
+                minimum_runtime.validate_fixture(fixture, self.workspace / "candidate")
+
+    def test_runtime_probe_rejects_recomputed_fixture_with_wrong_external_pin(self):
+        with patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "b" * 64}), \
+                patch.object(minimum_runtime.subprocess, "run") as build, self.assertRaises(ValueError):
+            minimum_runtime.verify(self.workspace, self.workspace / "candidate", self.workspace / "output",
+                Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+        build.assert_not_called()
+
+    def test_runtime_candidate_requires_frozen_unique_pre1_source_identity(self):
+        candidate = self.workspace / "runtime-candidate.json"
+        baseline = {"status": "FROZEN", "immutable": True, "non_authorizing": True,
+                    "components": [{"id": "directory-rust", "source_commit": "a" * 40,
+                                    "source_version": "0.1.15"}]}
+        candidate.write_text(json.dumps(baseline))
+        self.assertEqual(minimum_runtime.candidate_identity(candidate)["source_commit"], "a" * 40)
+        for bad in ({**baseline, "status": "DRAFT"}, {**baseline, "immutable": False},
+                    {**baseline, "components": baseline["components"] * 2},
+                    {**baseline, "components": [{**baseline["components"][0], "source_version": "1.0.0"}]}):
+            candidate.write_text(json.dumps(bad))
+            with self.subTest(bad=bad), self.assertRaises(ValueError): minimum_runtime.candidate_identity(candidate)
+
+    def test_runtime_probe_uses_offline_locked_build_and_records_failure_without_credit(self):
+        fixture = self.workspace / "runtime-probe"; fixture.mkdir()
+        (fixture / "source").mkdir(); (fixture / "vendor").mkdir()
+        output = self.workspace / "runtime-output"
+        value = {"fixture_sha256": "sha256:" + "a" * 64, "source_commit": "b" * 40,
+                 "source_version": "0.1.15"}
+        compiler = "rustc 1.88.0 (fixture)\nrelease: 1.88.0\nhost: aarch64-unknown-linux-gnu\n"
+        def build(argv, **kwargs):
+            self.assertIn("--offline", argv); self.assertIn("--locked", argv)
+            self.assertEqual(kwargs["env"]["CARGO_NET_OFFLINE"], "true")
+            self.assertEqual(kwargs["env"]["TMPDIR"], str(output / "tmp"))
+            self.assertTrue((output / "tmp").is_dir())
+            self.assertEqual(kwargs["cwd"], fixture / "source")
+            self.assertEqual(kwargs["timeout"], 1800)
+            self.assertNotIn("RUSTC_WRAPPER", kwargs["env"])
+            return subprocess.CompletedProcess(argv, 101)
+        with patch.object(minimum_runtime, "validate_fixture", return_value=value), \
+                patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                patch.object(minimum_runtime, "require_isolated_native"), \
+                patch.object(minimum_runtime.subprocess, "check_output", return_value=compiler), \
+                patch.object(minimum_runtime.subprocess, "run", side_effect=build), self.assertRaises(ValueError):
+            minimum_runtime.verify(fixture, self.workspace / "candidate", output,
+                                   Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+        result = json.loads((output / "result.json").read_text())
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["build_exit_code"], 101)
+        self.assertIs(result["qualification_credit"], False)
+        self.assertEqual(result["evidence_scope"], "source-build-only")
+
+    def test_runtime_probe_rejects_wrong_compiler_native_host_and_emulated_target(self):
+        fixture = self.workspace / "runtime-inputs"
+        for compiler in ("release: 1.98.0\nhost: aarch64-unknown-linux-gnu\n",
+                         "release: 1.88.0\nhost: x86_64-unknown-linux-gnu\n"):
+            with self.subTest(compiler=compiler), \
+                    patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "a" * 64}), \
+                    patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                    patch.object(minimum_runtime, "require_isolated_native"), \
+                    patch.object(minimum_runtime.subprocess, "check_output", return_value=compiler), \
+                    patch.object(minimum_runtime.subprocess, "run") as build, self.assertRaises(ValueError):
+                minimum_runtime.verify(fixture, self.workspace / "candidate", self.workspace / "mismatch",
+                                       Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+            build.assert_not_called()
+            if (self.workspace / "mismatch").exists():
+                (self.workspace / "mismatch/tmp").rmdir()
+                (self.workspace / "mismatch").rmdir()
+        with patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "a" * 64}), \
+                patch.object(minimum_runtime.common, "detected_target", return_value="macos-arm64"), self.assertRaises(ValueError):
+            minimum_runtime.verify(fixture, self.workspace / "candidate", self.workspace / "mismatch",
+                                   Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+
+    def test_runtime_probe_rejects_root_and_external_network_interfaces(self):
+        for uid, names in ((0, ["lo"]), (65534, ["lo", "eth0"]), (65534, ["lo"])):
+            with self.subTest(uid=uid, names=names), patch.object(minimum_runtime.os, "geteuid", return_value=uid), \
+                    patch.object(minimum_runtime, "active_interfaces", return_value=set(names)):
+                if uid == 65534 and names == ["lo"]:
+                    minimum_runtime.require_isolated_native()
+                else:
+                    with self.assertRaises(ValueError): minimum_runtime.require_isolated_native()
+
+    def test_runtime_isolation_ignores_down_tunnels_but_not_up_interfaces(self):
+        import struct
+        for ethernet_up in (False, True):
+            def ioctl(fd, request, name):
+                interface = name.split(b"\0", 1)[0]
+                flags = 1 if interface == b"lo" or (interface == b"eth0" and ethernet_up) else 0
+                return b"\0" * 16 + struct.pack("H", flags) + b"\0" * 14
+            with patch("socket.if_nameindex", return_value=[(1, "lo"), (2, "gre0"), (3, "eth0")]), \
+                    patch("fcntl.ioctl", side_effect=ioctl), self.subTest(ethernet_up=ethernet_up):
+                self.assertEqual(minimum_runtime.active_interfaces(), {"lo", "eth0"} if ethernet_up else {"lo"})
+
+    def test_runtime_success_is_source_only_and_revalidates_immutable_dependencies(self):
+        fixture = self.workspace / "runtime-success-fixture"; fixture.mkdir()
+        (fixture / "source").mkdir(); (fixture / "vendor").mkdir()
+        output = self.workspace / "runtime-success-output"
+        value = {"fixture_sha256": "sha256:" + "a" * 64, "source_commit": "b" * 40,
+                 "source_version": "0.1.15"}
+        def build(argv, **kwargs):
+            self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.98.0")
+            self.assertEqual(kwargs["env"]["CARGO_TARGET_DIR"], str(output / "target"))
+            binary = output / "target/debug/iicp-directory-rs"
+            binary.parent.mkdir(parents=True); binary.write_bytes(b"unit-fixture-only")
+            return subprocess.CompletedProcess(argv, 0)
+        with patch.object(minimum_runtime, "validate_fixture", return_value=value) as binding, \
+                patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                patch.object(minimum_runtime, "require_isolated_native"), \
+                patch.object(minimum_runtime.subprocess, "check_output", side_effect=[
+                    "release: 1.98.0\nhost: aarch64-unknown-linux-gnu\n", "iicp-directory-rs 0.1.15\n"]), \
+                patch.object(minimum_runtime.subprocess, "run", side_effect=build):
+            result = minimum_runtime.verify(fixture, self.workspace / "candidate", output,
+                Path("/tool/cargo"), Path("/tool/rustc"), "rust-1.98.0", "linux-aarch64", "sha256:" + "a" * 64)
+            self.assertEqual(binding.call_count, 2)
+        self.assertEqual(result["status"], "PASS")
+        self.assertIs(result["qualification_credit"], False)
+        self.assertIs(result["non_authorizing"], True)
+        self.assertEqual(result["evidence_scope"], "source-build-only")
+        self.assertEqual(result, json.loads((output / "result.json").read_text()))
+
+    def test_runtime_timeout_persists_failure_receipt(self):
+        fixture = self.workspace / "runtime-timeout-fixture"
+        output = self.workspace / "runtime-timeout-output"
+        value = {"fixture_sha256": "sha256:" + "a" * 64, "source_commit": "b" * 40,
+                 "source_version": "0.1.15"}
+        with patch.object(minimum_runtime, "validate_fixture", return_value=value), \
+                patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                patch.object(minimum_runtime, "require_isolated_native"), \
+                patch.object(minimum_runtime.subprocess, "check_output", return_value=
+                    "release: 1.88.0\nhost: aarch64-unknown-linux-gnu\n"), \
+                patch.object(minimum_runtime.subprocess, "run", side_effect=subprocess.TimeoutExpired("cargo", 1800)), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            minimum_runtime.verify(fixture, self.workspace / "candidate", output,
+                Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+        result = json.loads((output / "result.json").read_text())
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["failure_class"], "TimeoutExpired")
+        self.assertIs(result["qualification_credit"], False)
+
+    def test_runtime_stream_preserves_failure_evidence_before_tmpfs_teardown(self):
+        import base64
+        from contextlib import redirect_stdout
+        output = self.workspace / "runtime-stream"; output.mkdir()
+        expected = {"result.json": b'{"status":"FAIL","qualification_credit":false}',
+                    "build.log": b"exact compiler failure\n"}
+        for name, raw in expected.items(): (output / name).write_bytes(raw)
+        captured = io.StringIO()
+        with redirect_stdout(captured): minimum_runtime.stream_evidence(output)
+        for line in captured.getvalue().splitlines():
+            prefix, encoded = line.split(" ", 1)
+            self.assertEqual(prefix, "IICP_PRE1_RUNTIME_EVIDENCE")
+            value = json.loads(encoded)
+            self.assertEqual(base64.b64decode(value["base64"]), expected[value["name"]])
+            self.assertEqual(value["sha256"], adapter.file_digest(output / value["name"]))
+
     def directory_http_functions(self):
         import ast
         import resource
