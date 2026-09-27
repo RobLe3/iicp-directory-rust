@@ -3,8 +3,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-const CURRENT: &str = include_str!("../compatibility/v0.1.15.json");
-const PREVIOUS: &str = include_str!("../compatibility/v0.1.14.json");
+const CURRENT: &str = include_str!("../compatibility/v0.1.16.json");
+const PREVIOUS: &str = include_str!("../compatibility/v0.1.15.json");
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 const UPDATER: &str = include_str!("../scripts/directory_self_update.sh");
 
@@ -52,8 +52,8 @@ fn minimum_rust_version_is_declared_and_candidate_remains_pre1() {
 fn last_supported_generation_is_pinned_for_bounded_rollback() {
     let current = manifest(CURRENT);
     let previous = manifest(PREVIOUS);
-    assert_eq!(previous["implementation"]["version"], "0.1.14");
-    assert_eq!(current["implementation"]["version"], "0.1.15");
+    assert_eq!(previous["implementation"]["version"], "0.1.15");
+    assert_eq!(current["implementation"]["version"], "0.1.16");
     assert_eq!(previous["contracts"], current["contracts"]);
     assert!(UPDATER.contains("candidate verification failed; rolling back"));
     assert!(UPDATER.contains("ln -sfn \"$previous\" \"$STABLE_BIN\""));
