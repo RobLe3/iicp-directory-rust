@@ -2382,7 +2382,8 @@ if component == "directory-rust":
     if context["mode"] == "restricted":
         reset_directory_database(env)
     if scenario == "cross-flavor-equivalence":
-        registration_scenario_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        observed = registration_scenario_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_REGISTRATION_OBSERVATION " + json.dumps(observed, sort_keys=True))
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     if scenario == "minimum-version":

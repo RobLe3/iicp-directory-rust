@@ -813,8 +813,8 @@ class PackageExecutionTests(unittest.TestCase):
         branch = next(n for n in tree.body if isinstance(n, ast.If)
                       and ast.unparse(n.test) == "component == 'directory-rust'")
         for scenario in adapter.DIRECTORY_RUST_HTTP_SCENARIOS | adapter.DIRECTORY_RUST_DATABASE_SCENARIOS:
-            invoke = Mock()
-            namespace = {"component": "directory-rust", "scenario": scenario,
+            invoke = Mock(return_value={})
+            namespace = {"component": "directory-rust", "scenario": scenario, "json": json,
                 "installed": Path("/fixture"), "Path": Path, "env": {},
                 "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15", "IICP_PRE1_ROLLBACK_PREDECESSOR": "/previous", "IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256": "sha256:fixture"}),
                 "argv": ["/fixture/iicp-directory-rs"], "rollback_postcondition": invoke,
