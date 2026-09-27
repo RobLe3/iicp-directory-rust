@@ -26,10 +26,10 @@ HOSTS = {"linux-aarch64": "aarch64-unknown-linux-gnu", "linux-x86_64": "x86_64-u
 
 # Published predecessor identity is the crate's source commit, not an assumed
 # release-tag commit. This auxiliary input never substitutes a candidate asset.
-PREDECESSOR_VERSION = "0.1.14"
-PREDECESSOR_COMMIT = "5b5ed69b1070f1581f5576187fb13669f807088b"
-PREDECESSOR_CRATE_SHA256 = "caccc1a43f6f961593068016865cddbf3fc7cfbfbd8150c5e885e95c3098649a"
-PREDECESSOR_MANIFEST_SHA256 = "040f6ece1ccf2567ab8959ab4c16c7364cdf18f2a1a0f3b26f3a40d8d65e74d0"
+PREDECESSOR_VERSION = "0.1.15"
+PREDECESSOR_COMMIT = "4e8ef1fa9d03861ee5bd58584ef04a5a0bb3c0c1"
+PREDECESSOR_CRATE_SHA256 = "337edf921e091c8dc6788d25b007895bbc9e89e5421b0e82231862f8d1bf54cf"
+PREDECESSOR_MANIFEST_SHA256 = "f4fbdb75e5284dbfb7a31b9d2f07324caebea664f7c15a9b5051a5d8b953f11f"
 
 
 def predecessor_identity(crate, manifest):

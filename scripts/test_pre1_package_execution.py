@@ -45,9 +45,9 @@ class PackageExecutionTests(unittest.TestCase):
                 ns["rust_http_case"] = http
                 ns["directory_database_state"] = Mock(side_effect=["original", "changed"]
                     if failure == "changed-state" else None, return_value="original")
-                with patch.object(subprocess, "check_output", return_value="iicp-directory-rs 0.1.14\n"), \
+                with patch.object(subprocess, "check_output", return_value="iicp-directory-rs 0.1.15\n"), \
                         patch.object(subprocess, "run", side_effect=failed_upgrade):
-                    args = (self.workspace / "candidate", {"HOME": str(self.home)}, "0.1.15",
+                    args = (self.workspace / "candidate", {"HOME": str(self.home)}, "0.1.16",
                             predecessor, "sha256:" + hashlib.sha256(predecessor.read_bytes()).hexdigest())
                     if failure:
                         with self.assertRaisesRegex(ValueError, "cause differs" if failure == "wrong-cause"
@@ -55,8 +55,8 @@ class PackageExecutionTests(unittest.TestCase):
                             ns["rollback_postcondition"](*args)
                     else:
                         ns["rollback_postcondition"](*args)
-                        self.assertEqual([p[:2] for p in phases], [("rollback-seed", "0.1.14"),
-                            ("rollback-upgrade", "0.1.15"), ("rollback-restart", "0.1.14")])
+                        self.assertEqual([p[:2] for p in phases], [("rollback-seed", "0.1.15"),
+                            ("rollback-upgrade", "0.1.16"), ("rollback-restart", "0.1.15")])
                         self.assertEqual(phases[0][2], predecessor.resolve())
                         self.assertEqual(phases[2][2], predecessor.resolve())
                 self.assertEqual(ns["reset_directory_database"].call_count, 2)
@@ -87,14 +87,14 @@ class PackageExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             crate, manifest = root / "old.crate", root / "release.json"
-            value = {"schema": "iicp.directory-rust-release.v1", "version": "0.1.14",
+            value = {"schema": "iicp.directory-rust-release.v1", "version": "0.1.15",
                      "commit": minimum_runtime.PREDECESSOR_COMMIT,
                      "crate_sha256": minimum_runtime.PREDECESSOR_CRATE_SHA256,
                      "production_authority": False, "genesis_cutover_authorized": False}
             for commit in (minimum_runtime.PREDECESSOR_COMMIT, "0" * 40):
                 raw = json.dumps({"git": {"sha1": commit}, "path_in_vcs": ""}).encode()
                 with tarfile.open(crate, "w:gz") as archive:
-                    member = tarfile.TarInfo("iicp-directory-rs-0.1.14/.cargo_vcs_info.json")
+                    member = tarfile.TarInfo("iicp-directory-rs-0.1.15/.cargo_vcs_info.json")
                     member.size = len(raw)
                     archive.addfile(member, io.BytesIO(raw))
                 manifest.write_text(json.dumps(value))
@@ -110,9 +110,9 @@ class PackageExecutionTests(unittest.TestCase):
                             minimum_runtime.predecessor_identity(crate, manifest)
 
     def test_predecessor_identity_is_not_the_candidate_identity(self):
-        self.assertEqual(minimum_runtime.PREDECESSOR_VERSION, "0.1.14")
+        self.assertEqual(minimum_runtime.PREDECESSOR_VERSION, "0.1.15")
         self.assertEqual(minimum_runtime.PREDECESSOR_COMMIT,
-                         "5b5ed69b1070f1581f5576187fb13669f807088b")
+                         "4e8ef1fa9d03861ee5bd58584ef04a5a0bb3c0c1")
         self.assertNotEqual(minimum_runtime.PREDECESSOR_COMMIT,
                             "ce77bfb7c601cca98b71234cc886c833b33978f2")
 

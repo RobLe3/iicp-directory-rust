@@ -1713,7 +1713,7 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
             or "sha256:" + hashlib.sha256(predecessor.read_bytes()).hexdigest() != predecessor_sha256):
         raise ValueError("Directory rollback predecessor binding differs")
     observed = subprocess.check_output([str(predecessor), "--version"], env=env, text=True, timeout=10)
-    if observed.strip() != "iicp-directory-rs 0.1.14":
+    if observed.strip() != "iicp-directory-rs 0.1.15":
         raise ValueError("Directory rollback predecessor version differs")
     baseline = {}
     def authorization(request):
@@ -1760,7 +1760,7 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
                 pending.symlink_to(executable)
                 os.replace(pending, active)
             select(predecessor)
-            rust_http_case(active, env, "rollback-seed", "0.1.14", database=True, postcondition=seed)
+            rust_http_case(active, env, "rollback-seed", "0.1.15", database=True, postcondition=seed)
             before = directory_database_state(env)
             select(binary)
             rust_http_case(active, env, "rollback-upgrade", version, database=True, postcondition=readback)
@@ -1792,7 +1792,7 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
             select(predecessor)
             if active.resolve() != predecessor.resolve():
                 raise ValueError("Directory predecessor managed path was not restored")
-            rust_http_case(active, env, "rollback-restart", "0.1.14", database=True, postcondition=readback)
+            rust_http_case(active, env, "rollback-restart", "0.1.15", database=True, postcondition=readback)
             if directory_database_state(env) != before:
                 raise ValueError("Directory rollback changed schema or persistent data")
     finally:
