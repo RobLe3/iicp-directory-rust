@@ -1055,6 +1055,82 @@ def duplicate_registration_postcondition(request):
     if after["reputation_score"] != damaged or after.get("endpoint") != body["endpoint"]:
         raise ValueError("duplicate registration reset reputation or changed endpoint")
 
+def registration_fixture_postcondition(request, sql, contract_bytes, delegation):
+    """Observe the two canonical HTTP/state cases, not primitive parity.
+
+    The caller owns an isolated empty database and the installed process.
+    A valid synthetic delegation must first bind an active operator; a generic
+    422, bad signature or partial transaction cannot satisfy revoked rollback.
+    This helper alone neither admits a scenario nor grants qualification.
+    """
+    import hashlib, re
+    if hashlib.sha256(contract_bytes).hexdigest() != "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f":
+        raise ValueError("registration behavior fixture differs")
+    cases = {row["name"]: row["expected"] for row in json.loads(contract_bytes)["registration_cases"]}
+    node_id = "fixture-revoked-registration"
+    if (not isinstance(delegation, dict) or set(delegation) != {"node_id", "operator_pub", "not_after", "sig"}
+            or delegation["node_id"] != node_id
+            or not isinstance(delegation["operator_pub"], str)
+            or not re.fullmatch(r"[A-Za-z0-9+/]{43}=", delegation["operator_pub"])
+            or type(delegation["not_after"]) is not int
+            or delegation["not_after"] <= int(time.time()) + 60
+            or not isinstance(delegation["sig"], str)
+            or not re.fullmatch(r"[A-Za-z0-9+/]{86}==", delegation["sig"])):
+        raise ValueError("registration synthetic delegation differs")
+    def counts():
+        raw = sql("SELECT (SELECT COUNT(*) FROM nodes), (SELECT COUNT(*) FROM capabilities), "
+                  "(SELECT COUNT(*) FROM availability_windows)")
+        if not re.fullmatch(rb"[0-9]+\t[0-9]+\t[0-9]+\n", raw):
+            raise ValueError("registration relation counts differ")
+        return dict(zip(("node_rows", "capability_rows", "availability_rows"), map(int, raw.split())))
+    if any(counts().values()):
+        raise ValueError("registration fixture database is not empty")
+    def body(identifier, model, start):
+        # Explicit direct reachability keeps the isolated registration fixture
+        # from attempting external endpoint probes. This is not reachability proof.
+        return {"node_id": identifier, "endpoint": "https://1.1.1.1", "region": "eu-central",
+            "nat_type": "public", "transport_method": "direct_ipv4",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": [model], "max_tokens": 4096}],
+            "availability": [{"start": start, "end": "17:00", "share": 1.0}],
+            "limits": {"max_concurrent": 4, "tokens_per_min": 10000}}
+    recovery_id = "fixture-recovery-registration"
+    status, first = request("/v1/register", body(recovery_id, "model-a", "08:00"))
+    if status != 201 or first.get("node_id") != recovery_id or not isinstance(first.get("node_token"), str) or not first["node_token"]:
+        raise ValueError("registration recovery seed failed")
+    status, second = request("/v1/register", {**body(recovery_id, "model-b", "09:00"),
+        "current_node_token": first["node_token"]})
+    if status != 201 or second.get("node_id") != recovery_id or second.get("recovered") is not True:
+        raise ValueError("registration recovery result differs")
+    recovery = {**counts(), "recovered": second["recovered"]}
+    models = sql("SELECT CAST(models AS CHAR) FROM capabilities WHERE node_id = 'fixture-recovery-registration'")
+    start = sql("SELECT TIME_FORMAT(start_time, '%H:%i') FROM availability_windows WHERE node_id = 'fixture-recovery-registration'")
+    if json.loads(models) != ["model-b"] or start != b"09:00\n" or recovery != cases["recovery_replaces_relations"]:
+        raise ValueError("registration recovery did not replace relations")
+    def remove_node(identifier):
+        # Identifiers here are fixed fixture constants, never user SQL.
+        sql("DELETE FROM capabilities WHERE node_id = '" + identifier + "'; "
+            "DELETE FROM availability_windows WHERE node_id = '" + identifier + "'; "
+            "DELETE FROM nodes WHERE id = '" + identifier + "'")
+    remove_node(recovery_id)
+    status, positive = request("/v1/register", {**body(node_id, "model-a", "08:00"), "operator_delegation": delegation})
+    pub_hex = delegation["operator_pub"].encode().hex()
+    verified = sql("SELECT operator_verified FROM nodes WHERE id = 'fixture-revoked-registration' "
+        "AND CAST(operator_pubkey AS BINARY) = 0x" + pub_hex)
+    if status != 201 or positive.get("node_id") != node_id or verified != b"1\n":
+        raise ValueError("registration delegation positive control failed")
+    remove_node(node_id)
+    sql("UPDATE operators SET identity_status = 'revoked' WHERE CAST(operator_pubkey AS BINARY) = 0x" + pub_hex)
+    if sql("SELECT identity_status FROM operators WHERE CAST(operator_pubkey AS BINARY) = 0x" + pub_hex) != b"revoked\n":
+        raise ValueError("registration operator revocation fixture failed")
+    status, refused = request("/v1/register", {**body(node_id, "model-a", "08:00"), "operator_delegation": delegation})
+    if (status != 422 or refused.get("error", {}).get("code") != "validation_error"
+            or refused["error"].get("message") != "operator delegation references an inactive identity"):
+        raise ValueError("registration revoked refusal cause differs")
+    rollback = {**counts(), "status": status}
+    if rollback != cases["revoked_operator_rolls_back"]:
+        raise ValueError("registration revoked rollback left partial rows")
+    return {"recovery_replaces_relations": recovery, "revoked_operator_rolls_back": rollback}
+
 def http_postcondition(request, scenario):
     if scenario == "environment-public":
         status, value = request("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")

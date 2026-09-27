@@ -18,6 +18,64 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def registration_fixture_inputs(self):
+        import time
+        contract = (Path(__file__).resolve().parents[1] / "parity/behavior-contract-v1.json").read_bytes()
+        delegation = {"node_id": "fixture-revoked-registration", "operator_pub": "A" * 43 + "=",
+            "not_after": int(time.time()) + 3600, "sig": "A" * 86 + "=="}
+        responses = [(201, {"node_id": "fixture-recovery-registration", "node_token": "synthetic"}),
+            (201, {"node_id": "fixture-recovery-registration", "recovered": True}),
+            (201, {"node_id": "fixture-revoked-registration"}),
+            (422, {"error": {"code": "validation_error", "message": "operator delegation references an inactive identity"}})]
+        sql = [b"0\t0\t0\n", b"1\t1\t1\n", b'["model-b"]\n', b"09:00\n", b"", b"1\n", b"", b"", b"revoked\n", b"0\t0\t0\n"]
+        return contract, delegation, responses, sql
+
+    def test_registration_fixture_observes_http_and_persisted_relations(self):
+        from unittest.mock import Mock
+        contract, delegation, responses, sql = self.registration_fixture_inputs()
+        request, oracle = Mock(side_effect=responses), Mock(side_effect=sql)
+        observed = self.directory_http_functions()["registration_fixture_postcondition"](request, oracle, contract, delegation)
+        self.assertEqual(observed, {row["name"]: row["expected"] for row in json.loads(contract)["registration_cases"]})
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_args_list[1].args[1]["current_node_token"], "synthetic")
+        self.assertIn("operator_verified", oracle.call_args_list[5].args[0])
+        self.assertIn("CAST(operator_pubkey AS BINARY)", oracle.call_args_list[5].args[0])
+        self.assertNotIn("CONVERT", oracle.call_args_list[5].args[0])
+        self.assertEqual(request.call_args_list[2].args[1], request.call_args_list[3].args[1])
+
+    def test_registration_fixture_rejects_wrong_recovery_and_rollback(self):
+        from unittest.mock import Mock
+        for failure in ("rows", "models", "window", "recovered", "identity", "unverified", "revocation", "wrong-refusal", "partial-rollback"):
+            contract, delegation, responses, sql = self.registration_fixture_inputs()
+            if failure == "rows": sql[1] = b"1\t2\t1\n"
+            if failure == "models": sql[2] = b'["model-a"]\n'
+            if failure == "window": sql[3] = b"08:00\n"
+            if failure == "recovered": responses[1][1]["recovered"] = 1
+            if failure == "identity": responses[1][1]["node_id"] = "different"
+            if failure == "unverified": sql[5] = b"0\n"
+            if failure == "revocation": sql[8] = b"active\n"
+            if failure == "wrong-refusal": responses[3][1]["error"]["message"] = "bad signature"
+            if failure == "partial-rollback": sql[9] = b"0\t1\t0\n"
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                self.directory_http_functions()["registration_fixture_postcondition"](Mock(side_effect=responses), Mock(side_effect=sql), contract, delegation)
+
+    def test_registration_fixture_rejects_unbound_inputs_and_nonempty_database(self):
+        from unittest.mock import Mock
+        for failure in ("fixture", "expired", "node-id", "sql-pubkey", "sig", "extra", "nonempty", "malformed-counts"):
+            contract, delegation, responses, sql = self.registration_fixture_inputs()
+            if failure == "fixture": contract += b" "
+            if failure == "expired": delegation["not_after"] = 0
+            if failure == "node-id": delegation["node_id"] = "other"
+            if failure == "sql-pubkey": delegation["operator_pub"] = "'; DROP TABLE nodes; --"
+            if failure == "sig": delegation["sig"] = "bad"
+            if failure == "extra": delegation["extra"] = True
+            if failure == "nonempty": sql[0] = b"1\t0\t0\n"
+            if failure == "malformed-counts": sql[0] = b"0\t0\n"
+            request = Mock(side_effect=responses)
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                self.directory_http_functions()["registration_fixture_postcondition"](request, Mock(side_effect=sql), contract, delegation)
+            request.assert_not_called()
+
     def rollback_fixture(self):
         binary = self.workspace / "predecessor-input"
         binary.write_bytes(b"\x7fELF\x02\x01" + b"\x00" * 12 + (183).to_bytes(2, "little"))
