@@ -344,6 +344,13 @@ def validate_binding_context(value: dict, context: dict) -> None:
     if any(value.get(k) != context[k] for k in ("component", "runtime", "target")) or value.get("bindings") != {k: context[k] for k in BINDINGS}:
         raise ValueError("package execution candidate/environment/runtime binding differs")
 
+def prepared_package_home() -> Path:
+    """Keep the immutable preparation boundary separate from per-case HOME."""
+    return safe_path(
+        Path(os.environ.get("IICP_PRE1_PREPARED_PACKAGE_HOME", os.environ["HOME"]))
+    )
+
+
 def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
                      vendor_artifact: Path | None = None) -> Path:
     if context["component"] in {"directory-php", "directory-rust"}:
@@ -355,7 +362,7 @@ def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
     validate_binding_identity(value)
     validate_binding_context(value, context)
     workspace = safe_path(Path(value["workspace"]))
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     installed = safe_path(Path(value["installed_package"]))
     validate_workspace_boundary(workspace, home, installed, root)
     if value["artifact_sha256"] != file_digest(artifact) or value["installed_payload_sha256"] != digest(installed_payload(artifact, installed, context["component"])):
@@ -512,7 +519,7 @@ def validate_summary_identity(summary: dict) -> None:
 def write_case_proof(value: dict) -> Path:
     """Publish a complete sidecar atomically, without overwriting earlier evidence."""
     path = Path(os.environ["IICP_PRE1_CASE_PROOF_OUTPUT"])
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     parent = safe_path(path.parent)
     if not path.is_absolute() or not parent.is_relative_to(home) or path.exists() or path.is_symlink():
         raise ValueError("case proof output is unsafe or already exists")
@@ -604,7 +611,7 @@ def rust_fixtures(root: Path, installed: Path) -> dict[str, str]:
 
 def create_rust_binding(root, workspace, installed, artifact, runtime, target, bindings, vendor_artifact):
     validate_immutable_bindings(bindings)
-    validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])),
+    validate_workspace_boundary(safe_path(workspace), prepared_package_home(),
                                safe_path(installed), root)
     payload, deps = verify_rust_payload(workspace, installed, artifact, vendor_artifact)
     value = {"schema": SCHEMA, "component": "client-rust", "runtime": runtime,
@@ -625,7 +632,7 @@ def validate_rust_binding(value, context, artifact, root, vendor_artifact):
     validate_binding_context(value, context)
     workspace = safe_path(Path(value["workspace"]))
     installed = safe_path(Path(value["installed_package"]))
-    validate_workspace_boundary(workspace, safe_path(Path(os.environ["HOME"])), installed, root)
+    validate_workspace_boundary(workspace, prepared_package_home(), installed, root)
     payload, deps = verify_rust_payload(workspace, installed, artifact, vendor_artifact)
     expected = {"artifact_sha256": file_digest(artifact),
                 "vendor_artifact_sha256": file_digest(vendor_artifact),
@@ -803,7 +810,7 @@ def management_assertions(name, source):
 def stage_management_consumer(root: Path, artifact: Path, workspace: Path) -> dict:
     """Prepare only; the caller owns dependency acquisition and isolation."""
     root, artifact, workspace = safe_path(root), safe_path(artifact), safe_path(workspace)
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root) or any(workspace.iterdir()):
         raise ValueError("Management consumer workspace is not empty and run-isolated")
     expected = rust_archive_files(artifact, artifact.stem + "/")
@@ -827,7 +834,7 @@ def stage_management_consumer(root: Path, artifact: Path, workspace: Path) -> di
 def validate_management_consumer(root: Path, artifact: Path, workspace: Path, binding: dict) -> Path:
     """Recheck artifact and reviewed assertions, even after a forged rehash."""
     workspace = safe_path(workspace)
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root.resolve()):
         raise ValueError("Management consumer workspace is not run-isolated")
     payload = safe_path(workspace / "payload")
@@ -2428,7 +2435,7 @@ def directory_archive_payload(artifact):
 
 def stage_directory_payload(artifact, workspace, component):
     workspace = safe_path(workspace)
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     if workspace == home or not workspace.is_relative_to(home) or list(workspace.iterdir()):
         raise ValueError("Directory staging requires an empty run workspace")
     safe_path(artifact)
@@ -2591,7 +2598,7 @@ def directory_database_dependencies(workspace):
 
 def create_directory_binding(root, workspace, installed, artifact, component, runtime, target, bindings, *, stage_fixtures=True):
     validate_immutable_bindings(bindings)
-    validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])), safe_path(installed), root)
+    validate_workspace_boundary(safe_path(workspace), prepared_package_home(), safe_path(installed), root)
     payload, deps = directory_payload(artifact, installed, component, target)
     if component == "directory-rust":
         deps.update(directory_database_dependencies(workspace))

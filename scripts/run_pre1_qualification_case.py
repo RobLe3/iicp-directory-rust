@@ -426,7 +426,7 @@ def validate_runtime(runtime: str, runtime_row: dict, manifest: dict) -> None:
 
 
 def command_environment(runtime_row: dict, runtime: str) -> dict[str, str]:
-    allowed = {"PATH", "HOME", "IICP_HOME", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "RUSTUP_HOME", "IICP_PRE1_RUN_ROOT", "IICP_PRE1_CASE_EVIDENCE_ROOT"}
+    allowed = {"PATH", "HOME", "IICP_HOME", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "RUSTUP_HOME", "IICP_PRE1_PREPARED_PACKAGE_HOME", "IICP_PRE1_RUN_ROOT", "IICP_PRE1_CASE_EVIDENCE_ROOT"}
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
     for name in (
         "IICP_PRE1_CELL_ID",
