@@ -18,6 +18,81 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def rollback_fixture(self):
+        binary = self.workspace / "predecessor-input"
+        binary.write_bytes(b"\x7fELF\x02\x01" + b"\x00" * 12 + (183).to_bytes(2, "little"))
+        crate = self.workspace / "crate-input"
+        crate.write_bytes(b"pinned test crate")
+        manifest = self.workspace / "release-input"
+        manifest.write_text("{}")
+        receipt = self.workspace / "build-input"
+        receipt.write_text(json.dumps({"schema": "iicp.pre1-directory-predecessor-build.v1",
+            "status": "PASS", "source_commit": minimum_runtime.PREDECESSOR_COMMIT,
+            "version": "0.1.15", "target": "linux-aarch64",
+            "binary_sha256": adapter.file_digest(binary), "execution_kind": "container_native",
+            "network": "none", "qualification_credit": False, "non_authorizing": True,
+            "uid": 501, "rust_version": "1.88.0"}))
+        identity = {"source_version": "0.1.15", "source_commit": minimum_runtime.PREDECESSOR_COMMIT,
+            "crate_sha256": adapter.file_digest(crate), "release_manifest_sha256": adapter.file_digest(manifest),
+            "qualification_credit": False, "non_authorizing": True}
+        fixture = self.workspace / "directory-rollback-fixture"
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            minimum_runtime.prepare_rollback_fixture(crate, manifest, binary, receipt, fixture, "linux-aarch64")
+        return fixture, identity
+
+    def test_rollback_fixture_binding_and_successor_scope(self):
+        fixture, identity = self.rollback_fixture()
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            deps = adapter.directory_rollback_dependencies(self.workspace, "linux-aarch64")
+            self.assertIn("rollback-fixture", deps)
+            env = adapter.directory_rollback_environment(self.workspace, {"target": "linux-aarch64"}, "0.1.16", {})
+            self.assertEqual(env["IICP_PRE1_ROLLBACK_PREDECESSOR"], str(fixture / "predecessor"))
+            with self.assertRaises(ValueError):
+                adapter.directory_rollback_environment(self.workspace, {"target": "linux-aarch64"}, "0.1.15", {})
+            with self.assertRaises(ValueError):
+                minimum_runtime.validate_rollback_fixture(fixture, "linux-x86_64")
+
+    def test_rollback_missing_fixture_fails_before_execution(self):
+        self.assertEqual(adapter.directory_rollback_dependencies(self.workspace, "linux-aarch64"), {})
+        with self.assertRaises(ValueError):
+            adapter.directory_rollback_environment(self.workspace, {"target": "linux-aarch64"}, "0.1.16", {})
+
+    def test_rollback_fixture_rejects_modified_inputs(self):
+        fixture, identity = self.rollback_fixture()
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            for name in minimum_runtime.ROLLBACK_FILES:
+                path = fixture / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"corruption")
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+                path.write_bytes(original)
+            (fixture / "extra").write_text("unexpected")
+            with self.assertRaises(ValueError):
+                minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+
+    def test_rollback_rehashed_fixture_cannot_relabel_build(self):
+        fixture, identity = self.rollback_fixture()
+        receipt = fixture / "build-receipt.json"
+        value = json.loads(receipt.read_text())
+        value["source_commit"] = "0" * 40
+        receipt.write_text(json.dumps(value))
+        manifest = fixture / "fixture.json"
+        value = json.loads(manifest.read_text())
+        value["files"]["build-receipt.json"] = adapter.file_digest(receipt)
+        value.pop("fixture_sha256")
+        value["fixture_sha256"] = adapter.digest(value)
+        manifest.write_text(json.dumps(value))
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            with self.assertRaisesRegex(ValueError, "build binding"):
+                minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+
+    def test_rollback_malformed_manifest_fails_cleanly(self):
+        fixture, identity = self.rollback_fixture()
+        (fixture / "fixture.json").write_text("[]")
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+
     def exercise_rollback(self, failure):
         import hashlib
         from types import SimpleNamespace
@@ -640,7 +715,8 @@ class PackageExecutionTests(unittest.TestCase):
             invoke = Mock()
             namespace = {"component": "directory-rust", "scenario": scenario,
                 "installed": Path("/fixture"), "Path": Path, "env": {},
-                "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
+                "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15", "IICP_PRE1_ROLLBACK_PREDECESSOR": "/previous", "IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256": "sha256:fixture"}),
+                "argv": ["/fixture/iicp-directory-rs"], "rollback_postcondition": invoke,
                 "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
                 "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke, "reset_directory_database": Mock(),
@@ -648,12 +724,18 @@ class PackageExecutionTests(unittest.TestCase):
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
             self.assertEqual(stopped.exception.code, 0)
-            if scenario in {"migration-interrupted", "backup-restore"}:
-                invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
-                continue
-            self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
-            self.assertEqual(invoke.call_args.args[2], scenario)
-            self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
+            self.assert_directory_dispatch(scenario, invoke, namespace)
+
+    def assert_directory_dispatch(self, scenario, invoke, namespace):
+        if scenario == "rollback-last-supported":
+            invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15", Path("/previous"), "sha256:fixture")
+            return
+        if scenario in {"migration-interrupted", "backup-restore"}:
+            invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
+            return
+        self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
+        self.assertEqual(invoke.call_args.args[2], scenario)
+        self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
 
     def test_backup_restore_requires_identical_dump_and_real_http_readback(self):
         from unittest.mock import Mock
@@ -746,7 +828,7 @@ class PackageExecutionTests(unittest.TestCase):
         reset = Mock()
         namespace = {"component": "directory-rust", "scenario": "signature-mismatch",
             "installed": Path("/fixture"), "Path": Path, "env": {},
-            "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
+            "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15", "IICP_PRE1_ROLLBACK_PREDECESSOR": "/previous", "IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256": "sha256:fixture"}),
             "rust_http_case": Mock(side_effect=ValueError("injected scenario failure")),
             "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
             "reset_directory_database": reset, "context": {"mode": "local-only"}}

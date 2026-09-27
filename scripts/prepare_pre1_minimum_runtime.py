@@ -60,6 +60,108 @@ def predecessor_identity(crate, manifest):
             "qualification_credit": False, "non_authorizing": True}
 
 
+ROLLBACK_SCHEMA = "iicp.pre1-directory-rollback-fixture.v1"
+ROLLBACK_FILES = {"predecessor", "predecessor.crate", "release-manifest.json", "build-receipt.json"}
+
+
+def validate_rollback_binary(binary, target):
+    packages.safe_path(binary)
+    if not binary.is_file() or binary.stat().st_size > 256 * 1024 * 1024:
+        raise ValueError("rollback predecessor binary exceeds bound")
+    with binary.open("rb") as stream:
+        header = stream.read(20)
+    machine = {"linux-aarch64": 183, "linux-x86_64": 62}.get(target)
+    if (len(header) != 20 or header[:6] != b"\x7fELF\x02\x01" or machine is None
+            or int.from_bytes(header[18:20], "little") != machine):
+        raise ValueError("rollback predecessor native architecture differs")
+
+
+def rollback_build_identity(receipt, binary, target):
+    packages.safe_path(receipt)
+    if receipt.stat().st_size > 65536:
+        raise ValueError("rollback build receipt exceeds bound")
+    value = json.loads(receipt.read_text())
+    if not isinstance(value, dict):
+        raise ValueError("rollback build receipt must be an object")
+    expected = {"schema": "iicp.pre1-directory-predecessor-build.v1", "status": "PASS",
+                "source_commit": PREDECESSOR_COMMIT, "version": PREDECESSOR_VERSION,
+                "target": target, "binary_sha256": common.file_sha256(binary),
+                "execution_kind": "container_native", "network": "none",
+                "qualification_credit": False, "non_authorizing": True}
+    if {key: value.get(key) for key in expected} != expected:
+        raise ValueError("rollback predecessor build binding differs")
+    validate_rollback_build_context(value)
+    return value
+
+
+def validate_rollback_build_context(value):
+    if (value.get("qualification_credit") is not False or value.get("non_authorizing") is not True
+            or type(value.get("uid")) is not int or value["uid"] <= 0
+            or value.get("rust_version") not in RUNTIMES.values()):
+        raise ValueError("rollback predecessor build context differs")
+
+
+def rollback_fixture_files(fixture):
+    observed = packages.tree(fixture)
+    if set(observed) != ROLLBACK_FILES | {"fixture.json"}:
+        raise ValueError("rollback fixture file inventory differs")
+    return {name: observed[name] for name in sorted(ROLLBACK_FILES)}
+
+
+def validate_rollback_manifest_identity(value, expected):
+    if (set(value) != set(expected) | {"files", "fixture_sha256"}
+            or any(value.get(key) != item for key, item in expected.items())
+            or value.get("qualification_credit") is not False or value.get("non_authorizing") is not True):
+        raise ValueError("rollback fixture identity differs")
+
+
+def validate_rollback_fixture(fixture, target):
+    fixture = packages.safe_path(fixture)
+    manifest = packages.safe_path(fixture / "fixture.json")
+    if manifest.stat().st_size > 65536:
+        raise ValueError("rollback fixture manifest exceeds bound")
+    value = json.loads(manifest.read_text())
+    if not isinstance(value, dict):
+        raise ValueError("rollback fixture manifest must be an object")
+    unsigned = {key: item for key, item in value.items() if key != "fixture_sha256"}
+    identity = predecessor_identity(fixture / "predecessor.crate", fixture / "release-manifest.json")
+    expected = {"schema": ROLLBACK_SCHEMA, "target": target, "successor_version": "0.1.16", **identity}
+    validate_rollback_manifest_identity(value, expected)
+    if value.get("fixture_sha256") != packages.digest(unsigned):
+        raise ValueError("rollback fixture dependency binding differs")
+    if value.get("files") != rollback_fixture_files(fixture):
+        raise ValueError("rollback fixture dependency binding differs")
+    validate_rollback_binary(fixture / "predecessor", target)
+    rollback_build_identity(fixture / "build-receipt.json", fixture / "predecessor", target)
+    return value
+
+
+def copy_rollback_inputs(crate, manifest, binary, receipt, destination):
+    import shutil
+    for name, source in {"predecessor": binary, "predecessor.crate": crate,
+                         "release-manifest.json": manifest, "build-receipt.json": receipt}.items():
+        shutil.copyfile(source, destination / name)
+        (destination / name).chmod(0o700 if name == "predecessor" else 0o600)
+
+
+def prepare_rollback_fixture(crate, manifest, binary, receipt, destination, target):
+    """Stage verified auxiliary inputs; never promote a candidate or result."""
+    identity = predecessor_identity(crate, manifest)
+    validate_rollback_binary(binary, target)
+    rollback_build_identity(receipt, binary, target)
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("rollback fixture needs a fresh destination")
+    packages.safe_path(destination.parent)
+    destination.mkdir(mode=0o700)
+    copy_rollback_inputs(crate, manifest, binary, receipt, destination)
+    value = {"schema": ROLLBACK_SCHEMA, "target": target, "successor_version": "0.1.16", **identity,
+             "files": {name: common.file_sha256(destination / name) for name in sorted(ROLLBACK_FILES)}}
+    value["fixture_sha256"] = packages.digest(value)
+    (destination / "fixture.json").write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    (destination / "fixture.json").chmod(0o600)
+    return validate_rollback_fixture(destination, target)
+
+
 def candidate_identity(path):
     path = packages.safe_path(path)
     candidate = json.loads(path.read_text())
@@ -150,6 +252,8 @@ def validate_fixture(fixture, candidate):
     if manifest.stat().st_size > 16 * 1024 * 1024:
         raise ValueError("runtime fixture manifest exceeds bound")
     value = json.loads(manifest.read_text())
+    if not isinstance(value, dict):
+        raise ValueError("rollback fixture manifest must be an object")
     unsigned = {k: v for k, v in value.items() if k != "fixture_sha256"}
     identity = candidate_identity(candidate)
     if (value.get("schema") != SCHEMA or value.get("qualification_credit") is not False

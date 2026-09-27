@@ -891,7 +891,7 @@ def validate_management_binding(value, context, artifact, root):
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
-DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore"})
+DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore", "rollback-last-supported"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install", "minimum-version"})
 
@@ -2283,6 +2283,11 @@ if component == "directory-rust":
             os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
+    if scenario == "rollback-last-supported":
+        rollback_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
+            Path(os.environ["IICP_PRE1_ROLLBACK_PREDECESSOR"]), os.environ["IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
     if scenario == "backup-restore":
         backup_restore_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
@@ -2498,6 +2503,34 @@ def directory_runtime_dependencies(workspace, bindings):
     return {"runtime-fixture": value["fixture_sha256"], "runtime-candidate": file_digest(candidate)}
 
 
+def directory_rollback_dependencies(workspace, target):
+    fixture = workspace / "directory-rollback-fixture"
+    if not fixture.exists() and not fixture.is_symlink():
+        return {}
+    import prepare_pre1_minimum_runtime as helper
+    value = helper.validate_rollback_fixture(fixture, target)
+    return {"rollback-fixture": value["fixture_sha256"]}
+
+
+def directory_rollback_environment(workspace, context, version, env):
+    dependencies = directory_rollback_dependencies(workspace, context["target"])
+    if not dependencies or version != "0.1.16":
+        raise ValueError("Directory rollback requires the pinned profile-compatible successor fixture")
+    fixture = workspace / "directory-rollback-fixture"
+    return {**env, "IICP_PRE1_ROLLBACK_PREDECESSOR": str(fixture / "predecessor"),
+            "IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256": file_digest(fixture / "predecessor")}
+
+
+def directory_auxiliary_environment(workspace, context, component_manifest, env):
+    if context["component"] != "directory-rust":
+        return env
+    if context["scenario_id"] == "minimum-version":
+        return directory_minimum_runtime_environment(workspace, context, env)
+    if context["scenario_id"] == "rollback-last-supported":
+        return directory_rollback_environment(workspace, context, component_manifest["source_version"], env)
+    return env
+
+
 def directory_payload(artifact, installed, component, target):
     files = tree(installed)
     if component == "directory-rust":
@@ -2563,6 +2596,7 @@ def create_directory_binding(root, workspace, installed, artifact, component, ru
     if component == "directory-rust":
         deps.update(directory_database_dependencies(workspace))
         deps.update(directory_runtime_dependencies(workspace, bindings))
+        deps.update(directory_rollback_dependencies(workspace, target))
     fixtures = directory_fixtures(root, component)
     if "runtime-fixture" in deps:
         for name in ("prepare_pre1_minimum_runtime.py", "pre1_package_execution.py", "pre1_artifact_common.py"):
@@ -2630,8 +2664,7 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
            "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"],
            "IICP_PRE1_DIRECTORY_ARTIFACT_SHA256": rows[0]["sha256"]}
     require_directory_database_fixture(component, scenario, workspace, context["mode"])
-    if component == "directory-rust" and scenario == "minimum-version":
-        env = directory_minimum_runtime_environment(workspace, context, env)
+    env = directory_auxiliary_environment(workspace, context, component_manifest, env)
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
