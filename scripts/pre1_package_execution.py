@@ -898,7 +898,7 @@ def validate_management_binding(value, context, artifact, root):
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
-DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore", "rollback-last-supported"})
+DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore", "rollback-last-supported", "cross-flavor-equivalence"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
     "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install", "minimum-version"})
 
@@ -906,6 +906,26 @@ DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfi
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import urllib.request, urllib.error
+
+
+def registration_scenario_postcondition(binary, env, version):
+    # Public synthetic delegation signed by the registration test seed;
+    # not an operator credential. Its fixed expiry must fail closed.
+    contract = Path("directory-support-behavior.json").read_bytes()
+    delegation = json.loads(Path("directory-registration-delegation.json").read_bytes())
+    observed = []
+    def observe(raw_request, request, active_binary, launch_env):
+        observed.append(registration_fixture_postcondition(
+            request, lambda query: directory_fixture_sql(env, query), contract, delegation))
+    reset_directory_database(env)
+    try:
+        rust_http_case(binary, env, "cross-flavor-equivalence", version,
+            database=True, postcondition=observe, request_timeout=10)
+        if len(observed) != 1:
+            raise ValueError("Directory registration execution was not observed")
+        return observed[0]
+    finally:
+        reset_directory_database(env)
 
 
 def replica_snapshot_postcondition(request, scenario):
@@ -2058,7 +2078,11 @@ def restricted_request_adapter(request, binary, env):
         return status, value
     return execute
 
-def rust_http_case(binary, env, scenario, version, database=False, postcondition=None):
+def rust_http_case(binary, env, scenario, version, database=False, postcondition=None, request_timeout=2):
+    # Transactional registration includes password hashing on bounded CI CPUs;
+    # this functional budget is not a latency qualification threshold.
+    if type(request_timeout) not in {int, float} or not 0 < request_timeout <= 10:
+        raise ValueError("Directory HTTP request budget differs")
     require_loopback_only()
     if scenario == "environment-restricted" and (not database
             or env.get("IICP_RESTRICTED_DOMAIN_ENABLED") != "true"
@@ -2075,7 +2099,7 @@ def rust_http_case(binary, env, scenario, version, database=False, postcondition
             data=None if body is None else json.dumps(body).encode(),
             headers={"Content-Type": "application/json", **(headers or {})})
         try:
-            response = opener.open(req, timeout=2)
+            response = opener.open(req, timeout=request_timeout)
         except urllib.error.HTTPError as error:
             response = error
         with response:
@@ -2357,6 +2381,10 @@ if component == "directory-rust":
     rust_mode_postcondition(Path(argv[0]), env, context["mode"], os.environ["IICP_PRE1_DIRECTORY_VERSION"])
     if context["mode"] == "restricted":
         reset_directory_database(env)
+    if scenario == "cross-flavor-equivalence":
+        registration_scenario_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
     if scenario == "minimum-version":
         minimum_runtime_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
@@ -2569,6 +2597,8 @@ def directory_fixtures(root, component):
     if component == "directory-php":
         result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
     elif component == "directory-rust":
+        result["directory-registration-delegation.json"] = safe_path(
+            root / "qualification/registration-delegation-v1.json").read_bytes()
         for name, source in {"contract": "contract-v1.10.80.json", "behavior": "behavior-contract-v1.json", "http": "http-contract-v1.json"}.items():
             result["directory-support-" + name + ".json"] = safe_path(root / "parity" / source).read_bytes()
     return result

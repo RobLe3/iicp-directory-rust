@@ -18,6 +18,49 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def test_registration_scenario_uses_authenticated_request_and_always_resets_database(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        contract, delegation, _, _ = self.registration_fixture_inputs()
+        (self.workspace / "directory-support-behavior.json").write_bytes(contract)
+        (self.workspace / "directory-registration-delegation.json").write_text(json.dumps(delegation))
+        expected = {row["name"]: row["expected"] for row in json.loads(contract)["registration_cases"]}
+        raw, scoped = Mock(), Mock()
+        for failure in (False, True):
+            ns["reset_directory_database"] = reset = Mock()
+            ns["directory_fixture_sql"] = sql = Mock()
+            ns["registration_fixture_postcondition"] = observe = Mock(
+                side_effect=ValueError("registration failure") if failure else None,
+                return_value=expected)
+            def execute(binary, env, scenario, version, **kwargs):
+                self.assertIs(kwargs["database"], True)
+                self.assertEqual(kwargs["request_timeout"], 10)
+                kwargs["postcondition"](raw, scoped, binary, env)
+            ns["rust_http_case"] = Mock(side_effect=execute)
+            previous = Path.cwd()
+            try:
+                os.chdir(self.workspace)
+                if failure:
+                    with self.assertRaisesRegex(ValueError, "registration failure"):
+                        ns["registration_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16")
+                else:
+                    self.assertEqual(ns["registration_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16"), expected)
+            finally:
+                os.chdir(previous)
+            self.assertEqual(reset.call_count, 2)
+            self.assertIs(observe.call_args.args[0], scoped)
+            self.assertIsNot(observe.call_args.args[0], raw)
+            observe.call_args.args[1]("SELECT fixture")
+            sql.assert_called_once_with({}, "SELECT fixture")
+
+    def test_http_request_budget_is_bounded_before_launch(self):
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = check = __import__("unittest.mock", fromlist=["Mock"]).Mock()
+        for value in (True, False, 0, -1, 11, float("nan"), float("inf"), "10"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "request budget"):
+                ns["rust_http_case"](Path("/binary"), {}, "credential-missing", "0.1.16", request_timeout=value)
+        check.assert_not_called()
+
     def registration_fixture_inputs(self):
         import time
         contract = (Path(__file__).resolve().parents[1] / "parity/behavior-contract-v1.json").read_bytes()
@@ -777,7 +820,8 @@ class PackageExecutionTests(unittest.TestCase):
                 "argv": ["/fixture/iicp-directory-rs"], "rollback_postcondition": invoke,
                 "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
-                "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke, "reset_directory_database": Mock(),
+                "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke,
+                "registration_scenario_postcondition": invoke, "reset_directory_database": Mock(),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
@@ -788,7 +832,7 @@ class PackageExecutionTests(unittest.TestCase):
         if scenario == "rollback-last-supported":
             invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15", Path("/previous"), "sha256:fixture")
             return
-        if scenario in {"migration-interrupted", "backup-restore"}:
+        if scenario in {"migration-interrupted", "backup-restore", "cross-flavor-equivalence"}:
             invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
             return
         self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
@@ -1707,6 +1751,8 @@ class PackageExecutionTests(unittest.TestCase):
         self.workspace.mkdir()
         (self.root / "qualification").mkdir(exist_ok=True)
         (self.root / "parity").mkdir(exist_ok=True)
+        shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "qualification/registration-delegation-v1.json",
+                        self.root / "qualification/registration-delegation-v1.json")
         for name in ("contract-v1.10.80.json", "behavior-contract-v1.json", "http-contract-v1.json"):
             shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "parity" / name, self.root / "parity" / name)
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
@@ -1739,6 +1785,15 @@ class PackageExecutionTests(unittest.TestCase):
         context = {**self.context, "component": component, "runtime": value["runtime"],
                    "target": "linux-aarch64", "mode": "local-only", "scenario_id": "config-missing"}
         return artifact, installed, value, context
+
+    def test_registration_delegation_is_immutable_preparation_input(self):
+        artifact, installed, value, context = self.directory_inputs()
+        fixture = self.workspace / "directory-registration-delegation.json"
+        self.assertEqual(fixture.read_bytes(),
+                         (self.root / "qualification/registration-delegation-v1.json").read_bytes())
+        fixture.write_bytes(fixture.read_bytes() + b" ")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
 
     def test_directory_binary_binding_and_proof_are_candidate_bound(self):
         artifact, installed, value, context = self.directory_inputs()
