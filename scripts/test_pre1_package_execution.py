@@ -18,48 +18,74 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
-    def test_rollback_requires_real_lifecycle_and_exact_failure_cause(self):
+    def exercise_rollback(self, failure):
         import hashlib
         from types import SimpleNamespace
         from unittest.mock import Mock
-        for failure in (None, "wrong-cause", "changed-state"):
-            with self.subTest(failure=failure):
-                ns = self.directory_http_functions()
-                predecessor = self.workspace / "previous"
-                predecessor.write_bytes(b"native predecessor fixture")
-                phases = []
-                def http(executable, env, scenario, version, **kwargs):
-                    phases.append((scenario, version, executable.resolve()))
-                    def request(path, body=None, headers=None):
-                        if body is not None:
-                            return 201, {"node_id": "fixture-rollback", "node_token": "synthetic"}
-                        return 200, {"node_id": "fixture-rollback"}
-                    kwargs["postcondition"](request, request, executable, env)
-                def failed_upgrade(argv, **kwargs):
-                    kwargs["stdout"].write(b"arbitrary crash" if failure == "wrong-cause"
-                        else b"FATAL: DATABASE_URL is required")
-                    kwargs["stdout"].flush()
-                    return SimpleNamespace(returncode=1)
-                ns["private_case_home"] = Mock(return_value=self.home)
-                ns["reset_directory_database"] = Mock()
-                ns["rust_http_case"] = http
-                ns["directory_database_state"] = Mock(side_effect=["original", "changed"]
-                    if failure == "changed-state" else None, return_value="original")
-                with patch.object(subprocess, "check_output", return_value="iicp-directory-rs 0.1.15\n"), \
-                        patch.object(subprocess, "run", side_effect=failed_upgrade):
-                    args = (self.workspace / "candidate", {"HOME": str(self.home)}, "0.1.16",
-                            predecessor, "sha256:" + hashlib.sha256(predecessor.read_bytes()).hexdigest())
-                    if failure:
-                        with self.assertRaisesRegex(ValueError, "cause differs" if failure == "wrong-cause"
-                                else "changed rollback persistent state"):
-                            ns["rollback_postcondition"](*args)
-                    else:
-                        ns["rollback_postcondition"](*args)
-                        self.assertEqual([p[:2] for p in phases], [("rollback-seed", "0.1.15"),
-                            ("rollback-upgrade", "0.1.16"), ("rollback-restart", "0.1.15")])
-                        self.assertEqual(phases[0][2], predecessor.resolve())
-                        self.assertEqual(phases[2][2], predecessor.resolve())
-                self.assertEqual(ns["reset_directory_database"].call_count, 2)
+        ns = self.directory_http_functions()
+        predecessor = self.workspace / "previous"
+        predecessor.write_bytes(b"native predecessor fixture")
+        phases = []
+        def http(executable, env, scenario, version, **kwargs):
+            phases.append((scenario, version, executable.resolve()))
+            def request(path, body=None, headers=None):
+                if body is not None:
+                    return 201, {"node_id": "fixture-rollback", "node_token": "synthetic"}
+                return 200, {"node_id": "fixture-rollback"}
+            kwargs["postcondition"](request, request, executable, env)
+        def failed_upgrade(argv, **kwargs):
+            kwargs["stdout"].write(b"arbitrary crash" if failure == "wrong-cause"
+                else b"FATAL: DATABASE_URL is required; ephemeral memory requires non-production APP_ENV and IICP_ALLOW_IN_MEMORY=true")
+            kwargs["stdout"].flush()
+            return SimpleNamespace(returncode=1)
+        ns["private_case_home"] = Mock(return_value=self.home)
+        ns["reset_directory_database"] = Mock()
+        ns["rust_http_case"] = http
+        ns["directory_database_state"] = Mock(side_effect=["original", "changed"]
+            if failure == "changed-state" else None, return_value="original")
+        with patch.object(subprocess, "check_output", return_value="iicp-directory-rs 0.1.15\n"), \
+                patch.object(subprocess, "run", side_effect=failed_upgrade):
+            args = (self.workspace / "candidate", {"HOME": str(self.home)}, "0.1.16",
+                    predecessor, "sha256:" + hashlib.sha256(predecessor.read_bytes()).hexdigest())
+            if failure:
+                with self.assertRaisesRegex(ValueError, "cause differs" if failure == "wrong-cause"
+                        else "startup changed persistent state"):
+                    ns["rollback_postcondition"](*args)
+            else:
+                ns["rollback_postcondition"](*args)
+                self.assertEqual([p[:2] for p in phases], [("rollback-seed", "0.1.15"),
+                    ("rollback-upgrade", "0.1.16"), ("rollback-restart", "0.1.15")])
+                self.assertEqual(phases[0][2], predecessor.resolve())
+                self.assertEqual(phases[2][2], predecessor.resolve())
+        self.assertEqual(ns["reset_directory_database"].call_count, 2)
+
+    def test_rollback_accounts_discovery_without_ignoring_other_state(self):
+        ns = self.directory_http_functions()
+        def row(count, mode="legacy_dispatch"):
+            return b"\t".join(value.encode().hex().encode() for value in
+                ("1", "2026-09-27", mode, str(count), "2026-09-27 00:00:00", "2026-09-27 00:00:01")) + b"\n"
+        before = {"schema": b"exact-schema", "rows": {"nodes": b"exact-node", "dispatch_usage_daily": row(1)}}
+        after = copy.deepcopy(before)
+        after["rows"]["dispatch_usage_daily"] = row(2)
+        ns["rollback_request_state"](before, after, 1)
+        ns["rollback_request_state"](before, before, 0)
+        for bad in ("schema", "node", "extra-count", "denied-count", "mode"):
+            value = copy.deepcopy(after)
+            if bad == "schema": value["schema"] = b"changed"
+            if bad == "node": value["rows"]["nodes"] = b"changed"
+            if bad == "extra-count": value["rows"]["dispatch_usage_daily"] = row(3)
+            if bad == "mode": value["rows"]["dispatch_usage_daily"] = row(2, "ticketed_dispatch")
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ns["rollback_request_state"](before, value, 0 if bad == "denied-count" else 1)
+
+    def test_rollback_preserves_lifecycle(self):
+        self.exercise_rollback(None)
+
+    def test_rollback_rejects_wrong_failure_cause(self):
+        self.exercise_rollback("wrong-cause")
+
+    def test_rollback_rejects_changed_state(self):
+        self.exercise_rollback("changed-state")
 
     def test_rollback_rejects_changed_predecessor_before_launch(self):
         from unittest.mock import Mock

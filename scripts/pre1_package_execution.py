@@ -1703,6 +1703,32 @@ def directory_database_state(env):
         raise ValueError("Directory database state exceeds bound")
     return {"schema": schema, "rows": rows}
 
+def rollback_request_state(before, after, expected_count):
+    # Successful discovery is intentionally accounted by the released service.
+    # Verify its exact increment rather than ignoring telemetry or all-row drift.
+    if before["schema"] != after["schema"] or set(before["rows"]) != set(after["rows"]):
+        raise ValueError("Directory rollback request changed schema")
+    for table in before["rows"]:
+        if table != "dispatch_usage_daily" and before["rows"][table] != after["rows"][table]:
+            raise ValueError("Directory rollback request changed non-accounting data")
+    def usage(raw):
+        return [line.split(b"\t") for line in raw.splitlines()]
+    original, updated = usage(before["rows"]["dispatch_usage_daily"]), usage(after["rows"]["dispatch_usage_daily"])
+    if len(original) != len(updated) or not original:
+        raise ValueError("Directory rollback accounting row identity differs")
+    delta = 0
+    for old, new in zip(original, updated):
+        if len(old) != 6 or len(new) != 6 or old[:3] != new[:3] or old[4] != new[4]:
+            raise ValueError("Directory rollback accounting identity differs")
+        count = int(bytes.fromhex(new[3].decode())) - int(bytes.fromhex(old[3].decode()))
+        if count not in (0, 1) or new[5] < old[5] or (count == 0 and new != old):
+            raise ValueError("Directory rollback accounting mutation differs")
+        if count and bytes.fromhex(old[2].decode()) != b"legacy_dispatch":
+            raise ValueError("Directory rollback accounting mode differs")
+        delta += count
+    if delta != expected_count:
+        raise ValueError("Directory rollback accounting increment differs")
+
 def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256):
     # The caller must supply a preparation-bound predecessor. This probe is not
     # admitted into qualification until its fixture is in the package binding.
@@ -1718,7 +1744,10 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
     baseline = {}
     def authorization(request):
         for subject, expected in (("fixture-rollback-allowed", 200), ("fixture-rollback-denied", 401)):
+            request_before = directory_database_state(env) if "state" in baseline else None
             code, result = request("/v1/discover?intent=urn:iicp:intent:llm:chat:v1", headers=baseline[subject])
+            if request_before is not None:
+                rollback_request_state(request_before, directory_database_state(env), 1 if expected == 200 else 0)
             if code != expected:
                 raise ValueError("Directory rollback authorization or revocation differs")
             if expected == 200:
@@ -1749,8 +1778,11 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
         code, detail = request("/v1/node/fixture-rollback")
         if code != 200 or detail != baseline["detail"]:
             raise ValueError("Directory rollback persistent HTTP state differs")
+        if directory_database_state(env) != baseline["state"]:
+            raise ValueError("Directory rollback startup changed persistent state")
         if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
             authorization(request)
+        baseline["state"] = directory_database_state(env)
     reset_directory_database(env)
     try:
         with tempfile.TemporaryDirectory(prefix="directory-rollback-", dir=private_case_home(env)) as directory:
@@ -1761,10 +1793,23 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
                 os.replace(pending, active)
             select(predecessor)
             rust_http_case(active, env, "rollback-seed", "0.1.15", database=True, postcondition=seed)
-            before = directory_database_state(env)
+            baseline["state"] = directory_database_state(env)
             select(binary)
             rust_http_case(active, env, "rollback-upgrade", version, database=True, postcondition=readback)
-            if directory_database_state(env) != before:
+            before = baseline["state"]
+            after_upgrade = directory_database_state(env)
+            if after_upgrade != before:
+                evidence = os.environ.get("IICP_PRE1_CASE_EVIDENCE_ROOT")
+                if evidence:
+                    changed = {name: {"before_sha256": hashlib.sha256(value).hexdigest(),
+                        "after_sha256": hashlib.sha256(after_upgrade["rows"].get(name, b"")).hexdigest()}
+                        for name, value in before["rows"].items()
+                        if value != after_upgrade["rows"].get(name)}
+                    destination = Path(tempfile.mkdtemp(prefix="directory-rollback-state-", dir=evidence))
+                    path = destination / "changed-tables.json"
+                    path.write_text(json.dumps({"schema_changed": before["schema"] != after_upgrade["schema"],
+                        "tables": changed, "qualification_credit": False}) + "\n")
+                    path.chmod(0o600)
                 raise ValueError("Directory upgrade changed rollback persistent state")
             failure_env = {**env, "APP_ENV": "local", "IICP_ALLOW_IN_MEMORY": "false"}
             failure_env.pop("DATABASE_URL", None)
@@ -1781,8 +1826,7 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
                         "qualification_credit": False, "stage": "failed-upgrade"}) + "\n")
                     for item in destination.iterdir():
                         item.chmod(0o600)
-                refusal = (b"restricted trust-domain mode requires DATABASE_URL-backed membership persistence"
-                    if env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true" else b"FATAL: DATABASE_URL is required")
+                refusal = b"FATAL: DATABASE_URL is required; ephemeral memory requires non-production APP_ENV and IICP_ALLOW_IN_MEMORY=true"
                 if (result.returncode != 1 or len(output) > 65536
                         or refusal not in output
                         or b"listening on" in output):
@@ -1793,7 +1837,7 @@ def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256
             if active.resolve() != predecessor.resolve():
                 raise ValueError("Directory predecessor managed path was not restored")
             rust_http_case(active, env, "rollback-restart", "0.1.15", database=True, postcondition=readback)
-            if directory_database_state(env) != before:
+            if directory_database_state(env) != baseline["state"]:
                 raise ValueError("Directory rollback changed schema or persistent data")
     finally:
         reset_directory_database(env)

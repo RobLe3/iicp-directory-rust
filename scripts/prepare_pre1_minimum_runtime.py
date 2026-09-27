@@ -40,12 +40,11 @@ def predecessor_identity(crate, manifest):
             or common.file_sha256(manifest) != "sha256:" + PREDECESSOR_MANIFEST_SHA256):
         raise ValueError("predecessor published asset identity differs")
     value = json.loads(manifest.read_text())
-    if (value.get("schema") != "iicp.directory-rust-release.v1"
-            or value.get("version") != PREDECESSOR_VERSION
-            or value.get("commit") != PREDECESSOR_COMMIT
-            or value.get("crate_sha256") != PREDECESSOR_CRATE_SHA256
-            or value.get("production_authority") is not False
-            or value.get("genesis_cutover_authorized") is not False):
+    expected = {"schema": "iicp.directory-rust-release.v1", "version": PREDECESSOR_VERSION,
+                "commit": PREDECESSOR_COMMIT, "crate_sha256": PREDECESSOR_CRATE_SHA256,
+                "production_authority": False, "genesis_cutover_authorized": False}
+    if ({key: value.get(key) for key in expected} != expected
+            or any(type(value.get(key)) is not bool for key in ("production_authority", "genesis_cutover_authorized"))):
         raise ValueError("predecessor release provenance differs")
     with tarfile.open(crate, mode="r:gz") as archive:
         name = "iicp-directory-rs-" + PREDECESSOR_VERSION + "/.cargo_vcs_info.json"
