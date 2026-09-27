@@ -44,18 +44,29 @@ fi
 : "${MYSQL_USER:=root}"
 : "${MYSQL_PASSWORD:=}"
 
-case "$IICP_CROSS_FLAVOR_DB_NAME" in
-  iicp_cross_*) ;;
-  *) echo "refusing non-disposable database name" >&2; exit 2 ;;
-esac
+[[ "$IICP_CROSS_FLAVOR_DB_NAME" =~ ^iicp_cross_[a-z0-9_]{1,48}$ ]] || {
+  echo "refusing unsafe or non-disposable database name" >&2
+  exit 2
+}
 [ -f "$PHP_DIRECTORY_ROOT/artisan" ] || { echo "PHP directory checkout is invalid" >&2; exit 2; }
 
 mysql_cmd=(mysql --protocol=TCP --host="$MYSQL_HOST" --port="$MYSQL_PORT" --user="$MYSQL_USER" --batch --skip-column-names)
 export MYSQL_PWD="$MYSQL_PASSWORD"
 cleanup() {
-  "${mysql_cmd[@]}" -e "DROP DATABASE IF EXISTS $IICP_CROSS_FLAVOR_DB_NAME" >/dev/null 2>&1 || true
+  "${mysql_cmd[@]}" -e "DROP DATABASE IF EXISTS $IICP_CROSS_FLAVOR_DB_NAME" >/dev/null 2>&1
 }
-trap cleanup EXIT
+finish() {
+  status=$?
+  trap - EXIT
+  if cleanup; then
+    echo "cross-flavor database cleanup verified"
+  else
+    echo "cross-flavor database cleanup failed; run remains incomplete" >&2
+    if [[ "$status" == 0 ]]; then status=1; fi
+  fi
+  exit "$status"
+}
+trap finish EXIT
 
 cleanup
 "${mysql_cmd[@]}" -e "CREATE DATABASE $IICP_CROSS_FLAVOR_DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
@@ -124,4 +135,4 @@ printf '%s' "$mixed_output" | grep -Fq \
   exit 1
 }
 
-echo "cross-flavor membership compatibility passed: PHP migrate, Rust verify/issue/revoke, PHP resume, mixed-mode refusal"
+echo "cross-flavor membership checks passed (cleanup pending): PHP migrate, Rust verify/issue/revoke, PHP resume, mixed-mode refusal"

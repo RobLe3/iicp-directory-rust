@@ -48,6 +48,42 @@ class InstalledCrossFlavorTests(unittest.TestCase):
         self.assertEqual((self.root / "calls").read_text().splitlines(),
             ["db-maintenance-status", "trust-domain-membership-issue", "trust-domain-membership-revoke", "startup"])
 
+    def test_cleanup_failure_cannot_be_success(self):
+        mysql = self.bin / "mysql"
+        counter = self.root / "drops"
+        mysql.write_text('#!/bin/sh\ncase "$*" in *DROP*)\n'
+            ' if [ -f "' + str(counter) + '" ]; then exit 7; fi\n'
+            ' touch "' + str(counter) + '";;\n *COUNT*) echo 1;; esac\n')
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"cleanup failed", result.stderr)
+        self.assertNotIn(b"cleanup verified", result.stdout)
+        self.assertTrue((self.root / "calls").exists())
+
+    def test_initial_cleanup_failure_prevents_workload(self):
+        (self.bin / "mysql").write_text('#!/bin/sh\nexit 7\n')
+        result = self.run_script()
+        self.assertEqual(result.returncode, 7)
+        self.assertIn(b"cleanup failed", result.stderr)
+        self.assertFalse((self.root / "calls").exists())
+
+    def test_workload_failure_is_preserved_after_cleanup(self):
+        (self.bin / "php").write_text('#!/bin/sh\nexit 13\n')
+        result = self.run_script()
+        self.assertEqual(result.returncode, 13)
+        self.assertIn(b"cleanup verified", result.stdout)
+        self.assertNotIn(b"membership checks passed", result.stdout)
+
+    def test_database_name_cannot_inject_sql(self):
+        for name in ("iicp_cross_test; DROP DATABASE unrelated", "iicp_cross_", "production",
+                     "iicp_cross_" + "x" * 49, "iicp_cross_test-name"):
+            self.env["IICP_CROSS_FLAVOR_DB_NAME"] = name
+            with self.subTest(name=name):
+                result = self.run_script()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"unsafe or non-disposable", result.stderr)
+                self.assertFalse((self.root / "calls").exists())
+
     def test_digest_mismatch_fails_before_database_work(self):
         self.env["IICP_CROSS_FLAVOR_RUST_SHA256"] = "sha256:" + "0" * 64
         result = self.run_script()
