@@ -18,6 +18,64 @@ import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def test_discovery_scenario_uses_installed_scoped_listener_and_always_resets(self):
+        from unittest.mock import Mock
+        import pre1_installed_discovery as discovery
+        ns = self.directory_http_functions()
+        (self.workspace / "directory-discovery.py").write_bytes(Path(discovery.__file__).read_bytes())
+        contract, _, _, _ = self.registration_fixture_inputs()
+        (self.workspace / "directory-support-behavior.json").write_bytes(contract)
+        raw, scoped = Mock(), Mock()
+        for failure in (False, True):
+            ns["reset_directory_database"] = reset = Mock()
+            ns["directory_fixture_sql"] = sql = Mock()
+            ns["restricted_membership_command"] = membership = Mock()
+            expected = {"fixture": "actual-observation"}
+            def inspect(request, raw_request, query, issue, actual_contract, mode):
+                self.assertIs(request, scoped); self.assertIs(raw_request, raw)
+                self.assertEqual(mode, "restricted")
+                self.assertEqual(actual_contract, json.loads(contract))
+                query("SELECT fixture"); issue("fixture-node")
+                if failure: raise ValueError("discovery failure")
+                return expected
+            def execute(binary, env, scenario, version, **kwargs):
+                self.assertIs(kwargs["database"], True)
+                self.assertEqual(kwargs["request_timeout"], 10)
+                kwargs["postcondition"](raw, scoped, binary, env)
+            ns["rust_http_case"] = Mock(side_effect=execute)
+            # The prepared module is imported from bound fixture bytes, not a
+            # host-global copy or an implementation-policy expectation.
+            payload = (self.workspace / "directory-discovery.py").read_text()
+            payload += "\nobserve = __import__('builtins')._pre1_test_observe\n"
+            (self.workspace / "directory-discovery.py").write_text(payload)
+            previous = Path.cwd()
+            try:
+                os.chdir(self.workspace)
+                import builtins
+                with patch.object(builtins, "_pre1_test_observe", inspect, create=True):
+                    if failure:
+                        with self.assertRaisesRegex(ValueError, "discovery failure"):
+                            ns["discovery_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16", "restricted")
+                    else:
+                        self.assertEqual(ns["discovery_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16", "restricted"), expected)
+            finally:
+                os.chdir(previous)
+                (self.workspace / "directory-discovery.py").write_bytes(Path(discovery.__file__).read_bytes())
+            self.assertEqual(reset.call_count, 2)
+            sql.assert_called_once_with({}, "SELECT fixture")
+            membership.assert_called_once_with(Path("/installed/binary"), {}, "issue", "fixture-node", "registration", "node")
+
+    def test_sql_failure_retention_is_private_bounded_and_redacted(self):
+        ns = self.directory_http_functions()
+        with patch.dict(os.environ, {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home)}):
+            ns["retain_sql_failure"](b"ERROR synthetic-password " + b"x" * 70000, "synthetic-password")
+        logs = list(self.home.glob("directory-sql-failure-*.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertNotIn(b"synthetic-password", logs[0].read_bytes())
+        self.assertIn(b"[REDACTED]", logs[0].read_bytes())
+        self.assertLessEqual(logs[0].stat().st_size, 65536)
+        self.assertEqual(logs[0].stat().st_mode & 0o777, 0o600)
+
     def test_registration_scenario_uses_authenticated_request_and_always_resets_database(self):
         from unittest.mock import Mock
         ns = self.directory_http_functions()
@@ -821,7 +879,7 @@ class PackageExecutionTests(unittest.TestCase):
                 "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
                 "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke,
-                "registration_scenario_postcondition": invoke, "reset_directory_database": Mock(),
+                "registration_scenario_postcondition": invoke, "discovery_scenario_postcondition": Mock(return_value={}), "reset_directory_database": Mock(),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
@@ -1328,6 +1386,21 @@ class PackageExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "isolated database"):
             ns["rust_http_case"](Path("/binary"), env, "environment-restricted", "0.1.15")
 
+    def test_membership_admin_accepts_only_explicit_canonical_fixture_subjects(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        env = {"HOME": str(self.home)}
+        def run(argv, **kwargs):
+            kwargs["stdout"].write(b"iicp_mem_" + b"a" * 64)
+            return Mock(returncode=0)
+        ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+        for subject in ("fallback-capability", "empty-health", "unstable-backend", "eligible", "below-realtime", "realtime"):
+            self.assertTrue(ns["restricted_membership_command"](Path("/fixture/binary"), env,
+                "issue", subject, "registration", "node").startswith("iicp_mem_"))
+        for subject in ("production-node", "eligible-other", "realtime;rm", "", "x" * 129):
+            with self.assertRaises(ValueError):
+                ns["restricted_membership_command"](Path("/fixture/binary"), env, "issue", subject, "registration", "node")
+
     def test_membership_admin_checks_exit_output_bounds_and_exact_cli(self):
         from unittest.mock import Mock
         ns = self.directory_http_functions()
@@ -1749,6 +1822,9 @@ class PackageExecutionTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self.workspace)
         self.workspace.mkdir()
+        (self.root / "scripts").mkdir(exist_ok=True)
+        shutil.copyfile(Path(adapter.__file__).resolve().with_name("pre1_installed_discovery.py"),
+                        self.root / "scripts/pre1_installed_discovery.py")
         (self.root / "qualification").mkdir(exist_ok=True)
         (self.root / "parity").mkdir(exist_ok=True)
         shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "qualification/registration-delegation-v1.json",

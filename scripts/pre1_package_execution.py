@@ -928,6 +928,29 @@ def registration_scenario_postcondition(binary, env, version):
         reset_directory_database(env)
 
 
+def discovery_scenario_postcondition(binary, env, version, mode):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("installed_discovery", "directory-discovery.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    contract = helper.read_contract("directory-support-behavior.json")
+    observed = []
+    def observe(raw_request, request, active_binary, launch_env):
+        observed.append(helper.observe(request, raw_request,
+            lambda query: directory_fixture_sql(env, query),
+            lambda subject: restricted_membership_command(active_binary, launch_env,
+                "issue", subject, "registration", "node"), contract, mode))
+    reset_directory_database(env)
+    try:
+        rust_http_case(binary, env, "cross-flavor-equivalence", version,
+            database=True, postcondition=observe, request_timeout=10)
+        if len(observed) != 1:
+            raise ValueError("Directory discovery execution was not observed")
+        return observed[0]
+    finally:
+        reset_directory_database(env)
+
+
 def replica_snapshot_postcondition(request, scenario):
     # This key belongs only to the isolated synthetic fixture. Never inherit
     # APP_KEY or credentials from the operator environment.
@@ -1616,7 +1639,9 @@ def restricted_membership_command(binary, env, action, subject, scope="discovery
     import re
     if (action not in {"issue", "revoke"} or kind not in {"node", "client"}
             or not isinstance(subject, str) or len(subject) > 128
-            or not re.fullmatch(r"fixture(?:-[a-z0-9-]+)?|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", subject)
+            or (subject not in {"fallback-capability", "empty-health", "unstable-backend",
+                                "eligible", "below-realtime", "realtime"}
+                and not re.fullmatch(r"fixture(?:-[a-z0-9-]+)?|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", subject))
             or scope not in {"registration", "discovery", "bootstrap", "heartbeat", "peers", "consumer_token", "dispatch", "relay"}):
         raise ValueError("Directory membership fixture command differs")
     argv = [str(binary), "trust-domain-membership-" + action,
@@ -1723,13 +1748,27 @@ def directory_fixture_sql(env, sql):
         "--no-defaults", "--batch", "--raw", "--skip-column-names", "--protocol=TCP",
         "--host=127.0.0.1", "--port=3306", "--connect-timeout=3",
         "--user=" + config["username"], "--database=" + config["database"], "--execute", sql]
-    with tempfile.TemporaryDirectory(prefix="directory-schema-home-", dir=private_case_home(env)) as home, tempfile.TemporaryFile() as output:
+    with tempfile.TemporaryDirectory(prefix="directory-schema-home-", dir=private_case_home(env)) as home, tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
-            stdout=output, stderr=subprocess.DEVNULL, timeout=10, check=False)
+            stdout=output, stderr=errors, timeout=10, check=False)
         output.seek(0); observed = output.read(65537)
+        errors.seek(0); failure = errors.read(65536)
     if result.returncode or len(observed) > 65536:
-        raise ValueError("Directory isolated schema oracle failed")
+        retain_sql_failure(failure, password)
+        raise ValueError("Directory isolated schema oracle failed; bounded private error retained")
     return observed
+
+def retain_sql_failure(failure, password):
+    # Never retain stdout, argv, SQL text, or the credential-bearing environment.
+    # MySQL error diagnostics are bounded, private and redact the actual password.
+    destination = os.environ.get("IICP_PRE1_CASE_EVIDENCE_ROOT")
+    if destination:
+        safe = failure[:65536].replace(password.encode(), b"[REDACTED]")[:65536]
+        with tempfile.NamedTemporaryFile(prefix="directory-sql-failure-", suffix=".log",
+                dir=destination, delete=False) as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(safe)
+
 
 def directory_database_export(env):
     require_loopback_only()
@@ -2384,6 +2423,9 @@ if component == "directory-rust":
     if scenario == "cross-flavor-equivalence":
         observed = registration_scenario_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_REGISTRATION_OBSERVATION " + json.dumps(observed, sort_keys=True))
+        discovery = discovery_scenario_postcondition(Path(argv[0]), env,
+            os.environ["IICP_PRE1_DIRECTORY_VERSION"], context["mode"])
+        print("IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION " + json.dumps(discovery, sort_keys=True))
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     if scenario == "minimum-version":
@@ -2598,6 +2640,7 @@ def directory_fixtures(root, component):
     if component == "directory-php":
         result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
     elif component == "directory-rust":
+        result["directory-discovery.py"] = safe_path(root / "scripts/pre1_installed_discovery.py").read_bytes()
         result["directory-registration-delegation.json"] = safe_path(
             root / "qualification/registration-delegation-v1.json").read_bytes()
         for name, source in {"contract": "contract-v1.10.80.json", "behavior": "behavior-contract-v1.json", "http": "http-contract-v1.json"}.items():
