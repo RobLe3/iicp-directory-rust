@@ -17,6 +17,117 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+def directory_output_exit_code(code, output, context, assertion, root):
+    """Preserve native failure; accept only the owned scenario's bounded output."""
+    if code:
+        return code
+    try:
+        validate_directory_output(output, context, assertion, root)
+    except (ValueError, KeyError, TypeError, OSError, UnicodeError):
+        return 2
+    return 0
+
+
+def validate_directory_output(output, context, assertion, root):
+    if not isinstance(output, str) or len(output.encode()) > 1048576:
+        raise ValueError("Directory output exceeds bound")
+    rows = output.splitlines()
+    marker = "IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion
+    if context["scenario_id"] != "cross-flavor-equivalence":
+        if rows != [marker]:
+            raise ValueError("Directory exact assertion output differs")
+        return
+    if len(rows) != 4 or rows[-1] != marker or rows[1] != "IICP_PRE1_REGISTRATION_TRANSPORT tcp":
+        raise ValueError("Directory observed assertion output differs")
+    registration = directory_observation_json(rows[0], "IICP_PRE1_REGISTRATION_OBSERVATION ")
+    discovery = directory_observation_json(rows[2], "IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION ")
+    path = safe_path(root / "parity/behavior-contract-v1.json")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f":
+        raise ValueError("Directory output fixture differs")
+    contract = json.loads(raw)
+    expected = {row["name"]: row["expected"] for row in contract["registration_cases"]}
+    if not directory_observation_equal(registration, expected):
+        raise ValueError("Directory registration output differs")
+    validate_directory_discovery_output(discovery, context, contract)
+
+
+def directory_observation_json(row, prefix):
+    if not row.startswith(prefix) or len(row.encode()) > 65536:
+        raise ValueError("Directory observation marker differs")
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("Directory duplicate observation key")
+            value[key] = item
+        return value
+    def invalid(value):
+        raise ValueError("Directory nonfinite observation")
+    return json.loads(row[len(prefix):], object_pairs_hook=unique, parse_constant=invalid)
+
+
+def directory_observation_equal(actual, expected):
+    import math
+    if type(expected) in (int, float):
+        return type(actual) in (int, float) and math.isfinite(actual) and actual == expected
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(directory_observation_equal(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(directory_observation_equal(a, b) for a, b in zip(actual, expected))
+    return actual == expected
+
+
+def validate_directory_discovery_output(value, context, contract):
+    fields = {"scope", "mode", "fixture_sha256", "observations", "qualification_credit", "production_endpoint_validation"}
+    flavor = context["component"]
+    if (not isinstance(value, dict) or set(value) != fields or flavor not in {"directory-php", "directory-rust"}
+            or context["mode"] not in {"local-only", "public", "restricted"} or value["mode"] != context["mode"]
+            or value["scope"] != "installed-" + flavor.removeprefix("directory-") + "-tcp-discovery-and-registration-pricing"
+            or value["fixture_sha256"] != "sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+            or value["qualification_credit"] is not False or value["production_endpoint_validation"] is not False):
+        raise ValueError("Directory discovery output scope differs")
+    expected = {group + "/" + row["name"]: (group, row)
+        for group in ("eligibility_cases", "ranking_cases", "pricing_cases") for row in contract[group]}
+    rows = value["observations"]
+    if not isinstance(rows, dict) or set(rows) != set(expected):
+        raise ValueError("Directory discovery output coverage differs")
+    for key, (group, case) in expected.items():
+        if group == "pricing_cases":
+            if not directory_observation_equal(rows[key], case["expected"]):
+                raise ValueError("Directory pricing output differs")
+        else:
+            validate_directory_selection_output(rows[key], group, case)
+
+
+def validate_directory_selection_output(value, group, case):
+    if not isinstance(value, dict) or set(value) != {"eligible_ids", "recommendation_order", "scores"}:
+        raise ValueError("Directory selection output differs")
+    ids, order, scores = value["eligible_ids"], value["recommendation_order"], value["scores"]
+    validate_directory_selection_values(ids, order, scores)
+    expected = sorted(case["expected_ids"]) if group == "eligibility_cases" else (
+        [] if case["requested_model"] == "missing-model" else ["fixture-http-ranking"])
+    if ids != expected or (group == "ranking_cases" and ids and scores != [case["expected"]]):
+        raise ValueError("Directory selection output contract differs")
+
+
+
+def validate_directory_selection_values(ids, order, scores):
+    import math
+    if any(not isinstance(value, list) for value in (ids, order, scores)):
+        raise ValueError("Directory selection output lists differ")
+    if any(not isinstance(value, str) for value in ids + order):
+        raise ValueError("Directory selection output identifiers differ")
+    if len(set(order)) != len(order) or sorted(order) != ids or len(scores) != len(order):
+        raise ValueError("Directory selection output coverage differs")
+    if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1 for value in scores):
+        raise ValueError("Directory selection output scores differ")
+    if scores != sorted(scores, reverse=True):
+        raise ValueError("Directory selection output order differs")
+
+
 SCHEMA = "iicp.pre1-package-execution.v1"
 BINDINGS = (
     "candidate_manifest_sha256", "artifact_materialization_sha256",
@@ -2423,6 +2534,7 @@ if component == "directory-rust":
     if scenario == "cross-flavor-equivalence":
         observed = registration_scenario_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_REGISTRATION_OBSERVATION " + json.dumps(observed, sort_keys=True))
+        print("IICP_PRE1_REGISTRATION_TRANSPORT tcp")
         discovery = discovery_scenario_postcondition(Path(argv[0]), env,
             os.environ["IICP_PRE1_DIRECTORY_VERSION"], context["mode"])
         print("IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION " + json.dumps(discovery, sort_keys=True))

@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pre1_harness_binding import harness_identity, validate_harness_source
 from pre1_environment_contract import validate_modern_environment
-from pre1_package_execution import package_command, validate_binding, make_case_proof, write_case_proof
+from pre1_package_execution import package_command, validate_binding, make_case_proof, write_case_proof, directory_output_exit_code
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = 'directory-rust'
@@ -535,8 +535,7 @@ def main() -> int:
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=210)
         print(result.stdout, end="")
         validate_binding(proof["value"], context, proof["artifact"], ROOT)
-        marker = "IICP_PRE1_DIRECTORY_ASSERTION_PASS " + case["assertion"]
-        exit_code = result.returncode or (0 if result.stdout.splitlines() == [marker] else 2)
+        exit_code = directory_output_exit_code(result.returncode, result.stdout, context, case["assertion"], ROOT)
         write_case_proof(make_case_proof(proof["value"], context, case["assertion"],
             exit_code, os.environ["IICP_PRE1_RUN_ID"]))
     except (KeyError, OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
