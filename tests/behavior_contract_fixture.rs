@@ -27,6 +27,7 @@ struct Contract {
 
 #[derive(Deserialize)]
 struct RankingCase {
+    name: String,
     expected: f64,
     node: RankingNode,
     requested_model: Option<String>,
@@ -48,6 +49,7 @@ struct RankingNode {
 
 #[derive(Deserialize)]
 struct EligibilityCase {
+    name: String,
     candidates: Vec<EligibilityNode>,
     expected_ids: Vec<String>,
     min_reputation: f64,
@@ -69,6 +71,7 @@ struct EligibilityNode {
 
 #[derive(Deserialize)]
 struct PricingCase {
+    name: String,
     declared: f64,
     expected: f64,
     models: Vec<String>,
@@ -76,6 +79,7 @@ struct PricingCase {
 
 #[derive(Deserialize)]
 struct EndpointCase {
+    name: String,
     blocked: bool,
     ip: String,
 }
@@ -85,6 +89,7 @@ fn rust_policy_primitives_execute_the_php_behavior_fixture() {
     assert_eq!(format!("{:x}", Sha256::digest(BYTES)), EXPECTED_SHA256);
     let contract: Contract = serde_json::from_slice(BYTES).expect("valid behavior contract");
     assert_eq!(contract.schema, "iicp.directory.behavior-contract.v1");
+    let mut observations = serde_json::Map::new();
 
     for case in contract.ranking_cases {
         let input = RankingInput {
@@ -105,6 +110,10 @@ fn rust_policy_primitives_execute_the_php_behavior_fixture() {
             case.requested_model.as_deref(),
         );
         assert!((actual - case.expected).abs() < 0.000_001);
+        observations.insert(
+            format!("ranking_cases/{}", case.name),
+            serde_json::json!((actual * 1_000_000.0).round() / 1_000_000.0),
+        );
     }
 
     for case in contract.eligibility_cases {
@@ -128,18 +137,40 @@ fn rust_policy_primitives_execute_the_php_behavior_fixture() {
             .map(|node| node.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(actual, case.expected_ids);
+        observations.insert(
+            format!("eligibility_cases/{}", case.name),
+            serde_json::json!(actual),
+        );
     }
     for case in contract.pricing_cases {
         let actual = behavior_contract::pricing_multiplier(&case.models, case.declared);
         assert!((actual - case.expected).abs() < 0.000_001);
+        observations.insert(
+            format!("pricing_cases/{}", case.name),
+            serde_json::json!((actual * 1_000_000.0).round() / 1_000_000.0),
+        );
     }
     for case in contract.endpoint_cases {
-        assert_eq!(behavior_contract::blocked_ip(&case.ip), case.blocked);
+        let actual = behavior_contract::blocked_ip(&case.ip);
+        assert_eq!(actual, case.blocked);
+        observations.insert(
+            format!("endpoint_cases/{}", case.name),
+            serde_json::json!(actual),
+        );
     }
 
     // Transactional registration behavior is exercised by the disposable
     // dual-MySQL gate; keep the two shared case names present in this fixture.
     assert_eq!(contract.registration_cases.len(), 2);
+    assert_eq!(observations.len(), 15);
+    // Supplemental source-policy evidence, not installed HTTP observations.
+    // Preserve the existing assertions before six-decimal normalization.
+    if std::env::var("IICP_PRE1_POLICY_OBSERVATION").as_deref() == Ok("1") {
+        println!(
+            "\nIICP_PRE1_POLICY_OBSERVATION {}",
+            serde_json::Value::Object(observations)
+        );
+    }
 }
 
 #[test]
