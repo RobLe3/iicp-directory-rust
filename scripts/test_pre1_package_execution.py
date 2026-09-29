@@ -879,7 +879,8 @@ class PackageExecutionTests(unittest.TestCase):
                 "resource": Mock(RLIMIT_FSIZE=1),
                 "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
                 "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke,
-                "registration_scenario_postcondition": invoke, "discovery_scenario_postcondition": Mock(return_value={}), "reset_directory_database": Mock(),
+                "registration_scenario_postcondition": invoke, "discovery_scenario_postcondition": Mock(return_value={}),
+                "endpoint_scenario_postcondition": Mock(return_value={}), "reset_directory_database": Mock(),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
@@ -892,6 +893,9 @@ class PackageExecutionTests(unittest.TestCase):
             return
         if scenario in {"migration-interrupted", "backup-restore", "cross-flavor-equivalence"}:
             invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
+            if scenario == "cross-flavor-equivalence":
+                namespace["endpoint_scenario_postcondition"].assert_called_once_with(
+                    Path("/fixture/iicp-directory-rs"), {}, "0.1.15", "local-only")
             return
         self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
         self.assertEqual(invoke.call_args.args[2], scenario)

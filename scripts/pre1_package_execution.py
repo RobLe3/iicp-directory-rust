@@ -37,7 +37,7 @@ def validate_directory_output(output, context, assertion, root):
         if rows != [marker]:
             raise ValueError("Directory exact assertion output differs")
         return
-    if len(rows) != 4 or rows[-1] != marker or rows[1] != "IICP_PRE1_REGISTRATION_TRANSPORT tcp":
+    if len(rows) != 5 or rows[-1] != marker or rows[1] != "IICP_PRE1_REGISTRATION_TRANSPORT tcp":
         raise ValueError("Directory observed assertion output differs")
     registration = directory_observation_json(rows[0], "IICP_PRE1_REGISTRATION_OBSERVATION ")
     discovery = directory_observation_json(rows[2], "IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION ")
@@ -50,6 +50,8 @@ def validate_directory_output(output, context, assertion, root):
     if not directory_observation_equal(registration, expected):
         raise ValueError("Directory registration output differs")
     validate_directory_discovery_output(discovery, context, contract)
+    endpoints = directory_observation_json(rows[3], "IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION ")
+    validate_directory_endpoint_output(endpoints, context, contract)
 
 
 def directory_observation_json(row, prefix):
@@ -100,6 +102,24 @@ def validate_directory_discovery_output(value, context, contract):
                 raise ValueError("Directory pricing output differs")
         else:
             validate_directory_selection_output(rows[key], group, case)
+
+
+def validate_directory_endpoint_output(value, context, contract):
+    fields = {"scope", "mode", "fixture_sha256", "app_env", "observations", "qualification_credit"}
+    flavor = context["component"]
+    if (not isinstance(value, dict) or set(value) != fields
+            or flavor not in {"directory-php", "directory-rust"}
+            or context["mode"] not in {"local-only", "public", "restricted"}
+            or value["mode"] != context["mode"] or value["app_env"] != "production"
+            or value["scope"] != "installed-" + flavor.removeprefix("directory-") + "-tcp-production-endpoints"
+            or value["fixture_sha256"] != "sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+            or value["qualification_credit"] is not False):
+        raise ValueError("Directory endpoint output scope differs")
+    expected = {"endpoint_cases/" + row["name"]: {
+        "blocked": row["blocked"], "status": 422, "reason": "IICP-E035" if row["blocked"] else "IICP-E036",
+        "node_rows": 0, "capability_rows": 0, "availability_rows": 0} for row in contract["endpoint_cases"]}
+    if not directory_observation_equal(value["observations"], expected):
+        raise ValueError("Directory endpoint output coverage or refusal differs")
 
 
 def validate_directory_selection_output(value, group, case):
@@ -1060,6 +1080,32 @@ def discovery_scenario_postcondition(binary, env, version, mode):
         return observed[0]
     finally:
         reset_directory_database(env)
+
+
+def endpoint_scenario_postcondition(binary, env, version, mode):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("installed_endpoints", "directory-discovery.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    contract = helper.read_contract("directory-support-behavior.json")
+    production = {**env, "APP_ENV": "production", "IICP_SKIP_LIVENESS_CHECK": "false",
+        "IICP_DEV_ALLOW_INSECURE_TLS": "false", "IICP_GENESIS_ED25519_SECRET_KEY": "00" * 64}
+    observed = []
+    def observe(raw_request, request, active_binary, launch_env):
+        if any(launch_env.get(key) != production[key] for key in
+                ("APP_ENV", "IICP_SKIP_LIVENESS_CHECK", "IICP_DEV_ALLOW_INSECURE_TLS")):
+            raise ValueError("Directory endpoint environment differs")
+        observed.append(helper.observe_endpoints(request, raw_request,
+            lambda query: directory_fixture_sql(production, query), contract, mode))
+    reset_directory_database(production)
+    try:
+        rust_http_case(binary, production, "cross-flavor-equivalence", version,
+            database=True, postcondition=observe, request_timeout=10)
+        if len(observed) != 1:
+            raise ValueError("Directory endpoint execution was not observed")
+        return observed[0]
+    finally:
+        reset_directory_database(production)
 
 
 def replica_snapshot_postcondition(request, scenario):
@@ -2538,6 +2584,9 @@ if component == "directory-rust":
         discovery = discovery_scenario_postcondition(Path(argv[0]), env,
             os.environ["IICP_PRE1_DIRECTORY_VERSION"], context["mode"])
         print("IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION " + json.dumps(discovery, sort_keys=True))
+        endpoints = endpoint_scenario_postcondition(Path(argv[0]), env,
+            os.environ["IICP_PRE1_DIRECTORY_VERSION"], context["mode"])
+        print("IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION " + json.dumps(endpoints, sort_keys=True))
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     if scenario == "minimum-version":

@@ -311,11 +311,44 @@ class DirectoryOutputTests(unittest.TestCase):
             'mode': 'restricted', 'fixture_sha256': 'sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f',
             'qualification_credit': False, 'production_endpoint_validation': False, 'observations': observations}
 
+    def endpoints(self):
+        return {"scope": "installed-" + module.COMPONENT.removeprefix("directory-") + "-tcp-production-endpoints",
+            "mode": "restricted", "fixture_sha256": "sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+            "app_env": "production", "qualification_credit": False, "observations": {
+                "endpoint_cases/" + row["name"]: {"blocked": row["blocked"], "status": 422,
+                    "reason": "IICP-E035" if row["blocked"] else "IICP-E036",
+                    "node_rows": 0, "capability_rows": 0, "availability_rows": 0}
+                for row in self.contract["endpoint_cases"]}}
+
     def output(self, registration=None, discovery=None):
         a, b = self.values()
         return '\n'.join(['IICP_PRE1_REGISTRATION_OBSERVATION ' + json.dumps(a if registration is None else registration),
             'IICP_PRE1_REGISTRATION_TRANSPORT tcp',
-            'IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION ' + json.dumps(b if discovery is None else discovery), self.marker]) + '\n'
+            'IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION ' + json.dumps(b if discovery is None else discovery),
+            "IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION " + json.dumps(self.endpoints()), self.marker]) + '\n'
+
+    def test_endpoint_records_fail_closed(self):
+        from copy import deepcopy
+        original = self.endpoints()
+        for field, wrong in (("app_env", "testing"), ("qualification_credit", True),
+                             ("mode", "public"), ("fixture_sha256", "sha256:" + "0" * 64)):
+            value = deepcopy(original); value[field] = wrong
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                adapter.validate_directory_endpoint_output(value, self.context, self.contract)
+        for change in ({"status": 201}, {"blocked": 1}, {"node_rows": False},
+                       {"node_rows": 1}, {"reason": "IICP-E035"}):
+            value = deepcopy(original)
+            value["observations"]["endpoint_cases/public_ipv6"].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                adapter.validate_directory_endpoint_output(value, self.context, self.contract)
+        value = deepcopy(original); value["observations"].pop("endpoint_cases/public_ipv6")
+        with self.assertRaises(ValueError): adapter.validate_directory_endpoint_output(value, self.context, self.contract)
+
+    def test_endpoint_marker_required_and_bounded(self):
+        raw = self.output(); line = "IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION " + json.dumps(self.endpoints())
+        for output in (raw.replace(line + "\n", ""), raw.replace(line, line + "\n" + line),
+                       raw.replace(line, line.replace('"app_env": "production"', '"app_env": "production", "app_env": "production"'))):
+            self.assertEqual(self.code(output), 2)
 
     def code(self, output, code=0):
         return adapter.directory_output_exit_code(code, output, self.context, self.assertion, ROOT)

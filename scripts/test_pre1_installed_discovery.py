@@ -18,6 +18,45 @@ class InstalledDiscoveryTests(unittest.TestCase):
         return 200, {'count': len(ids), 'nodes': [
             {'node_id': key, 'score': score} for key, score in zip(ids, scores)]}
 
+    def endpoint_response(self, path, body):
+        internal = body["endpoint"] in {"https://127.0.0.1", "https://10.0.0.1", "https://[::1]", "https://[fc00::1]"}
+        return 422, {"error": {"code": "IICP-E035" if internal else "IICP-E036"}}
+
+    def test_production_endpoint_results_use_actual_response_and_counts(self):
+        request = Mock(side_effect=self.endpoint_response)
+        sql = Mock(return_value=b"0\t0\t0\n")
+        value = probe.observe_endpoints(request, Mock(), sql, self.contract, "public")
+        self.assertEqual(len(value["observations"]), 6)
+        self.assertIs(value["qualification_credit"], False)
+        self.assertEqual(value["app_env"], "production")
+        bodies = [call.args[1] for call in request.call_args_list]
+        self.assertIn("https://[2606:4700:4700::1111]", [body["endpoint"] for body in bodies])
+        self.assertTrue(all("nat_type" not in body and "transport_method" not in body for body in bodies))
+        self.assertEqual(value["observations"]["endpoint_cases/public_ipv6"]["reason"], "IICP-E036")
+
+    def test_endpoint_refusal_status_and_cause_must_match(self):
+        for response in ((201, {"error": {"code": "IICP-E035"}}),
+                         (422, {"error": {"code": "validation_error"}}), (422, {"error": {"code": "IICP-E036"}})):
+            with self.assertRaisesRegex(ValueError, 'refusal differs'):
+                probe.observe_endpoints(Mock(return_value=response), Mock(), Mock(return_value=b"0\t0\t0"), self.contract, "public")
+
+    def test_endpoint_partial_persistence_fails(self):
+        with self.assertRaisesRegex(ValueError, 'refusal differs'):
+            probe.observe_endpoints(Mock(side_effect=self.endpoint_response), Mock(), Mock(return_value=b"1\t0\t0"), self.contract, "public")
+
+    def test_endpoint_counts_reject_bad_shape_and_noninteger(self):
+        for raw in ("0\t0\t0", b"0\t0", b"0\t-1\t0", b"0\tFalse\t0", b"0\t0\t0\n1"):
+            with self.assertRaises(ValueError): probe.endpoint_counts(Mock(return_value=raw))
+
+    def test_restricted_endpoint_registration_requires_exact_denial(self):
+        for denied in ((200, {}), (401, {"error": {"code": "other"}})):
+            with self.assertRaisesRegex(ValueError, 'anonymous endpoint'):
+                probe.observe_endpoints(Mock(), Mock(return_value=denied), Mock(return_value=b"0\t0\t0"), self.contract, "restricted")
+        result = probe.observe_endpoints(Mock(side_effect=self.endpoint_response),
+            Mock(return_value=(401, {"error": {"code": "restricted_domain_denied"}})),
+            Mock(return_value=b"0\t0\t0"), self.contract, "restricted")
+        self.assertEqual(len(result['observations']), 6)
+
     def test_fixture_bytes_are_pinned(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'fixture.json'; path.write_text('{}')

@@ -144,3 +144,43 @@ def observe(request, raw_request, sql, membership, contract, mode):
     return {'scope': 'installed-rust-tcp-discovery-and-registration-pricing', 'mode': mode,
         'fixture_sha256': 'sha256:' + FIXTURE_SHA256, 'observations': observations,
         'qualification_credit': False, 'production_endpoint_validation': False}
+
+
+def endpoint_counts(sql):
+    raw = sql("SELECT (SELECT COUNT(*) FROM nodes), (SELECT COUNT(*) FROM capabilities), "
+              "(SELECT COUNT(*) FROM availability_windows);")
+    if not isinstance(raw, bytes) or len(raw) > 100:
+        raise ValueError('installed endpoint counts differ')
+    parts = raw.strip().split(b'\t')
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise ValueError('installed endpoint counts differ')
+    return dict(zip(('node_rows', 'capability_rows', 'availability_rows'), map(int, parts)))
+
+
+def observe_endpoints(request, raw_request, sql, contract, mode):
+    if mode not in {'public', 'restricted', 'local-only'}:
+        raise ValueError('installed endpoint mode differs')
+    observations = {}
+    for case in contract['endpoint_cases']:
+        clear_nodes(sql)
+        host = '[' + case['ip'] + ']' if ':' in case['ip'] else case['ip']
+        body = {'node_id': 'fixture-http-endpoint', 'endpoint': 'https://' + host, 'region': 'eu-west',
+            'capabilities': [{'intent': INTENT, 'models': ['model-a'], 'max_tokens': 4096}],
+            'limits': {'max_concurrent': 4, 'tokens_per_min': 10000}}
+        if mode == 'restricted':
+            status, denied = raw_request('/v1/register', body)
+            if (status != 401 or denied.get('error', {}).get('code') != 'restricted_domain_denied'
+                    or any(endpoint_counts(sql).values())):
+                raise ValueError('installed anonymous endpoint registration admitted')
+        status, value = request('/v1/register', body)
+        reason = value.get('error', {}).get('code')
+        expected = 'IICP-E035' if case['blocked'] else 'IICP-E036'
+        counts = endpoint_counts(sql)
+        if status != 422 or reason != expected or any(counts.values()):
+            raise ValueError('installed production endpoint refusal differs: ' + case['name'])
+        observations['endpoint_cases/' + case['name']] = {
+            'blocked': reason == 'IICP-E035', 'status': status, 'reason': reason, **counts}
+    clear_nodes(sql)
+    return {'scope': 'installed-rust-tcp-production-endpoints', 'mode': mode,
+        'fixture_sha256': 'sha256:' + FIXTURE_SHA256, 'app_env': 'production',
+        'observations': observations, 'qualification_credit': False}
