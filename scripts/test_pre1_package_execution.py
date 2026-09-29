@@ -1983,6 +1983,9 @@ class PackageExecutionTests(unittest.TestCase):
             link.symlink_to(self.home, target_is_directory=True)
             public = self.home / "public-home"
             public.mkdir(mode=0o755)
+            # mkdir mode is filtered by the caller's umask; make this negative fixture genuinely public.
+            public.chmod(0o755)
+            self.assertEqual(public.stat().st_mode & 0o777, 0o755)
             for home in ("relative", str(self.workspace), str(nested), str(link), str(public)):
                 with self.subTest(home=home), self.assertRaisesRegex(ValueError, "private case HOME"):
                     validate({"HOME": home})
