@@ -1804,6 +1804,29 @@ class PackageExecutionTests(unittest.TestCase):
             kill.assert_called_once()
             process.wait.assert_called_once_with(timeout=10)
 
+    def test_directory_http_listener_observation_precedes_case_and_cleanup(self):
+        from unittest.mock import Mock, MagicMock
+        import urllib.request
+        run = self.directory_http_functions()["rust_http_case"]
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        response = MagicMock(code=200)
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok":true,"version":"v0.1.15-rs"}'
+        events = []
+        with self.directory_network({"lo"}), \
+             patch.object(subprocess, "Popen", return_value=process), \
+             patch.object(os, "pread", return_value=b"listening on 0.0.0.0:8090", create=True), \
+             patch.object(os, "killpg", create=True) as kill, \
+             patch.object(urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value = response
+            run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15",
+                postcondition=lambda *_: events.append("case"),
+                listener_check=lambda: events.append("listener"))
+            self.assertEqual(events, ["listener", "case"])
+            kill.assert_called_once()
+            process.wait.assert_called_once_with(timeout=10)
+
     def test_directory_http_fixture_timeout_and_early_exit_preserve_cleanup(self):
         from unittest.mock import Mock
         import time
