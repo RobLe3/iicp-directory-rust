@@ -1,16 +1,40 @@
 """Fail-closed tests for the bounded, per-namespace comparative port lease."""
 import errno
 import json
+import os
 import socket
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pre1_comparative_topology as topology
 import pre1_package_execution as adapter
 
 
 class ComparativeTopologyTests(unittest.TestCase):
+    def test_exclusive_bind_retries_time_wait_without_socket_reuse(self):
+        guard = Mock()
+        guard.bind.side_effect = [OSError(errno.EADDRINUSE, "TIME_WAIT"), None]
+        checks = []
+        with patch.object(topology, "listening_ports", return_value=set()), \
+                patch.object(topology.time, "sleep") as sleep:
+            topology.bind_exclusive_peer(guard, "0.0.0.0", 8090,
+                                         lambda: checks.append(True))
+        self.assertEqual(guard.bind.call_count, 2)
+        self.assertEqual(len(checks), 2)
+        sleep.assert_called_once_with(0.25)
+
+    def test_exclusive_bind_refuses_listener_or_permanent_occupancy(self):
+        guard = Mock()
+        guard.bind.side_effect = OSError(errno.EADDRINUSE, "occupied")
+        with patch.object(topology, "listening_ports", return_value={8090}):
+            with self.assertRaisesRegex(ValueError, "peer listener"):
+                topology.bind_exclusive_peer(guard, "0.0.0.0", 8090, lambda: None)
+        with patch.object(topology, "listening_ports", return_value=set()), \
+                patch.object(topology.time, "monotonic", side_effect=[0, 76]):
+            with self.assertRaisesRegex(ValueError, "remained occupied"):
+                topology.bind_exclusive_peer(guard, "0.0.0.0", 8090, lambda: None)
+
     @unittest.skipUnless(sys.platform == "linux", "requires Linux procfs")
     def test_kernel_listener_table_reports_real_declared_port(self):
         with socket.socket() as server:
@@ -58,11 +82,17 @@ class ComparativeTopologyTests(unittest.TestCase):
                     with self.assertRaises(OSError) as refusal:
                         competitor.bind(("127.0.0.1", port))
                     self.assertEqual(refusal.exception.errno, errno.EADDRINUSE)
+                if os.uname().sysname == "Linux":
+                    with socket.socket() as reuse_competitor:
+                        reuse_competitor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        with self.assertRaises(OSError) as refusal:
+                            reuse_competitor.bind(("127.0.0.1", port))
+                        self.assertEqual(refusal.exception.errno, errno.EADDRINUSE)
                 with patch.object(topology, "listening_ports", return_value={port + 1}):
                     topology.observe_own_listener("directory-php", lease, lambda: checks.append(True))
                 self.assertIs(topology.result("directory-php", "local-only", lease)[
                     "global_authority_established"], False)
-        self.assertEqual(len(checks), 3)
+        self.assertEqual(len(checks), 4)
 
     def test_listener_observation_refuses_missing_or_peer_listener(self):
         lease = {"own_listener_observations": 0}

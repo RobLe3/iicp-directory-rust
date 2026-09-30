@@ -9,9 +9,33 @@ import errno
 from pathlib import Path
 import socket
 import sys
+import time
 
 PORTS = {"directory-rust": 8090, "directory-php": 8091}
 SCHEMA = "iicp.pre1-directory-comparative-topology.v1"
+PEER_BIND_WAIT_SECONDS = 75
+
+
+def bind_exclusive_peer(guard, address, peer, isolation_check):
+    """Wait out a prior TCP TIME_WAIT without enabling socket reuse.
+
+    SO_REUSEADDR is unsafe here: another reuse-enabled socket can bind the
+    supposedly excluded peer port while this non-listening guard holds it.
+    """
+    deadline = time.monotonic() + PEER_BIND_WAIT_SECONDS
+    while True:
+        isolation_check()
+        try:
+            guard.bind((address, peer))
+            return
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE:
+                raise
+            if peer in listening_ports():
+                raise ValueError("comparative peer listener is present") from error
+            if time.monotonic() >= deadline:
+                raise ValueError("comparative peer port remained occupied") from error
+            time.sleep(0.25)
 
 
 def listening_ports():
@@ -62,7 +86,7 @@ def hold_peer_port(component, isolation_check):
             guard = sockets.enter_context(socket.socket(family, socket.SOCK_STREAM))
             if family == socket.AF_INET6:
                 guard.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            guard.bind((wildcard, peer))
+            bind_exclusive_peer(guard, wildcard, peer, isolation_check)
             with socket.socket(family, socket.SOCK_STREAM) as competitor:
                 if family == socket.AF_INET6:
                     competitor.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
