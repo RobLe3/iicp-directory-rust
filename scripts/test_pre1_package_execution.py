@@ -1829,6 +1829,8 @@ class PackageExecutionTests(unittest.TestCase):
         (self.root / "scripts").mkdir(exist_ok=True)
         shutil.copyfile(Path(adapter.__file__).resolve().with_name("pre1_installed_discovery.py"),
                         self.root / "scripts/pre1_installed_discovery.py")
+        shutil.copyfile(Path(adapter.__file__).resolve().with_name("pre1_comparative_topology.py"),
+                        self.root / "scripts/pre1_comparative_topology.py")
         (self.root / "qualification").mkdir(exist_ok=True)
         (self.root / "parity").mkdir(exist_ok=True)
         shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "qualification/registration-delegation-v1.json",

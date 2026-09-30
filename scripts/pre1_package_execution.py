@@ -33,6 +33,9 @@ def validate_directory_output(output, context, assertion, root):
         raise ValueError("Directory output exceeds bound")
     rows = output.splitlines()
     marker = "IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion
+    if context["scenario_id"] == "no-dual-authority":
+        validate_comparative_topology_output(rows, marker, context)
+        return
     if context["scenario_id"] != "cross-flavor-equivalence":
         if rows != [marker]:
             raise ValueError("Directory exact assertion output differs")
@@ -52,6 +55,23 @@ def validate_directory_output(output, context, assertion, root):
     validate_directory_discovery_output(discovery, context, contract)
     endpoints = directory_observation_json(rows[3], "IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION ")
     validate_directory_endpoint_output(endpoints, context, contract)
+
+
+def validate_comparative_topology_output(rows, marker, context):
+    if len(rows) != 2 or rows[1] != marker:
+        raise ValueError("Directory comparative topology output differs")
+    value = directory_observation_json(rows[0], "IICP_PRE1_DIRECTORY_TOPOLOGY ")
+    component = context["component"]
+    expected = {"schema": "iicp.pre1-directory-comparative-topology.v1",
+        "component": component, "mode": context["mode"],
+        "peer_port": 8090 if component == "directory-php" else 8091,
+        "own_http_observed": True,
+        "scope": "declared-peer-port-in-one-isolated-network-namespace",
+        "global_authority_established": False}
+    if (not isinstance(value, dict) or set(value) != {*expected, "address_families"}
+            or any(value.get(key) != item for key, item in expected.items())
+            or value.get("address_families") not in (["ipv4"], ["ipv4", "ipv6"])):
+        raise ValueError("Directory comparative topology proof differs")
 
 
 def directory_observation_json(row, prefix):
@@ -1031,7 +1051,7 @@ DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-ve
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
 DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore", "rollback-last-supported", "cross-flavor-equivalence"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
-    "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install", "minimum-version"})
+    "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install", "minimum-version", "no-dual-authority"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -2569,6 +2589,39 @@ assertion = sys.argv[1]
 env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP") if k in os.environ}
 env.update(APP_ENV="testing", NO_COLOR="1")
 case_home = private_case_home(env)
+if scenario == "no-dual-authority":
+    import runpy
+    case = json.loads(Path("directory-case-map.json").read_text())["scenarios"][scenario]
+    if case != {"assertion": assertion, "command": ["@installed"]}:
+        raise ValueError("comparative Directory case map differs")
+    topology = runpy.run_path(str(Path("directory-topology.py").resolve()))
+    with topology["hold_peer_port"](component, require_loopback_only) as lease:
+        if component == "directory-rust":
+            launch = rust_mode_environment(env, context["mode"])
+            if context["mode"] == "restricted":
+                reset_directory_database(launch)
+            rust_mode_postcondition(installed / "iicp-directory-rs", launch,
+                context["mode"], os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+            if context["mode"] == "restricted":
+                reset_directory_database(launch)
+            rust_http_case(installed / "iicp-directory-rs", launch, "credential-missing",
+                os.environ["IICP_PRE1_DIRECTORY_VERSION"],
+                database=(Path.cwd() / "directory-operator-fixture.json").exists())
+        else:
+            php_mode_postcondition(installed, env, context["mode"])
+            observation = runpy.run_path(str(Path("directory-discovery.py").resolve()))["execute"](
+                installed, os.environ["IICP_PRE1_DIRECTORY_PHP"], env, context["mode"])
+            if (not isinstance(observation, dict) or observation.get("mode") != context["mode"]
+                    or observation.get("scope") != "installed-php-tcp-discovery-and-registration-pricing"
+                    or observation.get("qualification_credit") is not False
+                    or not isinstance(observation.get("observations"), dict)
+                    or not observation["observations"]):
+                raise ValueError("installed PHP Directory TCP observation differs")
+        topology_result = topology["result"](component, context["mode"], lease)
+    print("IICP_PRE1_DIRECTORY_TOPOLOGY " + json.dumps(
+        topology_result, sort_keys=True))
+    print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+    raise SystemExit(0)
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
     env = rust_mode_environment(env, context["mode"])
@@ -2797,7 +2850,8 @@ def provision_directory_runtime_paths(installed):
 
 def directory_fixtures(root, component):
     result = {"directory-probe.py": DIRECTORY_PROBE.encode(),
-              "directory-case-map.json": safe_path(root / "qualification/pre1-cases.json").read_bytes()}
+              "directory-case-map.json": safe_path(root / "qualification/pre1-cases.json").read_bytes(),
+              "directory-topology.py": safe_path(root / "scripts/pre1_comparative_topology.py").read_bytes()}
     if component == "directory-php":
         result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
     elif component == "directory-rust":
@@ -2975,7 +3029,7 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     case = mapping["support"] if scenario == "support" else mapping["scenarios"][scenario]
     if component == "directory-rust" and scenario not in DIRECTORY_RUST_SCENARIOS:
         raise ValueError("Directory black-box scenario remains unimplemented")
-    if component == "directory-php" and case["command"][0] != "@php":
+    if component == "directory-php" and scenario != "no-dual-authority" and case["command"][0] != "@php":
         raise ValueError("Directory structural checks are not packaged operation evidence")
     env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],

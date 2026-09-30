@@ -44,15 +44,19 @@ def _case_command(value: object, label: str) -> list[str]:
         raise RuntimeError(f"invalid exact qualification case: {label}")
     assertion = value.get("assertion")
     command = value.get("command")
+    installed_topology = (label == "no-dual-authority"
+        and assertion == "installed_comparative_authority_exclusion"
+        and command == ["@installed"])
     if (
         not isinstance(assertion, str)
         or not assertion
         or not isinstance(command, list)
         or not command
         or not all(isinstance(row, str) and row for row in command)
-        or command[:3] != ["@cargo", "test", "--locked"]
-        or command[-3] != assertion
-        or command[-2:] != ["--", "--exact"]
+        or not (installed_topology or (
+            command[:3] == ["@cargo", "test", "--locked"]
+            and command[-3] == assertion
+            and command[-2:] == ["--", "--exact"]))
     ):
         raise RuntimeError(f"qualification case is not an exact Rust assertion: {label}")
     return command

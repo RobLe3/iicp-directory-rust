@@ -176,17 +176,8 @@
       ]
     },
     "no-dual-authority": {
-      "assertion": "preview_contract_never_authorizes_dual_genesis",
-      "command": [
-        "@cargo",
-        "test",
-        "--locked",
-        "--test",
-        "pre1_release_boundaries",
-        "preview_contract_never_authorizes_dual_genesis",
-        "--",
-        "--exact"
-      ]
+      "assertion": "installed_comparative_authority_exclusion",
+      "command": ["@installed"]
     },
     "offline-locked-install": {
       "assertion": "offline_candidate_contract_pins_every_release_input",
