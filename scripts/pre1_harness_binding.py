@@ -13,6 +13,9 @@ from pathlib import Path
 
 
 TOOL_ONLY_PATHS = frozenset({
+    "qualification/pre1-cases.json",
+    "scripts/pre1_comparative_topology.py",
+    "scripts/pre1_installed_discovery.py",
     "scripts/run_pre1_qualification_case.py",
     "scripts/test_pre1_qualification_case.py",
     "scripts/pre1_harness_binding.py",
@@ -20,6 +23,8 @@ TOOL_ONLY_PATHS = frozenset({
     "scripts/pre1_package_execution.py",
     "scripts/test_pre1_package_execution.py",
     "scripts/test_pre1_prepared_home.py",
+    "scripts/test_pre1_comparative_topology.py",
+    "scripts/test_pre1_installed_discovery.py",
     "scripts/run_php83_local_ci.py",
     "scripts/test_php83_local_ci.py",
     "scripts/prepare_pre1_minimum_runtime.py",
