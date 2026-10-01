@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### 0.1.16 preparation — not published
+
+- Prepare the existing post-0.1.15 implementation changes and qualification
+  tooling as a new operator-preview version. Published 0.1.15 is the pinned
+  rollback predecessor; 0.1.14 predates authenticated restricted-directory
+  decision projection and is not accepted as a current-profile fallback.
+- Publication, successor candidate freeze, full rollback qualification and
+  Genesis authority remain separate, unfulfilled gates. No published release,
+  production service or protocol requirement is changed by this preparation.
+
 - Add component-owned Linux x86_64 and arm64 candidate artifact builders with
   locked Cargo tests, vendored offline installation and bounded disposable
   build storage. This does not change Genesis authority or deployment state.

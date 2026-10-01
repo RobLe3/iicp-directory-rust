@@ -70,14 +70,8 @@ pub fn endpoint_routable(endpoint: &str, env: Env) -> Result<(), EndpointReject>
         return Ok(());
     }
 
-    // Host = up to the first '/', ':' (port), strip brackets for IPv6.
     let host_port = after_scheme.split('/').next().unwrap_or("");
-    let host = host_port
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(host_port)
-        .trim_start_matches('[')
-        .trim_end_matches(']');
+    let host = endpoint_authority_host(host_port)?;
 
     if host.is_empty() {
         return Err(EndpointReject::NonRoutableHost);
@@ -140,6 +134,35 @@ pub fn endpoint_routable(endpoint: &str, env: Env) -> Result<(), EndpointReject>
     Ok(())
 }
 
+// Split an explicit port only after the closing bracket, never inside an IPv6
+// literal. Non-bracketed authorities retain their existing host/port handling.
+fn endpoint_authority_host(authority: &str) -> Result<&str, EndpointReject> {
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, suffix) = bracketed
+            .split_once(']')
+            .ok_or(EndpointReject::NonRoutableHost)?;
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| EndpointReject::NonRoutableHost)?;
+        if !suffix.is_empty() {
+            let port = suffix
+                .strip_prefix(':')
+                .ok_or(EndpointReject::NonRoutableHost)?;
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(EndpointReject::NonRoutableHost);
+            }
+            port.parse::<u16>()
+                .map_err(|_| EndpointReject::NonRoutableHost)?;
+        }
+        return Ok(host);
+    }
+    if authority.contains(['[', ']']) {
+        return Err(EndpointReject::NonRoutableHost);
+    }
+    Ok(authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host))
+}
+
 fn is_publicly_routable_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -152,6 +175,9 @@ fn is_publicly_routable_ip(ip: &IpAddr) -> bool {
                 && !v4.is_documentation()
         }
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_publicly_routable_ip(&IpAddr::V4(v4));
+            }
             let segments = v6.segments();
             let is_ula = (segments[0] & 0xfe00) == 0xfc00;
             let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
@@ -264,6 +290,60 @@ mod tests {
             assert!(
                 endpoint_routable(ok, Env::Production).is_ok(),
                 "should accept {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn routable_accepts_bracketed_public_ipv6_with_or_without_port() {
+        for env in [Env::Production, Env::Staging] {
+            for endpoint in [
+                "https://[2606:4700:4700::1111]",
+                "https://[2606:4700:4700::1111]:443/iicp",
+            ] {
+                assert_eq!(endpoint_routable(endpoint, env), Ok(()), "{endpoint}");
+            }
+        }
+    }
+
+    #[test]
+    fn routable_rejects_internal_ipv6_with_or_without_port() {
+        for env in [Env::Production, Env::Staging] {
+            for host in [
+                "::1",
+                "fc00::1",
+                "fd00::1",
+                "fe80::1",
+                "::ffff:127.0.0.1",
+                "::ffff:10.0.0.1",
+            ] {
+                for suffix in ["", ":443"] {
+                    let endpoint = format!("https://[{host}]{suffix}");
+                    assert_eq!(
+                        endpoint_routable(&endpoint, env),
+                        Err(EndpointReject::NonRoutableHost),
+                        "{endpoint}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routable_rejects_malformed_bracketed_authority() {
+        for endpoint in [
+            "https://[2606:4700:4700::1111",
+            "https://[8.8.8.8]",
+            "https://[::1]extra",
+            "https://[2606:4700:4700::1111]:",
+            "https://[2606:4700:4700::1111]:abc",
+            "https://[2606:4700:4700::1111]:65536",
+            "https://2606:4700:4700::1111]",
+        ] {
+            assert_eq!(
+                endpoint_routable(endpoint, Env::Production),
+                Err(EndpointReject::NonRoutableHost),
+                "{endpoint}"
             );
         }
     }

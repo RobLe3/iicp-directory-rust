@@ -13,14 +13,21 @@ from pathlib import Path
 
 
 TOOL_ONLY_PATHS = frozenset({
+    "qualification/pre1-cases.json",
+    "scripts/pre1_comparative_topology.py",
+    "scripts/pre1_installed_discovery.py",
     "scripts/run_pre1_qualification_case.py",
     "scripts/test_pre1_qualification_case.py",
     "scripts/pre1_harness_binding.py",
     "scripts/pre1_environment_contract.py",
     "scripts/pre1_package_execution.py",
     "scripts/test_pre1_package_execution.py",
+    "scripts/test_pre1_prepared_home.py",
+    "scripts/test_pre1_comparative_topology.py",
+    "scripts/test_pre1_installed_discovery.py",
     "scripts/run_php83_local_ci.py",
     "scripts/test_php83_local_ci.py",
+    "scripts/prepare_pre1_minimum_runtime.py",
 })
 
 
@@ -30,6 +37,26 @@ CI_ONLY_PATHS = frozenset({
     ".github/workflows/quality.yml",
     ".github/workflows/ci.yml",
 })
+
+
+# This is an exact append-only qualification note, not a documentation wildcard.
+# Both the released prefix and the reviewed addition remain immutable here.
+REVIEWED_DOCUMENT_APPENDICES = {
+    "OPERATIONS.md": {
+        "base_sha256": "79602ed2ddc66383fe7777415e9cb125b29134e3bc4a553edce5f3aab796ea45",
+        "append_sha256": "bc0a713ae89a67c8cb244d25edc15c7b6fd384ead6b0c54f4d39e59ffdc0f8b7",
+    },
+}
+
+
+def validate_document_appendix(root: Path, path: str, product: str, harness: str) -> None:
+    expected = REVIEWED_DOCUMENT_APPENDICES[path]
+    before = git(root, "show", f"{product}:{path}")
+    after = git(root, "show", f"{harness}:{path}")
+    if (hashlib.sha256(before).hexdigest() != expected["base_sha256"]
+            or not after.startswith(before)
+            or hashlib.sha256(after[len(before):]).hexdigest() != expected["append_sha256"]):
+        raise ValueError("qualification documentation differs from reviewed append-only note")
 
 
 def git(root: Path, *argv: str) -> bytes:
@@ -75,5 +102,9 @@ def validate_harness_source(
         root, "diff", "--no-renames", "--name-only", "-z",
         product_source_commit, binding["harness_source_commit"], "--"
     ).decode().split("\0")
-    if set(filter(None, changes)) - (TOOL_ONLY_PATHS | CI_ONLY_PATHS):
+    remaining = set(filter(None, changes)) - (TOOL_ONLY_PATHS | CI_ONLY_PATHS)
+    for path in remaining & REVIEWED_DOCUMENT_APPENDICES.keys():
+        validate_document_appendix(root, path, product_source_commit, binding["harness_source_commit"])
+        remaining.remove(path)
+    if remaining:
         raise ValueError("qualification tooling revision changes frozen product source")

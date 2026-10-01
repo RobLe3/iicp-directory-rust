@@ -1,0 +1,6 @@
+{
+  "node_id": "fixture-revoked-registration",
+  "not_after": 1893456000,
+  "operator_pub": "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=",
+  "sig": "ttIeJu8eyv0oHgoe25gmSY01dKfpnyyecs7Ygn2GZafYgraP6jsIKKG3X1/kx9f0ZErIaEwqSs5R9A+PGRlODQ=="
+}

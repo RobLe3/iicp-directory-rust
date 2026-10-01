@@ -58,6 +58,10 @@ class DriverContractTests(unittest.TestCase):
     def test_referenced_test_files_exist(self) -> None:
         commands = [module.SUPPORT_COMMAND, *module.SCENARIO_COMMANDS.values()]
         for command in commands:
+            if command == ["@installed"]:
+                self.assertEqual(module.SCENARIO_COMMANDS["no-dual-authority"], command)
+                self.assertTrue((ROOT / "scripts/pre1_comparative_topology.py").is_file())
+                continue
             assertion = command[-3]
             if "--test" in command:
                 source = ROOT / "tests" / f"{command[command.index('--test') + 1]}.rs"
@@ -276,6 +280,152 @@ class QualityWorkflowBoundaryTests(unittest.TestCase):
         for path in [".github/workflows/release.yml", ".github/workflows/other.yml", "Cargo.lock", "Cargo.toml", "src/lib.rs"]:
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, "frozen product source"):
                 self.check_changes([path])
+
+
+
+# Output handoff regression coverage runs in the existing owning driver gate.
+import json
+import os
+import sys
+import tempfile
+from unittest.mock import Mock, patch
+import pre1_package_execution as adapter
+
+
+class DirectoryOutputTests(unittest.TestCase):
+    def setUp(self):
+        self.contract = json.loads((ROOT / 'parity/behavior-contract-v1.json').read_bytes())
+        self.context = {'component': module.COMPONENT, 'scenario_id': 'cross-flavor-equivalence', 'mode': 'restricted'}
+        self.assertion = module.SCENARIO_CASES['cross-flavor-equivalence']['assertion']
+        self.marker = 'IICP_PRE1_DIRECTORY_ASSERTION_PASS ' + self.assertion
+
+    def values(self):
+        observations = {}
+        for group in ('eligibility_cases', 'ranking_cases', 'pricing_cases'):
+            for case in self.contract[group]:
+                if group == 'pricing_cases': value = case['expected']
+                else:
+                    ids = sorted(case['expected_ids']) if group == 'eligibility_cases' else (
+                        [] if case['requested_model'] == 'missing-model' else ['fixture-http-ranking'])
+                    scores = [0.9 - i / 10 for i in range(len(ids))] if group == 'eligibility_cases' else ([case['expected']] if ids else [])
+                    value = {'eligible_ids': ids, 'recommendation_order': ids, 'scores': scores}
+                observations[group + '/' + case['name']] = value
+        return {row['name']: row['expected'] for row in self.contract['registration_cases']}, {
+            'scope': 'installed-' + module.COMPONENT.removeprefix('directory-') + '-tcp-discovery-and-registration-pricing',
+            'mode': 'restricted', 'fixture_sha256': 'sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f',
+            'qualification_credit': False, 'production_endpoint_validation': False, 'observations': observations}
+
+    def endpoints(self):
+        return {"scope": "installed-" + module.COMPONENT.removeprefix("directory-") + "-tcp-production-endpoints",
+            "mode": "restricted", "fixture_sha256": "sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+            "app_env": "production", "qualification_credit": False, "observations": {
+                "endpoint_cases/" + row["name"]: {"blocked": row["blocked"], "status": 422,
+                    "reason": "IICP-E035" if row["blocked"] else "IICP-E036",
+                    "node_rows": 0, "capability_rows": 0, "availability_rows": 0}
+                for row in self.contract["endpoint_cases"]}}
+
+    def output(self, registration=None, discovery=None):
+        a, b = self.values()
+        return '\n'.join(['IICP_PRE1_REGISTRATION_OBSERVATION ' + json.dumps(a if registration is None else registration),
+            'IICP_PRE1_REGISTRATION_TRANSPORT tcp',
+            'IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION ' + json.dumps(b if discovery is None else discovery),
+            "IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION " + json.dumps(self.endpoints()), self.marker]) + '\n'
+
+    def test_endpoint_records_fail_closed(self):
+        from copy import deepcopy
+        original = self.endpoints()
+        for field, wrong in (("app_env", "testing"), ("qualification_credit", True),
+                             ("mode", "public"), ("fixture_sha256", "sha256:" + "0" * 64)):
+            value = deepcopy(original); value[field] = wrong
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                adapter.validate_directory_endpoint_output(value, self.context, self.contract)
+        for change in ({"status": 201}, {"blocked": 1}, {"node_rows": False},
+                       {"node_rows": 1}, {"reason": "IICP-E035"}):
+            value = deepcopy(original)
+            value["observations"]["endpoint_cases/public_ipv6"].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                adapter.validate_directory_endpoint_output(value, self.context, self.contract)
+        value = deepcopy(original); value["observations"].pop("endpoint_cases/public_ipv6")
+        with self.assertRaises(ValueError): adapter.validate_directory_endpoint_output(value, self.context, self.contract)
+
+    def test_endpoint_marker_required_and_bounded(self):
+        raw = self.output(); line = "IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION " + json.dumps(self.endpoints())
+        for output in (raw.replace(line + "\n", ""), raw.replace(line, line + "\n" + line),
+                       raw.replace(line, line.replace('"app_env": "production"', '"app_env": "production", "app_env": "production"'))):
+            self.assertEqual(self.code(output), 2)
+
+    def code(self, output, code=0):
+        return adapter.directory_output_exit_code(code, output, self.context, self.assertion, ROOT)
+
+    def test_complete_scoped_output_is_accepted(self):
+        self.assertEqual(self.code(self.output()), 0)
+        self.assertEqual(self.code(self.output(), 101), 101)
+
+    def test_marker_only_other_cases_remain_strict(self):
+        context = {**self.context, 'scenario_id': 'credential-missing'}
+        self.assertEqual(adapter.directory_output_exit_code(0, self.marker + '\n', context, self.assertion, ROOT), 0)
+        self.assertEqual(adapter.directory_output_exit_code(0, self.output(), context, self.assertion, ROOT), 2)
+        self.assertEqual(adapter.directory_output_exit_code(0, self.marker + '\nnoise\n', context, self.assertion, ROOT), 2)
+
+    def test_unknown_missing_duplicate_reordered_and_failed_markers_rejected(self):
+        raw = self.output(); rows = raw.splitlines()
+        for output in (self.marker, raw + self.marker, raw + 'noise\n', '\n'.join(rows[:-1]),
+                       '\n'.join([rows[1], rows[0], *rows[2:]]), raw.replace(self.marker, 'FAIL'),
+                       raw.replace('TRANSPORT tcp', 'TRANSPORT http-kernel'), 'x' * 1048577):
+            with self.subTest(output=output[:70]): self.assertEqual(self.code(output), 2)
+
+    def test_registration_boolean_partial_or_wrong_rollback_rejected(self):
+        for field, value in (('node_rows', True), ('node_rows', 2), ('recovered', False)):
+            a, b = self.values(); a['recovery_replaces_relations'][field] = value
+            self.assertEqual(self.code(self.output(a, b)), 2)
+        a, b = self.values(); a['revoked_operator_rolls_back']['capability_rows'] = 1
+        self.assertEqual(self.code(self.output(a, b)), 2)
+
+    def test_discovery_identity_coverage_credit_and_transport_scope_rejected(self):
+        for field, value in (('mode', 'public'), ('scope', 'other'), ('fixture_sha256', 'sha256:' + 'a' * 64),
+                             ('qualification_credit', True), ('production_endpoint_validation', True)):
+            a, b = self.values(); b[field] = value
+            self.assertEqual(self.code(self.output(a, b)), 2)
+        a, b = self.values(); b['observations'].pop(next(iter(b['observations'])))
+        self.assertEqual(self.code(self.output(a, b)), 2)
+
+    def test_wrong_pricing_rank_and_eligibility_rejected(self):
+        for group in ('pricing_cases', 'ranking_cases', 'eligibility_cases'):
+            a, b = self.values(); key = next(k for k in b['observations'] if k.startswith(group))
+            if group == 'pricing_cases': b['observations'][key] = True
+            elif group == 'ranking_cases': b['observations'][key]['scores'] = [0.111]
+            else: b['observations'][key]['eligible_ids'] = []
+            self.assertEqual(self.code(self.output(a, b)), 2)
+
+    def test_duplicate_json_nonfinite_and_malformed_rejected(self):
+        raw = self.output()
+        for output in (raw.replace('"mode": "restricted"', '"mode": "restricted", "mode": "restricted"'),
+                       raw.replace('"node_rows": 1', '"node_rows": NaN'),
+                       raw.replace('"node_rows": 1', '"node_rows": 1e999'),
+                       raw.replace('"node_rows": 1', '"node_rows": invalid')):
+            self.assertEqual(self.code(output), 2)
+
+    def test_stale_fixture_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); (root/'parity').mkdir(); (root/'parity/behavior-contract-v1.json').write_text('{}')
+            self.assertEqual(adapter.directory_output_exit_code(0, self.output(), self.context, self.assertion, root), 2)
+
+    def test_main_writes_real_handoff_result_into_existing_proof(self):
+        for output, child_code, expected in ((self.output(), 0, 0), (self.marker, 0, 2), (self.output(), 101, 101)):
+            component = {'id': module.COMPONENT}; manifest = {'components': [component]}
+            proof = {'value': {'fixture': True}, 'artifact': Path('/fixture/artifact')}
+            with patch.object(sys, 'argv', ['driver', '--cell', 'fixture', '--scenario', 'cross-flavor-equivalence', '--evidence-mode', 'digest-only']), \
+                 patch.dict(os.environ, {'IICP_PRE1_ARTIFACT_ROOT': '/fixture', 'IICP_PRE1_RUN_ID': 'unit-run'}), \
+                 patch.object(module, 'validate_context', return_value=('fixture', {}, manifest, self.context)), \
+                 patch.object(module, 'validate_runtime'), patch.object(module, 'command_environment', return_value={}), \
+                 patch.object(module, 'package_command', return_value=(['fixture'], {}, ROOT, proof)), \
+                 patch.object(module.subprocess, 'run', return_value=Mock(returncode=child_code, stdout=output)), \
+                 patch.object(module, 'validate_binding'), patch.object(module, 'make_case_proof') as make, \
+                 patch.object(module, 'write_case_proof') as write, patch('builtins.print'):
+                self.assertEqual(module.main(), expected)
+                self.assertEqual(make.call_args.args[3], expected)
+                write.assert_called_once_with(make.return_value)
+
 
 
 if __name__ == "__main__":

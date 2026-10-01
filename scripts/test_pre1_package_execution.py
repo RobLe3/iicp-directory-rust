@@ -14,9 +14,706 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pre1_package_execution as adapter
+import prepare_pre1_minimum_runtime as minimum_runtime
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def test_discovery_scenario_uses_installed_scoped_listener_and_always_resets(self):
+        from unittest.mock import Mock
+        import pre1_installed_discovery as discovery
+        ns = self.directory_http_functions()
+        (self.workspace / "directory-discovery.py").write_bytes(Path(discovery.__file__).read_bytes())
+        contract, _, _, _ = self.registration_fixture_inputs()
+        (self.workspace / "directory-support-behavior.json").write_bytes(contract)
+        raw, scoped = Mock(), Mock()
+        for failure in (False, True):
+            ns["reset_directory_database"] = reset = Mock()
+            ns["directory_fixture_sql"] = sql = Mock()
+            ns["restricted_membership_command"] = membership = Mock()
+            expected = {"fixture": "actual-observation"}
+            def inspect(request, raw_request, query, issue, actual_contract, mode):
+                self.assertIs(request, scoped); self.assertIs(raw_request, raw)
+                self.assertEqual(mode, "restricted")
+                self.assertEqual(actual_contract, json.loads(contract))
+                query("SELECT fixture"); issue("fixture-node")
+                if failure: raise ValueError("discovery failure")
+                return expected
+            def execute(binary, env, scenario, version, **kwargs):
+                self.assertIs(kwargs["database"], True)
+                self.assertEqual(kwargs["request_timeout"], 10)
+                kwargs["postcondition"](raw, scoped, binary, env)
+            ns["rust_http_case"] = Mock(side_effect=execute)
+            # The prepared module is imported from bound fixture bytes, not a
+            # host-global copy or an implementation-policy expectation.
+            payload = (self.workspace / "directory-discovery.py").read_text()
+            payload += "\nobserve = __import__('builtins')._pre1_test_observe\n"
+            (self.workspace / "directory-discovery.py").write_text(payload)
+            previous = Path.cwd()
+            try:
+                os.chdir(self.workspace)
+                import builtins
+                with patch.object(builtins, "_pre1_test_observe", inspect, create=True):
+                    if failure:
+                        with self.assertRaisesRegex(ValueError, "discovery failure"):
+                            ns["discovery_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16", "restricted")
+                    else:
+                        self.assertEqual(ns["discovery_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16", "restricted"), expected)
+            finally:
+                os.chdir(previous)
+                (self.workspace / "directory-discovery.py").write_bytes(Path(discovery.__file__).read_bytes())
+            self.assertEqual(reset.call_count, 2)
+            sql.assert_called_once_with({}, "SELECT fixture")
+            membership.assert_called_once_with(Path("/installed/binary"), {}, "issue", "fixture-node", "registration", "node")
+
+    def test_sql_failure_retention_is_private_bounded_and_redacted(self):
+        ns = self.directory_http_functions()
+        with patch.dict(os.environ, {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home)}):
+            ns["retain_sql_failure"](b"ERROR synthetic-password " + b"x" * 70000, "synthetic-password")
+        logs = list(self.home.glob("directory-sql-failure-*.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertNotIn(b"synthetic-password", logs[0].read_bytes())
+        self.assertIn(b"[REDACTED]", logs[0].read_bytes())
+        self.assertLessEqual(logs[0].stat().st_size, 65536)
+        self.assertEqual(logs[0].stat().st_mode & 0o777, 0o600)
+
+    def test_registration_scenario_uses_authenticated_request_and_always_resets_database(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        contract, delegation, _, _ = self.registration_fixture_inputs()
+        (self.workspace / "directory-support-behavior.json").write_bytes(contract)
+        (self.workspace / "directory-registration-delegation.json").write_text(json.dumps(delegation))
+        expected = {row["name"]: row["expected"] for row in json.loads(contract)["registration_cases"]}
+        raw, scoped = Mock(), Mock()
+        for failure in (False, True):
+            ns["reset_directory_database"] = reset = Mock()
+            ns["directory_fixture_sql"] = sql = Mock()
+            ns["registration_fixture_postcondition"] = observe = Mock(
+                side_effect=ValueError("registration failure") if failure else None,
+                return_value=expected)
+            def execute(binary, env, scenario, version, **kwargs):
+                self.assertIs(kwargs["database"], True)
+                self.assertEqual(kwargs["request_timeout"], 10)
+                kwargs["postcondition"](raw, scoped, binary, env)
+            ns["rust_http_case"] = Mock(side_effect=execute)
+            previous = Path.cwd()
+            try:
+                os.chdir(self.workspace)
+                if failure:
+                    with self.assertRaisesRegex(ValueError, "registration failure"):
+                        ns["registration_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16")
+                else:
+                    self.assertEqual(ns["registration_scenario_postcondition"](Path("/installed/binary"), {}, "0.1.16"), expected)
+            finally:
+                os.chdir(previous)
+            self.assertEqual(reset.call_count, 2)
+            self.assertIs(observe.call_args.args[0], scoped)
+            self.assertIsNot(observe.call_args.args[0], raw)
+            observe.call_args.args[1]("SELECT fixture")
+            sql.assert_called_once_with({}, "SELECT fixture")
+
+    def test_http_request_budget_is_bounded_before_launch(self):
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = check = __import__("unittest.mock", fromlist=["Mock"]).Mock()
+        for value in (True, False, 0, -1, 11, float("nan"), float("inf"), "10"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "request budget"):
+                ns["rust_http_case"](Path("/binary"), {}, "credential-missing", "0.1.16", request_timeout=value)
+        check.assert_not_called()
+
+    def registration_fixture_inputs(self):
+        import time
+        contract = (Path(__file__).resolve().parents[1] / "parity/behavior-contract-v1.json").read_bytes()
+        delegation = {"node_id": "fixture-revoked-registration", "operator_pub": "A" * 43 + "=",
+            "not_after": int(time.time()) + 3600, "sig": "A" * 86 + "=="}
+        responses = [(201, {"node_id": "fixture-recovery-registration", "node_token": "synthetic"}),
+            (201, {"node_id": "fixture-recovery-registration", "recovered": True}),
+            (201, {"node_id": "fixture-revoked-registration"}),
+            (422, {"error": {"code": "validation_error", "message": "operator delegation references an inactive identity"}})]
+        sql = [b"0\t0\t0\n", b"1\t1\t1\n", b'["model-b"]\n', b"09:00\n", b"", b"1\n", b"", b"", b"revoked\n", b"0\t0\t0\n"]
+        return contract, delegation, responses, sql
+
+    def test_registration_fixture_observes_http_and_persisted_relations(self):
+        from unittest.mock import Mock
+        contract, delegation, responses, sql = self.registration_fixture_inputs()
+        request, oracle = Mock(side_effect=responses), Mock(side_effect=sql)
+        observed = self.directory_http_functions()["registration_fixture_postcondition"](request, oracle, contract, delegation)
+        self.assertEqual(observed, {row["name"]: row["expected"] for row in json.loads(contract)["registration_cases"]})
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_args_list[1].args[1]["current_node_token"], "synthetic")
+        self.assertIn("operator_verified", oracle.call_args_list[5].args[0])
+        self.assertIn("CAST(operator_pubkey AS BINARY)", oracle.call_args_list[5].args[0])
+        self.assertNotIn("CONVERT", oracle.call_args_list[5].args[0])
+        self.assertEqual(request.call_args_list[2].args[1], request.call_args_list[3].args[1])
+
+    def test_registration_fixture_rejects_wrong_recovery_and_rollback(self):
+        from unittest.mock import Mock
+        for failure in ("rows", "models", "window", "recovered", "identity", "unverified", "revocation", "wrong-refusal", "partial-rollback"):
+            contract, delegation, responses, sql = self.registration_fixture_inputs()
+            if failure == "rows": sql[1] = b"1\t2\t1\n"
+            if failure == "models": sql[2] = b'["model-a"]\n'
+            if failure == "window": sql[3] = b"08:00\n"
+            if failure == "recovered": responses[1][1]["recovered"] = 1
+            if failure == "identity": responses[1][1]["node_id"] = "different"
+            if failure == "unverified": sql[5] = b"0\n"
+            if failure == "revocation": sql[8] = b"active\n"
+            if failure == "wrong-refusal": responses[3][1]["error"]["message"] = "bad signature"
+            if failure == "partial-rollback": sql[9] = b"0\t1\t0\n"
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                self.directory_http_functions()["registration_fixture_postcondition"](Mock(side_effect=responses), Mock(side_effect=sql), contract, delegation)
+
+    def test_registration_fixture_rejects_unbound_inputs_and_nonempty_database(self):
+        from unittest.mock import Mock
+        for failure in ("fixture", "expired", "node-id", "sql-pubkey", "sig", "extra", "nonempty", "malformed-counts"):
+            contract, delegation, responses, sql = self.registration_fixture_inputs()
+            if failure == "fixture": contract += b" "
+            if failure == "expired": delegation["not_after"] = 0
+            if failure == "node-id": delegation["node_id"] = "other"
+            if failure == "sql-pubkey": delegation["operator_pub"] = "'; DROP TABLE nodes; --"
+            if failure == "sig": delegation["sig"] = "bad"
+            if failure == "extra": delegation["extra"] = True
+            if failure == "nonempty": sql[0] = b"1\t0\t0\n"
+            if failure == "malformed-counts": sql[0] = b"0\t0\n"
+            request = Mock(side_effect=responses)
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                self.directory_http_functions()["registration_fixture_postcondition"](request, Mock(side_effect=sql), contract, delegation)
+            request.assert_not_called()
+
+    def rollback_fixture(self):
+        binary = self.workspace / "predecessor-input"
+        binary.write_bytes(b"\x7fELF\x02\x01" + b"\x00" * 12 + (183).to_bytes(2, "little"))
+        crate = self.workspace / "crate-input"
+        crate.write_bytes(b"pinned test crate")
+        manifest = self.workspace / "release-input"
+        manifest.write_text("{}")
+        receipt = self.workspace / "build-input"
+        receipt.write_text(json.dumps({"schema": "iicp.pre1-directory-predecessor-build.v1",
+            "status": "PASS", "source_commit": minimum_runtime.PREDECESSOR_COMMIT,
+            "version": "0.1.15", "target": "linux-aarch64",
+            "binary_sha256": adapter.file_digest(binary), "execution_kind": "container_native",
+            "network": "none", "qualification_credit": False, "non_authorizing": True,
+            "uid": 501, "rust_version": "1.88.0"}))
+        identity = {"source_version": "0.1.15", "source_commit": minimum_runtime.PREDECESSOR_COMMIT,
+            "crate_sha256": adapter.file_digest(crate), "release_manifest_sha256": adapter.file_digest(manifest),
+            "qualification_credit": False, "non_authorizing": True}
+        fixture = self.workspace / "directory-rollback-fixture"
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            minimum_runtime.prepare_rollback_fixture(crate, manifest, binary, receipt, fixture, "linux-aarch64")
+        return fixture, identity
+
+    def test_rollback_fixture_binding_and_successor_scope(self):
+        fixture, identity = self.rollback_fixture()
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            deps = adapter.directory_rollback_dependencies(self.workspace, "linux-aarch64")
+            self.assertIn("rollback-fixture", deps)
+            env = adapter.directory_rollback_environment(self.workspace, {"target": "linux-aarch64"}, "0.1.16", {})
+            self.assertEqual(env["IICP_PRE1_ROLLBACK_PREDECESSOR"], str(fixture / "predecessor"))
+            with self.assertRaises(ValueError):
+                adapter.directory_rollback_environment(self.workspace, {"target": "linux-aarch64"}, "0.1.15", {})
+            with self.assertRaises(ValueError):
+                minimum_runtime.validate_rollback_fixture(fixture, "linux-x86_64")
+
+    def test_rollback_missing_fixture_fails_before_execution(self):
+        self.assertEqual(adapter.directory_rollback_dependencies(self.workspace, "linux-aarch64"), {})
+        with self.assertRaises(ValueError):
+            adapter.directory_rollback_environment(self.workspace, {"target": "linux-aarch64"}, "0.1.16", {})
+
+    def test_rollback_fixture_rejects_modified_inputs(self):
+        fixture, identity = self.rollback_fixture()
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            for name in minimum_runtime.ROLLBACK_FILES:
+                path = fixture / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"corruption")
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+                path.write_bytes(original)
+            (fixture / "extra").write_text("unexpected")
+            with self.assertRaises(ValueError):
+                minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+
+    def test_rollback_rehashed_fixture_cannot_relabel_build(self):
+        fixture, identity = self.rollback_fixture()
+        receipt = fixture / "build-receipt.json"
+        value = json.loads(receipt.read_text())
+        value["source_commit"] = "0" * 40
+        receipt.write_text(json.dumps(value))
+        manifest = fixture / "fixture.json"
+        value = json.loads(manifest.read_text())
+        value["files"]["build-receipt.json"] = adapter.file_digest(receipt)
+        value.pop("fixture_sha256")
+        value["fixture_sha256"] = adapter.digest(value)
+        manifest.write_text(json.dumps(value))
+        with patch.object(minimum_runtime, "predecessor_identity", return_value=identity):
+            with self.assertRaisesRegex(ValueError, "build binding"):
+                minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+
+    def test_rollback_malformed_manifest_fails_cleanly(self):
+        fixture, identity = self.rollback_fixture()
+        (fixture / "fixture.json").write_text("[]")
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            minimum_runtime.validate_rollback_fixture(fixture, "linux-aarch64")
+
+    def exercise_rollback(self, failure):
+        import hashlib
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        predecessor = self.workspace / "previous"
+        predecessor.write_bytes(b"native predecessor fixture")
+        phases = []
+        def http(executable, env, scenario, version, **kwargs):
+            phases.append((scenario, version, executable.resolve()))
+            def request(path, body=None, headers=None):
+                if body is not None:
+                    return 201, {"node_id": "fixture-rollback", "node_token": "synthetic"}
+                return 200, {"node_id": "fixture-rollback"}
+            kwargs["postcondition"](request, request, executable, env)
+        def failed_upgrade(argv, **kwargs):
+            kwargs["stdout"].write(b"arbitrary crash" if failure == "wrong-cause"
+                else b"FATAL: DATABASE_URL is required; ephemeral memory requires non-production APP_ENV and IICP_ALLOW_IN_MEMORY=true")
+            kwargs["stdout"].flush()
+            return SimpleNamespace(returncode=1)
+        ns["private_case_home"] = Mock(return_value=self.home)
+        ns["reset_directory_database"] = Mock()
+        ns["rust_http_case"] = http
+        ns["directory_database_state"] = Mock(side_effect=["original", "changed"]
+            if failure == "changed-state" else None, return_value="original")
+        with patch.object(subprocess, "check_output", return_value="iicp-directory-rs 0.1.15\n"), \
+                patch.object(subprocess, "run", side_effect=failed_upgrade):
+            args = (self.workspace / "candidate", {"HOME": str(self.home)}, "0.1.16",
+                    predecessor, "sha256:" + hashlib.sha256(predecessor.read_bytes()).hexdigest())
+            if failure:
+                with self.assertRaisesRegex(ValueError, "cause differs" if failure == "wrong-cause"
+                        else "startup changed persistent state"):
+                    ns["rollback_postcondition"](*args)
+            else:
+                ns["rollback_postcondition"](*args)
+                self.assertEqual([p[:2] for p in phases], [("rollback-seed", "0.1.15"),
+                    ("rollback-upgrade", "0.1.16"), ("rollback-restart", "0.1.15")])
+                self.assertEqual(phases[0][2], predecessor.resolve())
+                self.assertEqual(phases[2][2], predecessor.resolve())
+        self.assertEqual(ns["reset_directory_database"].call_count, 2)
+
+    def test_rollback_accounts_discovery_without_ignoring_other_state(self):
+        ns = self.directory_http_functions()
+        def row(count, mode="legacy_dispatch"):
+            return b"\t".join(value.encode().hex().encode() for value in
+                ("1", "2026-09-27", mode, str(count), "2026-09-27 00:00:00", "2026-09-27 00:00:01")) + b"\n"
+        before = {"schema": b"exact-schema", "rows": {"nodes": b"exact-node", "dispatch_usage_daily": row(1)}}
+        after = copy.deepcopy(before)
+        after["rows"]["dispatch_usage_daily"] = row(2)
+        ns["rollback_request_state"](before, after, 1)
+        ns["rollback_request_state"](before, before, 0)
+        for bad in ("schema", "node", "extra-count", "denied-count", "mode"):
+            value = copy.deepcopy(after)
+            if bad == "schema": value["schema"] = b"changed"
+            if bad == "node": value["rows"]["nodes"] = b"changed"
+            if bad == "extra-count": value["rows"]["dispatch_usage_daily"] = row(3)
+            if bad == "mode": value["rows"]["dispatch_usage_daily"] = row(2, "ticketed_dispatch")
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ns["rollback_request_state"](before, value, 0 if bad == "denied-count" else 1)
+
+    def test_rollback_preserves_lifecycle(self):
+        self.exercise_rollback(None)
+
+    def test_rollback_rejects_wrong_failure_cause(self):
+        self.exercise_rollback("wrong-cause")
+
+    def test_rollback_rejects_changed_state(self):
+        self.exercise_rollback("changed-state")
+
+    def test_rollback_rejects_changed_predecessor_before_launch(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        predecessor = self.workspace / "previous"
+        predecessor.write_bytes(b"changed")
+        ns["rust_http_case"] = Mock()
+        with self.assertRaisesRegex(ValueError, "predecessor binding differs"):
+            ns["rollback_postcondition"](self.workspace / "candidate", {}, "0.1.15",
+                                         predecessor, "sha256:" + "a" * 64)
+        ns["rust_http_case"].assert_not_called()
+
+    def test_predecessor_rejects_unpinned_assets_before_extraction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            crate, manifest = root / "old.crate", root / "release.json"
+            crate.write_bytes(b"not the published crate")
+            manifest.write_text("{}")
+            with patch.object(minimum_runtime.tarfile, "open") as extract:
+                with self.assertRaisesRegex(ValueError, "published asset identity"):
+                    minimum_runtime.predecessor_identity(crate, manifest)
+                extract.assert_not_called()
+
+    def test_predecessor_requires_release_and_embedded_source_agreement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            crate, manifest = root / "old.crate", root / "release.json"
+            value = {"schema": "iicp.directory-rust-release.v1", "version": "0.1.15",
+                     "commit": minimum_runtime.PREDECESSOR_COMMIT,
+                     "crate_sha256": minimum_runtime.PREDECESSOR_CRATE_SHA256,
+                     "production_authority": False, "genesis_cutover_authorized": False}
+            for commit in (minimum_runtime.PREDECESSOR_COMMIT, "0" * 40):
+                raw = json.dumps({"git": {"sha1": commit}, "path_in_vcs": ""}).encode()
+                with tarfile.open(crate, "w:gz") as archive:
+                    member = tarfile.TarInfo("iicp-directory-rs-0.1.15/.cargo_vcs_info.json")
+                    member.size = len(raw)
+                    archive.addfile(member, io.BytesIO(raw))
+                manifest.write_text(json.dumps(value))
+                with patch.object(minimum_runtime.common, "file_sha256", side_effect=lambda path:
+                        "sha256:" + (minimum_runtime.PREDECESSOR_CRATE_SHA256 if path == crate
+                                     else minimum_runtime.PREDECESSOR_MANIFEST_SHA256)):
+                    if commit == minimum_runtime.PREDECESSOR_COMMIT:
+                        result = minimum_runtime.predecessor_identity(crate, manifest)
+                        self.assertFalse(result["qualification_credit"])
+                        self.assertTrue(result["non_authorizing"])
+                    else:
+                        with self.assertRaisesRegex(ValueError, "source provenance differs"):
+                            minimum_runtime.predecessor_identity(crate, manifest)
+
+    def test_predecessor_identity_is_not_the_candidate_identity(self):
+        self.assertEqual(minimum_runtime.PREDECESSOR_VERSION, "0.1.15")
+        self.assertEqual(minimum_runtime.PREDECESSOR_COMMIT,
+                         "4e8ef1fa9d03861ee5bd58584ef04a5a0bb3c0c1")
+        self.assertNotEqual(minimum_runtime.PREDECESSOR_COMMIT,
+                            "ce77bfb7c601cca98b71234cc886c833b33978f2")
+
+    def test_harness_documentation_exception_preserves_released_bytes(self):
+        import hashlib
+        import pre1_harness_binding as harness
+        before, appendix = b"released requirements\n", b"\nqualification diagnosis\n"
+        expected = {"base_sha256": hashlib.sha256(before).hexdigest(),
+                    "append_sha256": hashlib.sha256(appendix).hexdigest()}
+        with patch.dict(harness.REVIEWED_DOCUMENT_APPENDICES, {"OPERATIONS.md": expected}, clear=True):
+            for content in (before + appendix, b"changed\n" + appendix,
+                            before + appendix + b"unreviewed", before):
+                with self.subTest(content=content), patch.object(harness, "git", side_effect=[before, content]):
+                    if content == before + appendix:
+                        harness.validate_document_appendix(Path("/fixture"), "OPERATIONS.md", "base", "head")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "reviewed append-only"):
+                            harness.validate_document_appendix(Path("/fixture"), "OPERATIONS.md", "base", "head")
+
+    def test_harness_documentation_exception_is_not_a_document_wildcard(self):
+        import pre1_harness_binding as harness
+        self.assertEqual(set(harness.REVIEWED_DOCUMENT_APPENDICES), {"OPERATIONS.md"})
+        self.assertNotIn("OPERATIONS.md", harness.TOOL_ONLY_PATHS | harness.CI_ONLY_PATHS)
+        self.assertIn("scripts/prepare_pre1_minimum_runtime.py", harness.TOOL_ONLY_PATHS)
+        self.assertNotIn("scripts/prepare_pre1_unreviewed.py", harness.TOOL_ONLY_PATHS)
+
+    def test_runtime_dependencies_are_optional_but_partial_fixtures_fail(self):
+        self.assertEqual(adapter.directory_runtime_dependencies(self.workspace, self.bindings), {})
+        (self.workspace / "directory-runtime-fixture").mkdir()
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            adapter.directory_runtime_dependencies(self.workspace, self.bindings)
+
+    def test_minimum_runtime_fixture_stages_and_hashes_exact_owning_tools(self):
+        scripts = self.root / "scripts"; scripts.mkdir()
+        names = ("prepare_pre1_minimum_runtime.py", "pre1_package_execution.py", "pre1_artifact_common.py")
+        for name in names:
+            (scripts / name).write_text("# bound owning tool: " + name)
+        with patch.object(adapter, "directory_payload", return_value=({}, {})), \
+                patch.object(adapter, "directory_fixtures", return_value={}), \
+                patch.object(adapter, "directory_database_dependencies", return_value={}), \
+                patch.object(adapter, "directory_runtime_dependencies", return_value={"runtime-fixture": "sha256:" + "b" * 64}):
+            value = adapter.create_directory_binding(self.root, self.workspace, self.installed, self.artifact,
+                "directory-rust", "msrv-1.88", "linux-aarch64", self.bindings)
+            for name in names:
+                self.assertEqual((self.workspace / "directory-runtime-tools" / name).read_bytes(),
+                    (scripts / name).read_bytes())
+            (self.workspace / "directory-runtime-tools" / names[0]).write_text("tampered")
+            with self.assertRaisesRegex(ValueError, "fixtures changed"):
+                adapter.create_directory_binding(self.root, self.workspace, self.installed, self.artifact,
+                    "directory-rust", "msrv-1.88", "linux-aarch64", self.bindings, stage_fixtures=False)
+
+    def test_runtime_dependency_candidate_must_match_installed_binding(self):
+        candidate = self.workspace / "directory-runtime-candidate.json"
+        candidate.write_text(json.dumps({"manifest_sha256": self.bindings["candidate_manifest_sha256"]}))
+        with patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "b" * 64}):
+            deps = adapter.directory_runtime_dependencies(self.workspace, self.bindings)
+            self.assertEqual(deps["runtime-candidate"], adapter.file_digest(candidate))
+            candidate.write_text(json.dumps({"manifest_sha256": "sha256:" + "c" * 64}))
+            with self.assertRaisesRegex(ValueError, "candidate differs"):
+                adapter.directory_runtime_dependencies(self.workspace, self.bindings)
+
+    def test_minimum_runtime_never_falls_back_without_source_fixture(self):
+        with self.assertRaisesRegex(ValueError, "pinned frozen-source fixture"):
+            adapter.directory_minimum_runtime_environment(self.workspace, self.context, {})
+
+    def test_minimum_runtime_requires_bound_map_and_separate_build_storage(self):
+        path = self.home / "runtime-map.json"
+        context = {**self.context, "runtime": "msrv-1.88", "target": "linux-aarch64"}
+        value = {"target": context["target"], "map_sha256": context["runtime_map_sha256"],
+            "runtimes": {context["runtime"]: {"programs": {"cargo": "/tool/cargo", "rustc": "/tool/rustc"}}}}
+        path.write_text(json.dumps(value))
+        case_home = self.home / "case-home"; case_home.mkdir()
+        env = {"IICP_PRE1_RUNTIME_MAP": str(path), "IICP_PRE1_RUN_ROOT": str(self.home),
+               "IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home), "HOME": str(case_home)}
+        with patch.object(adapter, "directory_runtime_dependencies", return_value={"runtime-fixture": "sha256:" + "b" * 64}), \
+                patch.object(minimum_runtime, "executable") as executable:
+            selected = adapter.directory_minimum_runtime_environment(self.workspace, context, env)
+            self.assertEqual(selected["IICP_PRE1_DIRECTORY_CARGO"], "/tool/cargo")
+            self.assertEqual(selected["IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT"], str(self.home))
+            self.assertEqual(executable.call_count, 2)
+            with self.assertRaisesRegex(ValueError, "mutate prepared inputs"):
+                adapter.directory_minimum_runtime_environment(self.workspace, context,
+                    {**env, "IICP_PRE1_RUN_ROOT": str(self.workspace)})
+            for key in ("target", "map_sha256"):
+                path.write_text(json.dumps({**value, key: "wrong"}))
+                with self.assertRaisesRegex(ValueError, "runtime map binding"):
+                    adapter.directory_minimum_runtime_environment(self.workspace, context, env)
+
+    def test_runtime_evidence_is_retained_privately_and_never_overwritten(self):
+        ns = self.directory_http_functions()
+        output = self.workspace / "runtime-output"; output.mkdir()
+        (output / "result.json").write_text('{"status":"FAIL"}')
+        (output / "build.log").write_text("compiler failure")
+        env = {"HOME": str(self.home)}
+        ns["context"] = {"mode": "fixture"}
+        with patch.dict(os.environ, {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home)}):
+            ns["retain_runtime_evidence"](minimum_runtime, output, env)
+        retained = next(self.home.glob("directory-runtime-*"))
+        for name in ("result.json", "build.log"):
+            dest = retained / name
+            self.assertEqual(dest.read_bytes(), (output / name).read_bytes())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o600)
+        with patch.dict(os.environ, {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home)}):
+            ns["retain_runtime_evidence"](minimum_runtime, output, env)
+        self.assertEqual(len(list(self.home.glob("directory-runtime-*"))), 2)
+
+    def test_runtime_build_budget_cannot_escape_reviewed_deadline(self):
+        with self.assertRaisesRegex(ValueError, "execution budgets"):
+            minimum_runtime.verify(self.workspace, self.workspace, self.workspace,
+                Path("/cargo"), Path("/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64,
+                build_timeout=9999)
+
+    def test_minimum_runtime_requires_source_build_and_real_installed_postcondition(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        cache = self.home / "build-cache"; cache.mkdir()
+        ns = self.directory_http_functions()
+        ns.update(sys=sys, context={"runtime": "msrv-1.88", "target": "linux-aarch64", "mode": "local-only"})
+        ns["private_case_home"] = Mock(return_value=self.home)
+        ns["rust_http_case"] = Mock()
+        ns["subprocess"] = Mock(check_output=Mock(return_value="iicp-directory-rs 0.1.15\n"))
+        env = {"HOME": str(self.home)}
+        values = {"IICP_PRE1_CASE_EVIDENCE_ROOT": str(self.home), "IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT": str(cache),
+            "IICP_PRE1_DIRECTORY_CARGO": "/tool/cargo", "IICP_PRE1_DIRECTORY_RUSTC": "/tool/rustc",
+            "IICP_PRE1_DIRECTORY_RUNTIME_FIXTURE_SHA256": "sha256:" + "a" * 64}
+        def verify(*args, **kwargs):
+            self.assertEqual(kwargs["build_timeout"], 150)
+            self.assertFalse(args[2].is_relative_to(args[0]))
+            return {"status": "PASS", "qualification_credit": False}
+        helper = SimpleNamespace(packages=adapter, verify=Mock(side_effect=verify))
+        with patch.dict(os.environ, values), patch("importlib.import_module", return_value=helper):
+            ns["minimum_runtime_postcondition"](Path("/installed/iicp-directory-rs"), env, "0.1.15")
+            ns["rust_http_case"].assert_called_once_with(Path("/installed/iicp-directory-rs"), env,
+                "credential-missing", "0.1.15", database=False)
+            ns["rust_http_case"].reset_mock()
+            helper.verify.side_effect = ValueError("offline compiler failure")
+            with self.assertRaisesRegex(ValueError, "compiler failure"):
+                ns["minimum_runtime_postcondition"](Path("/installed/iicp-directory-rs"), env, "0.1.15")
+            ns["rust_http_case"].assert_not_called()
+            helper.verify.side_effect = verify
+            ns["subprocess"].check_output.return_value = "iicp-directory-rs 9.9.9\n"
+            with self.assertRaisesRegex(ValueError, "installed minimum-runtime"):
+                ns["minimum_runtime_postcondition"](Path("/installed/iicp-directory-rs"), env, "0.1.15")
+            ns["rust_http_case"].assert_not_called()
+        self.assertFalse(list(cache.iterdir()))
+
+    def test_runtime_source_rejects_archive_escapes_links_and_missing_lock(self):
+        for bad in ("../escape", "symlink", "hardlink", "missing-lock", "duplicate"):
+            raw = io.BytesIO()
+            with tarfile.open(fileobj=raw, mode="w") as archive:
+                for name in ("Cargo.toml", "Cargo.lock", "src/main.rs"):
+                    if bad == "missing-lock" and name == "Cargo.lock":
+                        continue
+                    member = tarfile.TarInfo(name); member.size = 1
+                    archive.addfile(member, io.BytesIO(b"x"))
+                if bad != "missing-lock":
+                    member = tarfile.TarInfo("Cargo.lock" if bad == "duplicate" else bad)
+                    member.size = 1
+                    if bad in {"symlink", "hardlink"}:
+                        member.type = tarfile.SYMTYPE if bad == "symlink" else tarfile.LNKTYPE
+                        member.linkname = "/outside"
+                    archive.addfile(member, io.BytesIO(b"x"))
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                minimum_runtime.extract_source(raw.getvalue(), self.workspace / "source-rejected")
+            self.assertFalse((self.workspace / "source-rejected").exists())
+
+    def test_runtime_fixture_binds_candidate_source_and_all_vendor_bytes(self):
+        fixture = self.workspace / "runtime-fixture"; fixture.mkdir()
+        for name in ("source", "vendor"):
+            (fixture / name).mkdir(); (fixture / name / "fixture").write_text("bound")
+        identity = {"candidate_file_sha256": "sha256:" + "a" * 64,
+                    "source_commit": "b" * 40, "source_version": "0.1.15"}
+        value = {"schema": minimum_runtime.SCHEMA, **identity,
+                 "files": minimum_runtime.fixture_tree(fixture),
+                 "qualification_credit": False, "non_authorizing": True}
+        value["fixture_sha256"] = adapter.digest(value)
+        manifest = fixture / "fixture.json"; manifest.write_text(json.dumps(value))
+        with patch.object(minimum_runtime, "candidate_identity", return_value=identity):
+            self.assertEqual(minimum_runtime.validate_fixture(fixture, self.workspace / "candidate"), value)
+            for name in ("source", "vendor"):
+                (fixture / name / "fixture").write_text("tampered")
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    minimum_runtime.validate_fixture(fixture, self.workspace / "candidate")
+                (fixture / name / "fixture").write_text("bound")
+            altered = {**identity, "source_commit": "c" * 40}
+            with patch.object(minimum_runtime, "candidate_identity", return_value=altered), self.assertRaises(ValueError):
+                minimum_runtime.validate_fixture(fixture, self.workspace / "candidate")
+
+    def test_runtime_probe_rejects_recomputed_fixture_with_wrong_external_pin(self):
+        with patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "b" * 64}), \
+                patch.object(minimum_runtime.subprocess, "run") as build, self.assertRaises(ValueError):
+            minimum_runtime.verify(self.workspace, self.workspace / "candidate", self.workspace / "output",
+                Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+        build.assert_not_called()
+
+    def test_runtime_candidate_requires_frozen_unique_pre1_source_identity(self):
+        candidate = self.workspace / "runtime-candidate.json"
+        baseline = {"status": "FROZEN", "immutable": True, "non_authorizing": True,
+                    "components": [{"id": "directory-rust", "source_commit": "a" * 40,
+                                    "source_version": "0.1.15"}]}
+        candidate.write_text(json.dumps(baseline))
+        self.assertEqual(minimum_runtime.candidate_identity(candidate)["source_commit"], "a" * 40)
+        for bad in ({**baseline, "status": "DRAFT"}, {**baseline, "immutable": False},
+                    {**baseline, "components": baseline["components"] * 2},
+                    {**baseline, "components": [{**baseline["components"][0], "source_version": "1.0.0"}]}):
+            candidate.write_text(json.dumps(bad))
+            with self.subTest(bad=bad), self.assertRaises(ValueError): minimum_runtime.candidate_identity(candidate)
+
+    def test_runtime_probe_uses_offline_locked_build_and_records_failure_without_credit(self):
+        fixture = self.workspace / "runtime-probe"; fixture.mkdir()
+        (fixture / "source").mkdir(); (fixture / "vendor").mkdir()
+        output = self.workspace / "runtime-output"
+        value = {"fixture_sha256": "sha256:" + "a" * 64, "source_commit": "b" * 40,
+                 "source_version": "0.1.15"}
+        compiler = "rustc 1.88.0 (fixture)\nrelease: 1.88.0\nhost: aarch64-unknown-linux-gnu\n"
+        def build(argv, **kwargs):
+            self.assertIn("--offline", argv); self.assertIn("--locked", argv)
+            self.assertEqual(kwargs["env"]["CARGO_NET_OFFLINE"], "true")
+            self.assertEqual(kwargs["env"]["TMPDIR"], str(output / "tmp"))
+            self.assertTrue((output / "tmp").is_dir())
+            self.assertEqual(kwargs["cwd"], fixture / "source")
+            self.assertEqual(kwargs["timeout"], 1800)
+            self.assertNotIn("RUSTC_WRAPPER", kwargs["env"])
+            return subprocess.CompletedProcess(argv, 101)
+        with patch.object(minimum_runtime, "validate_fixture", return_value=value), \
+                patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                patch.object(minimum_runtime, "require_isolated_native"), \
+                patch.object(minimum_runtime.subprocess, "check_output", return_value=compiler), \
+                patch.object(minimum_runtime.subprocess, "run", side_effect=build), self.assertRaises(ValueError):
+            minimum_runtime.verify(fixture, self.workspace / "candidate", output,
+                                   Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+        result = json.loads((output / "result.json").read_text())
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["build_exit_code"], 101)
+        self.assertIs(result["qualification_credit"], False)
+        self.assertEqual(result["evidence_scope"], "source-build-only")
+
+    def test_runtime_probe_rejects_wrong_compiler_native_host_and_emulated_target(self):
+        fixture = self.workspace / "runtime-inputs"
+        for compiler in ("release: 1.98.0\nhost: aarch64-unknown-linux-gnu\n",
+                         "release: 1.88.0\nhost: x86_64-unknown-linux-gnu\n"):
+            with self.subTest(compiler=compiler), \
+                    patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "a" * 64}), \
+                    patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                    patch.object(minimum_runtime, "require_isolated_native"), \
+                    patch.object(minimum_runtime.subprocess, "check_output", return_value=compiler), \
+                    patch.object(minimum_runtime.subprocess, "run") as build, self.assertRaises(ValueError):
+                minimum_runtime.verify(fixture, self.workspace / "candidate", self.workspace / "mismatch",
+                                       Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+            build.assert_not_called()
+            if (self.workspace / "mismatch").exists():
+                (self.workspace / "mismatch/tmp").rmdir()
+                (self.workspace / "mismatch").rmdir()
+        with patch.object(minimum_runtime, "validate_fixture", return_value={"fixture_sha256": "sha256:" + "a" * 64}), \
+                patch.object(minimum_runtime.common, "detected_target", return_value="macos-arm64"), self.assertRaises(ValueError):
+            minimum_runtime.verify(fixture, self.workspace / "candidate", self.workspace / "mismatch",
+                                   Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+
+    def test_runtime_probe_rejects_root_and_external_network_interfaces(self):
+        for uid, names in ((0, ["lo"]), (65534, ["lo", "eth0"]), (65534, ["lo"])):
+            with self.subTest(uid=uid, names=names), patch.object(minimum_runtime.os, "geteuid", return_value=uid), \
+                    patch.object(minimum_runtime, "active_interfaces", return_value=set(names)):
+                if uid == 65534 and names == ["lo"]:
+                    minimum_runtime.require_isolated_native()
+                else:
+                    with self.assertRaises(ValueError): minimum_runtime.require_isolated_native()
+
+    def test_runtime_isolation_ignores_down_tunnels_but_not_up_interfaces(self):
+        import struct
+        for ethernet_up in (False, True):
+            def ioctl(fd, request, name):
+                interface = name.split(b"\0", 1)[0]
+                flags = 1 if interface == b"lo" or (interface == b"eth0" and ethernet_up) else 0
+                return b"\0" * 16 + struct.pack("H", flags) + b"\0" * 14
+            with patch("socket.if_nameindex", return_value=[(1, "lo"), (2, "gre0"), (3, "eth0")]), \
+                    patch("fcntl.ioctl", side_effect=ioctl), self.subTest(ethernet_up=ethernet_up):
+                self.assertEqual(minimum_runtime.active_interfaces(), {"lo", "eth0"} if ethernet_up else {"lo"})
+
+    def test_runtime_success_is_source_only_and_revalidates_immutable_dependencies(self):
+        fixture = self.workspace / "runtime-success-fixture"; fixture.mkdir()
+        (fixture / "source").mkdir(); (fixture / "vendor").mkdir()
+        output = self.workspace / "runtime-success-output"
+        value = {"fixture_sha256": "sha256:" + "a" * 64, "source_commit": "b" * 40,
+                 "source_version": "0.1.15"}
+        def build(argv, **kwargs):
+            self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.98.0")
+            self.assertEqual(kwargs["env"]["CARGO_TARGET_DIR"], str(output / "target"))
+            binary = output / "target/debug/iicp-directory-rs"
+            binary.parent.mkdir(parents=True); binary.write_bytes(b"unit-fixture-only")
+            return subprocess.CompletedProcess(argv, 0)
+        with patch.object(minimum_runtime, "validate_fixture", return_value=value) as binding, \
+                patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                patch.object(minimum_runtime, "require_isolated_native"), \
+                patch.object(minimum_runtime.subprocess, "check_output", side_effect=[
+                    "release: 1.98.0\nhost: aarch64-unknown-linux-gnu\n", "iicp-directory-rs 0.1.15\n"]), \
+                patch.object(minimum_runtime.subprocess, "run", side_effect=build):
+            result = minimum_runtime.verify(fixture, self.workspace / "candidate", output,
+                Path("/tool/cargo"), Path("/tool/rustc"), "rust-1.98.0", "linux-aarch64", "sha256:" + "a" * 64)
+            self.assertEqual(binding.call_count, 2)
+        self.assertEqual(result["status"], "PASS")
+        self.assertIs(result["qualification_credit"], False)
+        self.assertIs(result["non_authorizing"], True)
+        self.assertEqual(result["evidence_scope"], "source-build-only")
+        self.assertEqual(result, json.loads((output / "result.json").read_text()))
+
+    def test_runtime_timeout_persists_failure_receipt(self):
+        fixture = self.workspace / "runtime-timeout-fixture"
+        output = self.workspace / "runtime-timeout-output"
+        value = {"fixture_sha256": "sha256:" + "a" * 64, "source_commit": "b" * 40,
+                 "source_version": "0.1.15"}
+        with patch.object(minimum_runtime, "validate_fixture", return_value=value), \
+                patch.object(minimum_runtime.common, "detected_target", return_value="linux-aarch64"), \
+                patch.object(minimum_runtime, "require_isolated_native"), \
+                patch.object(minimum_runtime.subprocess, "check_output", return_value=
+                    "release: 1.88.0\nhost: aarch64-unknown-linux-gnu\n"), \
+                patch.object(minimum_runtime.subprocess, "run", side_effect=subprocess.TimeoutExpired("cargo", 1800)), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            minimum_runtime.verify(fixture, self.workspace / "candidate", output,
+                Path("/tool/cargo"), Path("/tool/rustc"), "msrv-1.88", "linux-aarch64", "sha256:" + "a" * 64)
+        result = json.loads((output / "result.json").read_text())
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["failure_class"], "TimeoutExpired")
+        self.assertIs(result["qualification_credit"], False)
+
+    def test_runtime_stream_preserves_failure_evidence_before_tmpfs_teardown(self):
+        import base64
+        from contextlib import redirect_stdout
+        output = self.workspace / "runtime-stream"; output.mkdir()
+        expected = {"result.json": b'{"status":"FAIL","qualification_credit":false}',
+                    "build.log": b"exact compiler failure\n"}
+        for name, raw in expected.items(): (output / name).write_bytes(raw)
+        captured = io.StringIO()
+        with redirect_stdout(captured): minimum_runtime.stream_evidence(output)
+        for line in captured.getvalue().splitlines():
+            prefix, encoded = line.split(" ", 1)
+            self.assertEqual(prefix, "IICP_PRE1_RUNTIME_EVIDENCE")
+            value = json.loads(encoded)
+            self.assertEqual(base64.b64decode(value["base64"]), expected[value["name"]])
+            self.assertEqual(value["sha256"], adapter.file_digest(output / value["name"]))
+
     def directory_http_functions(self):
         import ast
         import resource
@@ -174,18 +871,134 @@ class PackageExecutionTests(unittest.TestCase):
         branch = next(n for n in tree.body if isinstance(n, ast.If)
                       and ast.unparse(n.test) == "component == 'directory-rust'")
         for scenario in adapter.DIRECTORY_RUST_HTTP_SCENARIOS | adapter.DIRECTORY_RUST_DATABASE_SCENARIOS:
-            invoke = Mock()
-            namespace = {"component": "directory-rust", "scenario": scenario,
+            invoke = Mock(return_value={})
+            namespace = {"component": "directory-rust", "scenario": scenario, "json": json,
                 "installed": Path("/fixture"), "Path": Path, "env": {},
-                "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15"}),
+                "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15", "IICP_PRE1_ROLLBACK_PREDECESSOR": "/previous", "IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256": "sha256:fixture"}),
+                "argv": ["/fixture/iicp-directory-rs"], "rollback_postcondition": invoke,
                 "resource": Mock(RLIMIT_FSIZE=1),
-                "rust_http_case": invoke, "rust_mode_postcondition": Mock(),
+                "rust_http_case": invoke, "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
+                "migration_interrupted_postcondition": invoke, "backup_restore_postcondition": invoke,
+                "registration_scenario_postcondition": invoke, "discovery_scenario_postcondition": Mock(return_value={}),
+                "endpoint_scenario_postcondition": Mock(return_value={}), "reset_directory_database": Mock(),
                 "context": {"mode": "local-only"}, "assertion": "fixture", "print": Mock()}
             with self.subTest(scenario=scenario), self.assertRaises(SystemExit) as stopped:
                 exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
             self.assertEqual(stopped.exception.code, 0)
-            self.assertEqual(invoke.call_args.args[2], scenario)
-            self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
+            self.assert_directory_dispatch(scenario, invoke, namespace)
+
+    def assert_directory_dispatch(self, scenario, invoke, namespace):
+        if scenario == "rollback-last-supported":
+            invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15", Path("/previous"), "sha256:fixture")
+            return
+        if scenario in {"migration-interrupted", "backup-restore", "cross-flavor-equivalence"}:
+            invoke.assert_called_once_with(Path("/fixture/iicp-directory-rs"), {}, "0.1.15")
+            if scenario == "cross-flavor-equivalence":
+                namespace["endpoint_scenario_postcondition"].assert_called_once_with(
+                    Path("/fixture/iicp-directory-rs"), {}, "0.1.15", "local-only")
+            return
+        self.assertEqual(namespace["reset_directory_database"].call_count, 2 if scenario == "signature-mismatch" else 0)
+        self.assertEqual(invoke.call_args.args[2], scenario)
+        self.assertEqual(invoke.call_args.kwargs.get("database", False), scenario in adapter.DIRECTORY_RUST_DATABASE_SCENARIOS)
+
+    def test_backup_restore_requires_identical_dump_and_real_http_readback(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        dump = b"CREATE TABLE nodes (id INT);"
+        for failure in (None, "export", "import", "schema-drift", "data-drift", "blind-oracle", "corrupt-recovery", "readback"):
+            ns["reset_directory_database"] = reset = Mock()
+            ns["directory_database_export"] = Mock(side_effect=ValueError("export") if failure == "export"
+                else [dump, dump + b"drift" if failure == "data-drift" else dump])
+            ns["directory_database_state"] = Mock(side_effect=[{"schema": b"schema", "rows": b"rows"},
+                {"schema": b"drift" if failure == "schema-drift" else b"schema", "rows": b"drift" if failure == "data-drift" else b"rows"},
+                {"schema": b"schema", "rows": b"rows" if failure == "blind-oracle" else b"corrupted"},
+                {"schema": b"schema", "rows": b"drift" if failure == "corrupt-recovery" else b"rows"}])
+            ns["directory_fixture_sql"] = Mock()
+            ns["directory_database_import"] = restore = Mock(side_effect=ValueError("import") if failure == "import" else None)
+            def execute(binary, env, scenario, version, **kwargs):
+                self.assertTrue(kwargs["database"])
+                def request(path, body=None, headers=None):
+                    if path == "/v1/register":
+                        return 201, {"node_id": "fixture-backup", "node_token": "synthetic"}
+                    if path == "/v1/node/fixture-backup":
+                        return 200, {"node_id": "fixture-backup", "reputation_score":
+                            0.5 if scenario == "backup-readback" and failure == "readback" else 0.8}
+                    raise AssertionError(path)
+                kwargs["postcondition"](request, request, binary, env)
+            ns["rust_http_case"] = Mock(side_effect=execute)
+            with self.subTest(failure=failure):
+                if failure is None:
+                    ns["backup_restore_postcondition"](Path("/fixture"), {}, "0.1.15")
+                    self.assertEqual(restore.call_args_list, [unittest.mock.call({}, dump), unittest.mock.call({}, dump)])
+                    self.assertEqual(ns["rust_http_case"].call_count, 2)
+                    self.assertEqual(reset.call_count, 4)
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["backup_restore_postcondition"](Path("/fixture"), {}, "0.1.15")
+                    self.assertGreaterEqual(reset.call_count, 2)
+
+    def test_backup_export_and_import_bound_private_credentials(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = Mock()
+        ns["database_fixture_inputs"] = Mock(return_value=({"username": "iicp_pre1_fixture",
+            "database": "iicp_pre1_" + "a" * 16}, "synthetic-private-password"))
+        tools = self.workspace / "directory-database-tools"; tools.mkdir()
+        (tools / "mysqldump").write_bytes(b"fixture")
+        backup = b"CREATE TABLE nodes (id INT);"
+        def export(argv, **kwargs):
+            self.assertNotIn("synthetic-private-password", " ".join(argv))
+            self.assertIn("--no-defaults", argv)
+            self.assertIn("--host=127.0.0.1", argv)
+            self.assertEqual(kwargs["timeout"], 20)
+            self.assertEqual(list(Path(kwargs["env"]["HOME"]).iterdir()), [])
+            self.assertTrue(callable(kwargs["preexec_fn"]))
+            kwargs["stdout"].write(backup)
+            return Mock(returncode=0)
+        with patch("subprocess.run", side_effect=export), patch.object(Path, "cwd", return_value=self.workspace):
+            self.assertEqual(ns["directory_database_export"]({"HOME": str(self.home)}), backup)
+        with patch("subprocess.run", return_value=Mock(returncode=0)) as run:
+            ns["directory_database_import"]({"HOME": str(self.home)}, backup)
+            self.assertEqual(run.call_args.kwargs["input"], backup)
+            self.assertNotIn("synthetic-private-password", " ".join(run.call_args.args[0]))
+        with patch("subprocess.run", return_value=Mock(returncode=1)), self.assertRaisesRegex(ValueError, "restore failed"):
+            ns["directory_database_import"]({"HOME": str(self.home)}, backup)
+        for value in (b"", "not-bytes", b"x" * (8 * 1024 * 1024 + 1)):
+            with self.subTest(value_type=type(value).__name__), self.assertRaisesRegex(ValueError, "bound"):
+                ns["directory_database_import"]({}, value)
+
+    def test_database_restore_oracle_compares_schema_collation_and_all_rows(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        oracle = Mock(side_effect=[b"schema", b"nodes\tid\nnodes\ttoken\n", b"31\tNULL\n"])
+        ns["directory_fixture_sql"] = oracle
+        self.assertEqual(ns["directory_database_state"]({}),
+                         {"schema": b"schema", "rows": {"nodes": b"31\tNULL\n"}})
+        self.assertIn("CHARACTER_SET_NAME", oracle.call_args_list[0].args[1])
+        self.assertIn("COLLATION_NAME", oracle.call_args_list[0].args[1])
+        self.assertIn("HEX(CAST(`token` AS BINARY))", oracle.call_args_list[2].args[1])
+        self.assertTrue(oracle.call_args_list[2].args[1].endswith("ORDER BY 1,2"))
+        for identifiers in (b"", b"nodes;DROP\tid\n", b"nodes\tx`\n", b"nodes\tid\textra\n"):
+            ns["directory_fixture_sql"] = Mock(side_effect=[b"schema", identifiers])
+            with self.subTest(identifiers=identifiers), self.assertRaises(ValueError):
+                ns["directory_database_state"]({})
+
+    def test_signature_runtime_failure_still_resets_disposable_database(self):
+        import ast
+        from unittest.mock import Mock
+        tree = ast.parse(adapter.DIRECTORY_PROBE)
+        branch = next(n for n in tree.body if isinstance(n, ast.If)
+                      and ast.unparse(n.test) == "component == 'directory-rust'")
+        reset = Mock()
+        namespace = {"component": "directory-rust", "scenario": "signature-mismatch",
+            "installed": Path("/fixture"), "Path": Path, "env": {},
+            "os": Mock(environ={"IICP_PRE1_DIRECTORY_VERSION": "0.1.15", "IICP_PRE1_ROLLBACK_PREDECESSOR": "/previous", "IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256": "sha256:fixture"}),
+            "rust_http_case": Mock(side_effect=ValueError("injected scenario failure")),
+            "rust_mode_postcondition": Mock(), "rust_mode_environment": Mock(return_value={}),
+            "reset_directory_database": reset, "context": {"mode": "local-only"}}
+        with self.assertRaisesRegex(ValueError, "injected scenario failure"):
+            exec(compile(ast.Module(body=[branch], type_ignores=[]), "probe", "exec"), namespace)
+        self.assertEqual(reset.call_count, 2)
 
     def test_stale_owner_requires_bind_refusal_active_health_and_clean_restart(self):
         from unittest.mock import Mock
@@ -394,6 +1207,33 @@ class PackageExecutionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check(Mock(), Mock(return_value={"verified_at": None, "challenge": "stale"}))
 
+    def test_signature_mismatch_requires_crypto_positive_negative_and_recovery(self):
+        from unittest.mock import Mock
+        import hashlib, hmac
+        check = self.directory_http_functions()["signature_mismatch_postcondition"]
+        responses = [(201, {"node_id": "fixture-replay", "node_token": "synthetic", "node_hmac_key": "fixture-key"}),
+                     *[(200, {"ok": True, "challenge": str(n)}) for n in range(1, 5)]]
+        observations = [None, {"verified_at": None, "challenge": "1"},
+            {"verified_at": 100, "challenge": "2"}, {"verified_at": 100, "challenge": "3"},
+            {"verified_at": 103, "challenge": "4"}]
+        with patch("time.sleep"):
+            request = Mock(side_effect=copy.deepcopy(responses))
+            check(request, Mock(side_effect=copy.deepcopy(observations)))
+        answer = lambda value: hmac.new(b"fixture-key", value.encode(), hashlib.sha256).hexdigest()
+        calls = request.call_args_list
+        self.assertEqual(calls[2].args[1]["challenge_response"], answer("1"))
+        tampered = calls[3].args[1]["challenge_response"]
+        self.assertEqual(len(tampered), 64)
+        self.assertEqual(tampered[1:], answer("2")[1:])
+        self.assertNotEqual(tampered[0], answer("2")[0])
+        self.assertEqual(calls[4].args[1]["challenge_response"], answer("3"))
+        for index, field, value in [(1, "verified_at", 100), (2, "verified_at", None),
+                (2, "challenge", "1"), (3, "verified_at", 101), (3, "challenge", "2"),
+                (4, "verified_at", 100), (4, "challenge", "3")]:
+            mutated = copy.deepcopy(observations); mutated[index][field] = value
+            with self.subTest(index=index, field=field), patch("time.sleep"), self.assertRaises(ValueError):
+                check(Mock(side_effect=copy.deepcopy(responses)), Mock(side_effect=mutated))
+
     def test_database_observation_uses_bounded_loopback_native_client(self):
         check = self.directory_http_functions()
         config = {"username": "iicp_pre1_fixture", "database": "iicp_pre1_" + "a" * 16}
@@ -488,6 +1328,296 @@ class PackageExecutionTests(unittest.TestCase):
             with self.subTest(index=index, replacement=replacement), self.assertRaises(ValueError):
                 check(Mock(side_effect=changed))
 
+    def restricted_mode_responses(self):
+        denied = (401, {"error": {"code": "restricted_domain_denied"}})
+        eligible = (200, {"nodes": [], "count": 0, "restricted_domain_decision": {
+            "schema": "iicp.restricted-trust-domain.directory-decision.v0",
+            "profile": "urn:iicp:profile:restricted-trust-domain:v1", "decision": "eligible",
+            "operation": "discovery", "domain_id": "example.internal", "authority_id": "did:key:directory",
+            "subject_kind": "client", "membership_generation": 1, "membership_expires_at": 2000}})
+        return [denied, eligible, denied, denied, denied, denied, denied, eligible, denied]
+
+    def test_restricted_mode_requires_full_membership_lifecycle(self):
+        from unittest.mock import Mock, call
+        ns = self.directory_http_functions()
+        ns["time"] = Mock(time=lambda: 1000)
+        request = Mock(side_effect=self.restricted_mode_responses())
+        first, wrong, rotated = ["iicp_mem_" + c * 64 for c in "123"]
+        administer = Mock(side_effect=[first, wrong, rotated, "revoked", "revoked"])
+        ns["restricted_mode_postcondition"](request, administer)
+        self.assertEqual(request.call_count, 9)
+        self.assertEqual(administer.call_args_list, [call("issue", "fixture-client", "discovery"),
+            call("issue", "fixture-other", "bootstrap"), call("issue", "fixture-client", "discovery"),
+            call("revoke", "fixture-client", "discovery"), call("revoke", "fixture-other", "bootstrap")])
+        self.assertEqual(request.call_args_list[3].kwargs["headers"]["X-IICP-Subject-Id"], "fixture-other")
+        self.assertEqual(request.call_args_list[6].kwargs["headers"]["X-IICP-Membership"], first)
+        self.assertEqual(request.call_args_list[7].kwargs["headers"]["X-IICP-Membership"], rotated)
+        self.assertNotEqual(request.call_args_list[4].kwargs["headers"]["X-IICP-Membership"], first)
+
+    def test_restricted_mode_rejects_every_incorrect_lifecycle_response(self):
+        from unittest.mock import Mock
+        for index in range(9):
+            ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+            responses = self.restricted_mode_responses()
+            responses[index] = (200, {})
+            administer = Mock(side_effect=["iicp_mem_" + c * 64 for c in "123"] + ["revoked", "revoked"])
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                ns["restricted_mode_postcondition"](Mock(side_effect=responses), administer)
+
+    def test_restricted_mode_rejects_wrong_projection_and_unchanged_rotation(self):
+        from unittest.mock import Mock
+        wrong = {"schema": "wrong", "profile": "wrong", "decision": "denied", "operation": "bootstrap",
+            "domain_id": "wrong", "authority_id": "wrong", "subject_kind": "node",
+            "membership_generation": False, "membership_expires_at": 999}
+        for field, value in wrong.items():
+            ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+            responses = copy.deepcopy(self.restricted_mode_responses())
+            responses[1][1]["restricted_domain_decision"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                ns["restricted_mode_postcondition"](Mock(side_effect=responses), Mock(return_value="token"))
+        ns = self.directory_http_functions(); ns["time"] = Mock(time=lambda: 1000)
+        with self.assertRaisesRegex(ValueError, "rotation"):
+            ns["restricted_mode_postcondition"](Mock(side_effect=self.restricted_mode_responses()), Mock(return_value="same-token"))
+
+    def test_restricted_mode_requires_database_exact_identity_and_no_replica(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        env = {"IICP_RESTRICTED_DOMAIN_ENABLED": "true", "IICP_REPLICA_MODE": "false",
+            "IICP_TRUST_DOMAIN_ID": "example.internal", "IICP_TRUST_DOMAIN_AUTHORITY_ID": "did:key:directory"}
+        for key in env:
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "exact mode"):
+                ns["rust_http_case"](Path("/binary"), {**env, key: "wrong"}, "environment-restricted", "0.1.15", database=True)
+        with self.assertRaisesRegex(ValueError, "isolated database"):
+            ns["rust_http_case"](Path("/binary"), env, "environment-restricted", "0.1.15")
+
+    def test_membership_admin_accepts_only_explicit_canonical_fixture_subjects(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        env = {"HOME": str(self.home)}
+        def run(argv, **kwargs):
+            kwargs["stdout"].write(b"iicp_mem_" + b"a" * 64)
+            return Mock(returncode=0)
+        ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+        for subject in ("fallback-capability", "empty-health", "unstable-backend", "eligible", "below-realtime", "realtime"):
+            self.assertTrue(ns["restricted_membership_command"](Path("/fixture/binary"), env,
+                "issue", subject, "registration", "node").startswith("iicp_mem_"))
+        for subject in ("production-node", "eligible-other", "realtime;rm", "", "x" * 129):
+            with self.assertRaises(ValueError):
+                ns["restricted_membership_command"](Path("/fixture/binary"), env, "issue", subject, "registration", "node")
+
+    def test_membership_admin_checks_exit_output_bounds_and_exact_cli(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        env = {"HOME": str(self.home)}
+        for action, code, raw, valid in [("issue", 0, b'iicp_mem_' + b'a' * 64 + b'\n', True),
+                ("revoke", 0, b'revoked\n', True), ("issue", 1, b'iicp_mem_' + b'a' * 64, False),
+                ("issue", 0, b'garbage', False), ("revoke", 0, b'not-revoked', False),
+                ("issue", 0, b'x' * 4097, False)]:
+            def run(argv, **kwargs):
+                expected = ["/fixture/iicp-directory-rs", "trust-domain-membership-" + action,
+                    "--kind", "client", "--subject", "fixture-client"]
+                if action == "issue": expected += ["--scopes", "discovery", "--ttl-seconds", "3600"]
+                self.assertEqual(argv, expected); self.assertEqual(kwargs["timeout"], 30)
+                self.assertEqual(kwargs["env"], env); self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                kwargs["stdout"].write(raw)
+                return Mock(returncode=code)
+            ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+            with self.subTest(action=action, code=code, length=len(raw)):
+                if valid:
+                    self.assertEqual(ns["restricted_membership_command"](Path("/fixture/iicp-directory-rs"), env, action, "fixture-client"), raw.decode().strip())
+                else:
+                    with self.assertRaises(ValueError):
+                        ns["restricted_membership_command"](Path("/fixture/iicp-directory-rs"), env, action, "fixture-client")
+        for action, subject, scope in [("delete", "fixture-client", "discovery"), ("issue", "other", "discovery"), ("issue", "fixture-client", "*")]:
+            with self.assertRaises(ValueError):
+                ns["restricted_membership_command"](Path("/binary"), env, action, subject, scope)
+
+    def test_mode_environment_is_explicit_and_does_not_mutate_input(self):
+        ns = self.directory_http_functions()
+        original = {"IICP_REPLICA_MODE": "true", "HOME": str(self.home)}
+        result = ns["rust_mode_environment"](original, "restricted")
+        self.assertEqual(original["IICP_REPLICA_MODE"], "true")
+        self.assertEqual(result["IICP_REPLICA_MODE"], "false")
+        self.assertEqual(result["IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH"], "1")
+        self.assertEqual(ns["rust_mode_environment"](result, "public")["IICP_RESTRICTED_DOMAIN_ENABLED"], "false")
+        self.assertEqual(ns["rust_mode_environment"](original, "local-only"), original)
+        with self.assertRaises(ValueError): ns["rust_mode_environment"](original, "unknown")
+
+    def test_support_requires_both_pinned_fixtures_not_just_version_metadata(self):
+        import shutil
+        ns = self.directory_http_functions()
+        source = Path(adapter.__file__).resolve().parents[1] / "parity"
+        for name, original in (("contract", "contract-v1.10.80.json"), ("behavior", "behavior-contract-v1.json"), ("http", "http-contract-v1.json")):
+            shutil.copyfile(source / original, self.workspace / ("directory-support-" + name + ".json"))
+        with patch.object(Path, "cwd", return_value=self.workspace):
+            ns["directory_support_postcondition"]()
+            for name in ("contract", "behavior", "http"):
+                path = self.workspace / ("directory-support-" + name + ".json")
+                original = path.read_bytes()
+                path.write_bytes(b'{}')
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    ns["directory_support_postcondition"]()
+                path.write_bytes(original)
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, "missing"):
+                ns["directory_support_postcondition"]()
+
+    def test_restricted_malformed_config_requires_specific_federation_refusal(self):
+        import ast
+        tree = ast.parse(adapter.DIRECTORY_PROBE)
+        branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "scenario == 'config-malformed'")
+        for mode, expected in (("restricted", "restricted trust-domain federation is not implemented; replica mode cannot be combined with restricted-domain mode"),
+                ("public", "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID"), ("local-only", "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID")):
+            namespace = {"env": {"IICP_RESTRICTED_DOMAIN_ENABLED": "true" if mode == "restricted" else "false"}, "context": {"mode": mode}}
+            exec(compile(ast.Module(body=branch.body, type_ignores=[]), "probe", "exec"), namespace)
+            self.assertEqual(namespace["expected"], expected)
+            self.assertEqual(namespace["expected_code"], 1)
+            self.assertEqual(namespace["env"]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true" if mode == "restricted" else "false")
+
+    def test_restricted_request_preserves_inner_credentials_and_scenario_error(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        administer = Mock(return_value="synthetic-membership")
+        ns["restricted_membership_command"] = administer
+        raw = Mock(return_value=(401, {"error": {"code": "unauthorized"}}))
+        env = {"HOME": str(self.home)}
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), env)
+        headers = {"Authorization": "Bearer synthetic-node-token"}
+        body = {"node_id": "fixture-replay"}
+        self.assertEqual(request("/v1/heartbeat", body, headers)[0], 401)
+        self.assertEqual(administer.call_args.args, (Path("/binary"), env, "issue", "fixture-replay", "heartbeat", "node"))
+        forwarded = raw.call_args.args[2]
+        self.assertEqual(forwarded["Authorization"], headers["Authorization"])
+        self.assertEqual(forwarded["X-IICP-Subject-Id"], "fixture-replay")
+        self.assertEqual(headers, {"Authorization": "Bearer synthetic-node-token"})
+        administer.reset_mock()
+        request("/health")
+        administer.assert_not_called()
+
+    def test_restricted_request_refuses_membership_masking_and_overrides(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["restricted_membership_command"] = Mock(return_value="synthetic")
+        for code in ("restricted_domain_denied", "restricted_domain_unavailable"):
+            raw = Mock(return_value=(401, {"error": {"code": code}}))
+            request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, "masked scenario"):
+                request("/v1/peers", {"node_id": "fixture"})
+        raw = Mock()
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+        for name in ("X-IICP-Membership", "x-iicp-subject-id"):
+            with self.assertRaisesRegex(ValueError, "override"):
+                request("/v1/peers", {"node_id": "fixture"}, {name: "injected"})
+        raw.assert_not_called()
+
+    def test_restricted_success_requires_operation_specific_projection(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["restricted_membership_command"] = Mock(return_value="synthetic")
+        result = {"restricted_domain_decision": {"decision": "eligible", "operation": "discovery",
+            "domain_id": "example.internal", "authority_id": "did:key:directory", "subject_kind": "client"}}
+        raw = Mock(return_value=(200, result))
+        request = ns["restricted_request_adapter"](raw, Path("/binary"), {})
+        self.assertEqual(request("/v1/discover?intent=fixture"), (200, result))
+        for key in result["restricted_domain_decision"]:
+            changed = copy.deepcopy(result); changed["restricted_domain_decision"][key] = "wrong"
+            raw.return_value = (200, changed)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "projection"):
+                request("/v1/discover?intent=fixture")
+
+    def test_restricted_mode_requires_database_for_every_assigned_case(self):
+        with patch.object(adapter, "directory_database_dependencies", return_value={}) as inputs:
+            with self.assertRaisesRegex(ValueError, "missing"):
+                adapter.require_directory_database_fixture("directory-rust", "package-version-self-report", self.workspace, "restricted")
+            inputs.assert_called_once_with(self.workspace)
+
+    def test_database_reset_uses_validated_run_owned_namespace_and_private_secret(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        config = {"database": "iicp_pre1_" + "a" * 16, "username": "iicp_pre1_fixture"}
+        ns["database_fixture_inputs"] = Mock(return_value=(config, "synthetic-private-password"))
+        run = Mock(return_value=Mock(returncode=0))
+        ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+        ns["reset_directory_database"]({"HOME": str(self.home), "PATH": "/fixture"})
+        argv = run.call_args.args[0]
+        self.assertNotIn("synthetic-private-password", " ".join(argv))
+        self.assertEqual(argv[-1], "DROP DATABASE IF EXISTS `iicp_pre1_" + "a" * 16 + "`; CREATE DATABASE `iicp_pre1_" + "a" * 16 + "`")
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+        self.assertEqual(run.call_args.kwargs["env"]["MYSQL_PWD"], "synthetic-private-password")
+        run.return_value.returncode = 1
+        with self.assertRaisesRegex(ValueError, "reset failed"):
+            ns["reset_directory_database"]({"HOME": str(self.home)})
+
+    def test_interrupted_schema_requires_real_startup_refusal_and_unchanged_state(self):
+        from unittest.mock import Mock
+        baseline = b"nodes\tid\tvarchar(128)\tNO\tNULL\t\nfixture-interrupted-schema\n"
+        refusal = b"FATAL: MySQL schema verification failed: schema incompatible (1 required contract differences); nodes.region missing\n"
+        for name, code, output, after in [
+                ("valid", 1, refusal, baseline),
+                ("wrong-exit", 0, refusal, baseline),
+                ("wrong-error", 1, b"FATAL: configured MySQL connection failed", baseline),
+                ("unrelated-membership", 1, b"restricted_domain_denied", baseline),
+                ("listening", 1, refusal + b"listening on 0.0.0.0", baseline),
+                ("memory-downgrade", 1, refusal + b"using InMemoryRepo", baseline),
+                ("oversize", 1, refusal + b"x" * 65537, baseline),
+                ("mutated", 1, refusal, baseline + b"mutation"),
+            ]:
+            with self.subTest(name=name):
+                ns = self.directory_http_functions()
+                ns["require_loopback_only"] = Mock()
+                ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+                    "username": "iicp_pre1_fixture"}, "synthetic password"))
+                ns["reset_directory_database"] = Mock()
+                ns["rust_http_case"] = Mock()
+                ns["directory_fixture_sql"] = Mock(side_effect=[b"", baseline, after])
+                def run(argv, **kwargs):
+                    self.assertEqual(argv, ["/fixture/iicp-directory-rs"])
+                    self.assertEqual(kwargs["timeout"], 30)
+                    self.assertEqual(kwargs["env"]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true")
+                    self.assertIn("synthetic%20password@127.0.0.1", kwargs["env"]["DATABASE_URL"])
+                    kwargs["stdout"].write(output)
+                    return Mock(returncode=code)
+                ns["subprocess"] = Mock(run=run, STDOUT=subprocess.STDOUT)
+                call = lambda: ns["migration_interrupted_postcondition"](Path("/fixture/iicp-directory-rs"),
+                    {"HOME": str(self.home), "IICP_RESTRICTED_DOMAIN_ENABLED": "true"}, "0.1.15")
+                if name == "valid": call()
+                else:
+                    with self.assertRaisesRegex(ValueError, "preserve and reject"): call()
+                self.assertEqual(ns["reset_directory_database"].call_count, 3)
+                ns["rust_http_case"].assert_called_once_with(Path("/fixture/iicp-directory-rs"),
+                    {"HOME": str(self.home), "IICP_RESTRICTED_DOMAIN_ENABLED": "true"},
+                    "credential-missing", "0.1.15", database=True)
+
+    def test_schema_oracle_is_bounded_loopback_and_keeps_secret_out_of_argv(self):
+        from unittest.mock import Mock
+        for code, payload in [(0, b"fixture"), (1, b""), (0, b"x" * 65537)]:
+            ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+            ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+                "username": "iicp_pre1_fixture"}, "synthetic-private-password"))
+            def run(argv, **kwargs):
+                self.assertNotIn("synthetic-private-password", " ".join(argv))
+                self.assertIn("--host=127.0.0.1", argv)
+                self.assertEqual(kwargs["timeout"], 10)
+                self.assertEqual(kwargs["env"]["MYSQL_PWD"], "synthetic-private-password")
+                kwargs["stdout"].write(payload)
+                return Mock(returncode=code)
+            ns["subprocess"] = Mock(run=run, DEVNULL=subprocess.DEVNULL)
+            if not code and len(payload) <= 65536:
+                self.assertEqual(ns["directory_fixture_sql"]({"HOME": str(self.home)}, "SELECT 1"), payload)
+            else:
+                with self.assertRaisesRegex(ValueError, "oracle failed"):
+                    ns["directory_fixture_sql"]({"HOME": str(self.home)}, "SELECT 1")
+
+    def test_interrupted_schema_cleanup_on_failed_positive_control(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions(); ns["require_loopback_only"] = Mock()
+        ns["database_fixture_inputs"] = Mock(return_value=({"database": "iicp_pre1_" + "a" * 16,
+            "username": "iicp_pre1_fixture"}, "synthetic"))
+        ns["reset_directory_database"] = Mock()
+        ns["rust_http_case"] = Mock(side_effect=ValueError("positive control failed"))
+        with self.assertRaisesRegex(ValueError, "positive control failed"):
+            ns["migration_interrupted_postcondition"](Path("/binary"), {"HOME": str(self.home)}, "0.1.15")
+        self.assertEqual(ns["reset_directory_database"].call_count, 2)
+
     def test_public_mode_requires_both_fresh_environment_variants(self):
         from unittest.mock import Mock
         ns = self.directory_http_functions()
@@ -503,8 +1633,13 @@ class PackageExecutionTests(unittest.TestCase):
         runner.reset_mock()
         ns["rust_mode_postcondition"](Path("/binary"), original, "local-only", "0.1.15")
         runner.assert_not_called()
-        with self.assertRaisesRegex(ValueError, "restricted mode remains unimplemented"):
-            ns["rust_mode_postcondition"](Path("/binary"), original, "restricted", "0.1.15")
+        ns["rust_mode_postcondition"](Path("/binary"), original, "restricted", "0.1.15")
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args.args[1]["IICP_RESTRICTED_DOMAIN_ENABLED"], "true")
+        self.assertTrue(runner.call_args.kwargs["database"])
+        self.assertEqual(runner.call_args.args[2], "environment-restricted")
+        with self.assertRaises(ValueError):
+            ns["rust_mode_postcondition"](Path("/binary"), original, "unknown", "0.1.15")
 
     def test_public_mode_rejects_false_positive_discovery(self):
         check = self.directory_http_functions()["http_postcondition"]
@@ -669,6 +1804,29 @@ class PackageExecutionTests(unittest.TestCase):
             kill.assert_called_once()
             process.wait.assert_called_once_with(timeout=10)
 
+    def test_directory_http_listener_observation_precedes_case_and_cleanup(self):
+        from unittest.mock import Mock, MagicMock
+        import urllib.request
+        run = self.directory_http_functions()["rust_http_case"]
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        response = MagicMock(code=200)
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok":true,"version":"v0.1.15-rs"}'
+        events = []
+        with self.directory_network({"lo"}), \
+             patch.object(subprocess, "Popen", return_value=process), \
+             patch.object(os, "pread", return_value=b"listening on 0.0.0.0:8090", create=True), \
+             patch.object(os, "killpg", create=True) as kill, \
+             patch.object(urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value = response
+            run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15",
+                postcondition=lambda *_: events.append("case"),
+                listener_check=lambda: events.append("listener"))
+            self.assertEqual(events, ["listener", "case"])
+            kill.assert_called_once()
+            process.wait.assert_called_once_with(timeout=10)
+
     def test_directory_http_fixture_timeout_and_early_exit_preserve_cleanup(self):
         from unittest.mock import Mock
         import time
@@ -691,7 +1849,17 @@ class PackageExecutionTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self.workspace)
         self.workspace.mkdir()
+        (self.root / "scripts").mkdir(exist_ok=True)
+        shutil.copyfile(Path(adapter.__file__).resolve().with_name("pre1_installed_discovery.py"),
+                        self.root / "scripts/pre1_installed_discovery.py")
+        shutil.copyfile(Path(adapter.__file__).resolve().with_name("pre1_comparative_topology.py"),
+                        self.root / "scripts/pre1_comparative_topology.py")
         (self.root / "qualification").mkdir(exist_ok=True)
+        (self.root / "parity").mkdir(exist_ok=True)
+        shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "qualification/registration-delegation-v1.json",
+                        self.root / "qualification/registration-delegation-v1.json")
+        for name in ("contract-v1.10.80.json", "behavior-contract-v1.json", "http-contract-v1.json"):
+            shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "parity" / name, self.root / "parity" / name)
         mapping = {"support": {"assertion": "support", "command": ["@php", "vendor/bin/phpunit"]},
                    "scenarios": {name: {"assertion": name, "command": ["@php", "vendor/bin/phpunit"]}
                      for name in ["package-version-self-report", "config-missing", "config-malformed", "backup-restore",
@@ -722,6 +1890,15 @@ class PackageExecutionTests(unittest.TestCase):
         context = {**self.context, "component": component, "runtime": value["runtime"],
                    "target": "linux-aarch64", "mode": "local-only", "scenario_id": "config-missing"}
         return artifact, installed, value, context
+
+    def test_registration_delegation_is_immutable_preparation_input(self):
+        artifact, installed, value, context = self.directory_inputs()
+        fixture = self.workspace / "directory-registration-delegation.json"
+        self.assertEqual(fixture.read_bytes(),
+                         (self.root / "qualification/registration-delegation-v1.json").read_bytes())
+        fixture.write_bytes(fixture.read_bytes() + b" ")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, context, artifact, self.root)
 
     def test_directory_binary_binding_and_proof_are_candidate_bound(self):
         artifact, installed, value, context = self.directory_inputs()
@@ -831,6 +2008,9 @@ class PackageExecutionTests(unittest.TestCase):
             link.symlink_to(self.home, target_is_directory=True)
             public = self.home / "public-home"
             public.mkdir(mode=0o755)
+            # mkdir mode is filtered by the caller's umask; make this negative fixture genuinely public.
+            public.chmod(0o755)
+            self.assertEqual(public.stat().st_mode & 0o777, 0o755)
             for home in ("relative", str(self.workspace), str(nested), str(link), str(public)):
                 with self.subTest(home=home), self.assertRaisesRegex(ValueError, "private case HOME"):
                     validate({"HOME": home})

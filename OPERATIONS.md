@@ -318,3 +318,29 @@ builder, then this rehearsal, retaining fragments and bounded diagnostics for
 three days. Download and verify them against the reviewed workflow SHA before
 expiry. Default PR checks run the portable safety suite, not the expensive
 artifact lane. An artifact upload or green source check is not a rehearsal PASS.
+
+### Minimum-runtime build diagnosis
+
+`scripts/prepare_pre1_minimum_runtime.py --help` describes the separate
+`prepare` and `verify` phases. Preparation consumes a frozen candidate manifest,
+exports its exact Directory source commit and vendors locked dependencies into
+a fresh private fixture outside the checkout. Keep qualification inputs and
+evidence under the operator's private qualification root.
+
+Verification requires the externally pinned fixture digest, the declared native
+Linux architecture, a non-root identity and loopback-only networking. It builds
+offline with the selected Rust 1.88.0 or 1.98.0 compiler, checks the resulting
+binary's version and rechecks immutable fixture bytes. Compiler temporary files
+and build outputs stay outside the source fixture. Bounded logs and the result
+are streamed before container exit so tmpfs teardown cannot erase the evidence.
+
+The standalone command remains source-build diagnosis only and grants no
+campaign credit. The installed `minimum-version` adapter additionally consumes
+the source fixture, candidate file and exact owning tools through its package
+binding, verifies the frozen installed binary's version and exercises HTTP
+behavior. Compiler outputs use separate writable storage; bounded diagnostics
+are retained beside shard output before build storage is removed. Its build
+budget is 150 seconds within the existing 210-second packaged-case deadline.
+Missing fixtures, changed inputs, wrong compilers or installed failures cannot
+fall back to a source-unit test. Final qualification still requires clean,
+candidate-bound execution on every declared runtime and native target.

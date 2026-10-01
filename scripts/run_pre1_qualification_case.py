@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pre1_harness_binding import harness_identity, validate_harness_source
 from pre1_environment_contract import validate_modern_environment
-from pre1_package_execution import package_command, validate_binding, make_case_proof, write_case_proof
+from pre1_package_execution import package_command, validate_binding, make_case_proof, write_case_proof, directory_output_exit_code
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = 'directory-rust'
@@ -44,15 +44,19 @@ def _case_command(value: object, label: str) -> list[str]:
         raise RuntimeError(f"invalid exact qualification case: {label}")
     assertion = value.get("assertion")
     command = value.get("command")
+    installed_topology = (label == "no-dual-authority"
+        and assertion == "installed_comparative_authority_exclusion"
+        and command == ["@installed"])
     if (
         not isinstance(assertion, str)
         or not assertion
         or not isinstance(command, list)
         or not command
         or not all(isinstance(row, str) and row for row in command)
-        or command[:3] != ["@cargo", "test", "--locked"]
-        or command[-3] != assertion
-        or command[-2:] != ["--", "--exact"]
+        or not (installed_topology or (
+            command[:3] == ["@cargo", "test", "--locked"]
+            and command[-3] == assertion
+            and command[-2:] == ["--", "--exact"]))
     ):
         raise RuntimeError(f"qualification case is not an exact Rust assertion: {label}")
     return command
@@ -426,7 +430,7 @@ def validate_runtime(runtime: str, runtime_row: dict, manifest: dict) -> None:
 
 
 def command_environment(runtime_row: dict, runtime: str) -> dict[str, str]:
-    allowed = {"PATH", "HOME", "IICP_HOME", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "RUSTUP_HOME"}
+    allowed = {"PATH", "HOME", "IICP_HOME", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "RUSTUP_HOME", "IICP_PRE1_PREPARED_PACKAGE_HOME", "IICP_PRE1_RUN_ROOT", "IICP_PRE1_CASE_EVIDENCE_ROOT"}
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
     for name in (
         "IICP_PRE1_CELL_ID",
@@ -535,8 +539,7 @@ def main() -> int:
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=210)
         print(result.stdout, end="")
         validate_binding(proof["value"], context, proof["artifact"], ROOT)
-        marker = "IICP_PRE1_DIRECTORY_ASSERTION_PASS " + case["assertion"]
-        exit_code = result.returncode or (0 if result.stdout.splitlines() == [marker] else 2)
+        exit_code = directory_output_exit_code(result.returncode, result.stdout, context, case["assertion"], ROOT)
         write_case_proof(make_case_proof(proof["value"], context, case["assertion"],
             exit_code, os.environ["IICP_PRE1_RUN_ID"]))
     except (KeyError, OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:

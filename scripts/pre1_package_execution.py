@@ -17,6 +17,159 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+def directory_output_exit_code(code, output, context, assertion, root):
+    """Preserve native failure; accept only the owned scenario's bounded output."""
+    if code:
+        return code
+    try:
+        validate_directory_output(output, context, assertion, root)
+    except (ValueError, KeyError, TypeError, OSError, UnicodeError):
+        return 2
+    return 0
+
+
+def validate_directory_output(output, context, assertion, root):
+    if not isinstance(output, str) or len(output.encode()) > 1048576:
+        raise ValueError("Directory output exceeds bound")
+    rows = output.splitlines()
+    marker = "IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion
+    if context["scenario_id"] == "no-dual-authority":
+        validate_comparative_topology_output(rows, marker, context)
+        return
+    if context["scenario_id"] != "cross-flavor-equivalence":
+        if rows != [marker]:
+            raise ValueError("Directory exact assertion output differs")
+        return
+    if len(rows) != 5 or rows[-1] != marker or rows[1] != "IICP_PRE1_REGISTRATION_TRANSPORT tcp":
+        raise ValueError("Directory observed assertion output differs")
+    registration = directory_observation_json(rows[0], "IICP_PRE1_REGISTRATION_OBSERVATION ")
+    discovery = directory_observation_json(rows[2], "IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION ")
+    path = safe_path(root / "parity/behavior-contract-v1.json")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f":
+        raise ValueError("Directory output fixture differs")
+    contract = json.loads(raw)
+    expected = {row["name"]: row["expected"] for row in contract["registration_cases"]}
+    if not directory_observation_equal(registration, expected):
+        raise ValueError("Directory registration output differs")
+    validate_directory_discovery_output(discovery, context, contract)
+    endpoints = directory_observation_json(rows[3], "IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION ")
+    validate_directory_endpoint_output(endpoints, context, contract)
+
+
+def validate_comparative_topology_output(rows, marker, context):
+    if len(rows) != 2 or rows[1] != marker:
+        raise ValueError("Directory comparative topology output differs")
+    value = directory_observation_json(rows[0], "IICP_PRE1_DIRECTORY_TOPOLOGY ")
+    component = context["component"]
+    expected = {"schema": "iicp.pre1-directory-comparative-topology.v1",
+        "component": component, "mode": context["mode"],
+        "peer_port": 8090 if component == "directory-php" else 8091,
+        "own_http_observed": True,
+        "scope": "declared-peer-port-in-one-isolated-network-namespace",
+        "global_authority_established": False}
+    if (not isinstance(value, dict) or set(value) != {*expected, "address_families", "own_listener_observations"}
+            or any(value.get(key) != item for key, item in expected.items())
+            or value.get("address_families") not in (["ipv4"], ["ipv4", "ipv6"])
+            or type(value.get("own_listener_observations")) is not int
+            or not 1 <= value["own_listener_observations"] <= 10000):
+        raise ValueError("Directory comparative topology proof differs")
+
+
+def directory_observation_json(row, prefix):
+    if not row.startswith(prefix) or len(row.encode()) > 65536:
+        raise ValueError("Directory observation marker differs")
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("Directory duplicate observation key")
+            value[key] = item
+        return value
+    def invalid(value):
+        raise ValueError("Directory nonfinite observation")
+    return json.loads(row[len(prefix):], object_pairs_hook=unique, parse_constant=invalid)
+
+
+def directory_observation_equal(actual, expected):
+    import math
+    if type(expected) in (int, float):
+        return type(actual) in (int, float) and math.isfinite(actual) and actual == expected
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(directory_observation_equal(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(directory_observation_equal(a, b) for a, b in zip(actual, expected))
+    return actual == expected
+
+
+def validate_directory_discovery_output(value, context, contract):
+    fields = {"scope", "mode", "fixture_sha256", "observations", "qualification_credit", "production_endpoint_validation"}
+    flavor = context["component"]
+    if (not isinstance(value, dict) or set(value) != fields or flavor not in {"directory-php", "directory-rust"}
+            or context["mode"] not in {"local-only", "public", "restricted"} or value["mode"] != context["mode"]
+            or value["scope"] != "installed-" + flavor.removeprefix("directory-") + "-tcp-discovery-and-registration-pricing"
+            or value["fixture_sha256"] != "sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+            or value["qualification_credit"] is not False or value["production_endpoint_validation"] is not False):
+        raise ValueError("Directory discovery output scope differs")
+    expected = {group + "/" + row["name"]: (group, row)
+        for group in ("eligibility_cases", "ranking_cases", "pricing_cases") for row in contract[group]}
+    rows = value["observations"]
+    if not isinstance(rows, dict) or set(rows) != set(expected):
+        raise ValueError("Directory discovery output coverage differs")
+    for key, (group, case) in expected.items():
+        if group == "pricing_cases":
+            if not directory_observation_equal(rows[key], case["expected"]):
+                raise ValueError("Directory pricing output differs")
+        else:
+            validate_directory_selection_output(rows[key], group, case)
+
+
+def validate_directory_endpoint_output(value, context, contract):
+    fields = {"scope", "mode", "fixture_sha256", "app_env", "observations", "qualification_credit"}
+    flavor = context["component"]
+    if (not isinstance(value, dict) or set(value) != fields
+            or flavor not in {"directory-php", "directory-rust"}
+            or context["mode"] not in {"local-only", "public", "restricted"}
+            or value["mode"] != context["mode"] or value["app_env"] != "production"
+            or value["scope"] != "installed-" + flavor.removeprefix("directory-") + "-tcp-production-endpoints"
+            or value["fixture_sha256"] != "sha256:61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+            or value["qualification_credit"] is not False):
+        raise ValueError("Directory endpoint output scope differs")
+    expected = {"endpoint_cases/" + row["name"]: {
+        "blocked": row["blocked"], "status": 422, "reason": "IICP-E035" if row["blocked"] else "IICP-E036",
+        "node_rows": 0, "capability_rows": 0, "availability_rows": 0} for row in contract["endpoint_cases"]}
+    if not directory_observation_equal(value["observations"], expected):
+        raise ValueError("Directory endpoint output coverage or refusal differs")
+
+
+def validate_directory_selection_output(value, group, case):
+    if not isinstance(value, dict) or set(value) != {"eligible_ids", "recommendation_order", "scores"}:
+        raise ValueError("Directory selection output differs")
+    ids, order, scores = value["eligible_ids"], value["recommendation_order"], value["scores"]
+    validate_directory_selection_values(ids, order, scores)
+    expected = sorted(case["expected_ids"]) if group == "eligibility_cases" else (
+        [] if case["requested_model"] == "missing-model" else ["fixture-http-ranking"])
+    if ids != expected or (group == "ranking_cases" and ids and scores != [case["expected"]]):
+        raise ValueError("Directory selection output contract differs")
+
+
+
+def validate_directory_selection_values(ids, order, scores):
+    import math
+    if any(not isinstance(value, list) for value in (ids, order, scores)):
+        raise ValueError("Directory selection output lists differ")
+    if any(not isinstance(value, str) for value in ids + order):
+        raise ValueError("Directory selection output identifiers differ")
+    if len(set(order)) != len(order) or sorted(order) != ids or len(scores) != len(order):
+        raise ValueError("Directory selection output coverage differs")
+    if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1 for value in scores):
+        raise ValueError("Directory selection output scores differ")
+    if scores != sorted(scores, reverse=True):
+        raise ValueError("Directory selection output order differs")
+
+
 SCHEMA = "iicp.pre1-package-execution.v1"
 BINDINGS = (
     "candidate_manifest_sha256", "artifact_materialization_sha256",
@@ -344,6 +497,13 @@ def validate_binding_context(value: dict, context: dict) -> None:
     if any(value.get(k) != context[k] for k in ("component", "runtime", "target")) or value.get("bindings") != {k: context[k] for k in BINDINGS}:
         raise ValueError("package execution candidate/environment/runtime binding differs")
 
+def prepared_package_home() -> Path:
+    """Keep the immutable preparation boundary separate from per-case HOME."""
+    return safe_path(
+        Path(os.environ.get("IICP_PRE1_PREPARED_PACKAGE_HOME", os.environ["HOME"]))
+    )
+
+
 def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
                      vendor_artifact: Path | None = None) -> Path:
     if context["component"] in {"directory-php", "directory-rust"}:
@@ -355,7 +515,7 @@ def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
     validate_binding_identity(value)
     validate_binding_context(value, context)
     workspace = safe_path(Path(value["workspace"]))
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     installed = safe_path(Path(value["installed_package"]))
     validate_workspace_boundary(workspace, home, installed, root)
     if value["artifact_sha256"] != file_digest(artifact) or value["installed_payload_sha256"] != digest(installed_payload(artifact, installed, context["component"])):
@@ -512,7 +672,7 @@ def validate_summary_identity(summary: dict) -> None:
 def write_case_proof(value: dict) -> Path:
     """Publish a complete sidecar atomically, without overwriting earlier evidence."""
     path = Path(os.environ["IICP_PRE1_CASE_PROOF_OUTPUT"])
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     parent = safe_path(path.parent)
     if not path.is_absolute() or not parent.is_relative_to(home) or path.exists() or path.is_symlink():
         raise ValueError("case proof output is unsafe or already exists")
@@ -604,7 +764,7 @@ def rust_fixtures(root: Path, installed: Path) -> dict[str, str]:
 
 def create_rust_binding(root, workspace, installed, artifact, runtime, target, bindings, vendor_artifact):
     validate_immutable_bindings(bindings)
-    validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])),
+    validate_workspace_boundary(safe_path(workspace), prepared_package_home(),
                                safe_path(installed), root)
     payload, deps = verify_rust_payload(workspace, installed, artifact, vendor_artifact)
     value = {"schema": SCHEMA, "component": "client-rust", "runtime": runtime,
@@ -625,7 +785,7 @@ def validate_rust_binding(value, context, artifact, root, vendor_artifact):
     validate_binding_context(value, context)
     workspace = safe_path(Path(value["workspace"]))
     installed = safe_path(Path(value["installed_package"]))
-    validate_workspace_boundary(workspace, safe_path(Path(os.environ["HOME"])), installed, root)
+    validate_workspace_boundary(workspace, prepared_package_home(), installed, root)
     payload, deps = verify_rust_payload(workspace, installed, artifact, vendor_artifact)
     expected = {"artifact_sha256": file_digest(artifact),
                 "vendor_artifact_sha256": file_digest(vendor_artifact),
@@ -803,7 +963,7 @@ def management_assertions(name, source):
 def stage_management_consumer(root: Path, artifact: Path, workspace: Path) -> dict:
     """Prepare only; the caller owns dependency acquisition and isolation."""
     root, artifact, workspace = safe_path(root), safe_path(artifact), safe_path(workspace)
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root) or any(workspace.iterdir()):
         raise ValueError("Management consumer workspace is not empty and run-isolated")
     expected = rust_archive_files(artifact, artifact.stem + "/")
@@ -827,7 +987,7 @@ def stage_management_consumer(root: Path, artifact: Path, workspace: Path) -> di
 def validate_management_consumer(root: Path, artifact: Path, workspace: Path, binding: dict) -> Path:
     """Recheck artifact and reviewed assertions, even after a forged rehash."""
     workspace = safe_path(workspace)
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root.resolve()):
         raise ValueError("Management consumer workspace is not run-isolated")
     payload = safe_path(workspace / "payload")
@@ -891,14 +1051,83 @@ def validate_management_binding(value, context, artifact, root):
 # source-test command is never used as a fallback for a released binary.
 DIRECTORY_RUST_HTTP_SCENARIOS = frozenset({"credential-missing", "unsupported-version",
     "credential-expired", "credential-rotated", "rate-limit", "dynamic-public-route-readiness", "duplicate-registration", "config-permission-denied", "disk-full", "process-crash-restart", "stale-pid-or-lock", "interrupted-write"})
-DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed"})
+DIRECTORY_RUST_DATABASE_SCENARIOS = frozenset({"credential-replayed", "migration-interrupted", "signature-mismatch", "backup-restore", "rollback-last-supported", "cross-flavor-equivalence"})
 DIRECTORY_RUST_SCENARIOS = DIRECTORY_RUST_HTTP_SCENARIOS | DIRECTORY_RUST_DATABASE_SCENARIOS | frozenset({
-    "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install"})
+    "support", "package-version-self-report", "config-missing", "config-malformed", "offline-locked-install", "minimum-version", "no-dual-authority"})
 
 DIRECTORY_PROBE = r'''import json, os, resource, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import urllib.request, urllib.error
+
+
+def registration_scenario_postcondition(binary, env, version):
+    # Public synthetic delegation signed by the registration test seed;
+    # not an operator credential. Its fixed expiry must fail closed.
+    contract = Path("directory-support-behavior.json").read_bytes()
+    delegation = json.loads(Path("directory-registration-delegation.json").read_bytes())
+    observed = []
+    def observe(raw_request, request, active_binary, launch_env):
+        observed.append(registration_fixture_postcondition(
+            request, lambda query: directory_fixture_sql(env, query), contract, delegation))
+    reset_directory_database(env)
+    try:
+        rust_http_case(binary, env, "cross-flavor-equivalence", version,
+            database=True, postcondition=observe, request_timeout=10)
+        if len(observed) != 1:
+            raise ValueError("Directory registration execution was not observed")
+        return observed[0]
+    finally:
+        reset_directory_database(env)
+
+
+def discovery_scenario_postcondition(binary, env, version, mode):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("installed_discovery", "directory-discovery.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    contract = helper.read_contract("directory-support-behavior.json")
+    observed = []
+    def observe(raw_request, request, active_binary, launch_env):
+        observed.append(helper.observe(request, raw_request,
+            lambda query: directory_fixture_sql(env, query),
+            lambda subject: restricted_membership_command(active_binary, launch_env,
+                "issue", subject, "registration", "node"), contract, mode))
+    reset_directory_database(env)
+    try:
+        rust_http_case(binary, env, "cross-flavor-equivalence", version,
+            database=True, postcondition=observe, request_timeout=10)
+        if len(observed) != 1:
+            raise ValueError("Directory discovery execution was not observed")
+        return observed[0]
+    finally:
+        reset_directory_database(env)
+
+
+def endpoint_scenario_postcondition(binary, env, version, mode):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("installed_endpoints", "directory-discovery.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    contract = helper.read_contract("directory-support-behavior.json")
+    production = {**env, "APP_ENV": "production", "IICP_SKIP_LIVENESS_CHECK": "false",
+        "IICP_DEV_ALLOW_INSECURE_TLS": "false", "IICP_GENESIS_ED25519_SECRET_KEY": "00" * 64}
+    observed = []
+    def observe(raw_request, request, active_binary, launch_env):
+        if any(launch_env.get(key) != production[key] for key in
+                ("APP_ENV", "IICP_SKIP_LIVENESS_CHECK", "IICP_DEV_ALLOW_INSECURE_TLS")):
+            raise ValueError("Directory endpoint environment differs")
+        observed.append(helper.observe_endpoints(request, raw_request,
+            lambda query: directory_fixture_sql(production, query), contract, mode))
+    reset_directory_database(production)
+    try:
+        rust_http_case(binary, production, "cross-flavor-equivalence", version,
+            database=True, postcondition=observe, request_timeout=10)
+        if len(observed) != 1:
+            raise ValueError("Directory endpoint execution was not observed")
+        return observed[0]
+    finally:
+        reset_directory_database(production)
 
 
 def replica_snapshot_postcondition(request, scenario):
@@ -1047,6 +1276,82 @@ def duplicate_registration_postcondition(request):
     after = detail()
     if after["reputation_score"] != damaged or after.get("endpoint") != body["endpoint"]:
         raise ValueError("duplicate registration reset reputation or changed endpoint")
+
+def registration_fixture_postcondition(request, sql, contract_bytes, delegation):
+    """Observe the two canonical HTTP/state cases, not primitive parity.
+
+    The caller owns an isolated empty database and the installed process.
+    A valid synthetic delegation must first bind an active operator; a generic
+    422, bad signature or partial transaction cannot satisfy revoked rollback.
+    This helper alone neither admits a scenario nor grants qualification.
+    """
+    import hashlib, re
+    if hashlib.sha256(contract_bytes).hexdigest() != "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f":
+        raise ValueError("registration behavior fixture differs")
+    cases = {row["name"]: row["expected"] for row in json.loads(contract_bytes)["registration_cases"]}
+    node_id = "fixture-revoked-registration"
+    if (not isinstance(delegation, dict) or set(delegation) != {"node_id", "operator_pub", "not_after", "sig"}
+            or delegation["node_id"] != node_id
+            or not isinstance(delegation["operator_pub"], str)
+            or not re.fullmatch(r"[A-Za-z0-9+/]{43}=", delegation["operator_pub"])
+            or type(delegation["not_after"]) is not int
+            or delegation["not_after"] <= int(time.time()) + 60
+            or not isinstance(delegation["sig"], str)
+            or not re.fullmatch(r"[A-Za-z0-9+/]{86}==", delegation["sig"])):
+        raise ValueError("registration synthetic delegation differs")
+    def counts():
+        raw = sql("SELECT (SELECT COUNT(*) FROM nodes), (SELECT COUNT(*) FROM capabilities), "
+                  "(SELECT COUNT(*) FROM availability_windows)")
+        if not re.fullmatch(rb"[0-9]+\t[0-9]+\t[0-9]+\n", raw):
+            raise ValueError("registration relation counts differ")
+        return dict(zip(("node_rows", "capability_rows", "availability_rows"), map(int, raw.split())))
+    if any(counts().values()):
+        raise ValueError("registration fixture database is not empty")
+    def body(identifier, model, start):
+        # Explicit direct reachability keeps the isolated registration fixture
+        # from attempting external endpoint probes. This is not reachability proof.
+        return {"node_id": identifier, "endpoint": "https://1.1.1.1", "region": "eu-central",
+            "nat_type": "public", "transport_method": "direct_ipv4",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": [model], "max_tokens": 4096}],
+            "availability": [{"start": start, "end": "17:00", "share": 1.0}],
+            "limits": {"max_concurrent": 4, "tokens_per_min": 10000}}
+    recovery_id = "fixture-recovery-registration"
+    status, first = request("/v1/register", body(recovery_id, "model-a", "08:00"))
+    if status != 201 or first.get("node_id") != recovery_id or not isinstance(first.get("node_token"), str) or not first["node_token"]:
+        raise ValueError("registration recovery seed failed")
+    status, second = request("/v1/register", {**body(recovery_id, "model-b", "09:00"),
+        "current_node_token": first["node_token"]})
+    if status != 201 or second.get("node_id") != recovery_id or second.get("recovered") is not True:
+        raise ValueError("registration recovery result differs")
+    recovery = {**counts(), "recovered": second["recovered"]}
+    models = sql("SELECT CAST(models AS CHAR) FROM capabilities WHERE node_id = 'fixture-recovery-registration'")
+    start = sql("SELECT TIME_FORMAT(start_time, '%H:%i') FROM availability_windows WHERE node_id = 'fixture-recovery-registration'")
+    if json.loads(models) != ["model-b"] or start != b"09:00\n" or recovery != cases["recovery_replaces_relations"]:
+        raise ValueError("registration recovery did not replace relations")
+    def remove_node(identifier):
+        # Identifiers here are fixed fixture constants, never user SQL.
+        sql("DELETE FROM capabilities WHERE node_id = '" + identifier + "'; "
+            "DELETE FROM availability_windows WHERE node_id = '" + identifier + "'; "
+            "DELETE FROM nodes WHERE id = '" + identifier + "'")
+    remove_node(recovery_id)
+    status, positive = request("/v1/register", {**body(node_id, "model-a", "08:00"), "operator_delegation": delegation})
+    pub_hex = delegation["operator_pub"].encode().hex()
+    verified = sql("SELECT operator_verified FROM nodes WHERE id = 'fixture-revoked-registration' "
+        "AND CAST(operator_pubkey AS BINARY) = 0x" + pub_hex)
+    if status != 201 or positive.get("node_id") != node_id or verified != b"1\n":
+        raise ValueError("registration delegation positive control failed")
+    remove_node(node_id)
+    sql("UPDATE operators SET identity_status = 'revoked' WHERE CAST(operator_pubkey AS BINARY) = 0x" + pub_hex)
+    if sql("SELECT identity_status FROM operators WHERE CAST(operator_pubkey AS BINARY) = 0x" + pub_hex) != b"revoked\n":
+        raise ValueError("registration operator revocation fixture failed")
+    status, refused = request("/v1/register", {**body(node_id, "model-a", "08:00"), "operator_delegation": delegation})
+    if (status != 422 or refused.get("error", {}).get("code") != "validation_error"
+            or refused["error"].get("message") != "operator delegation references an inactive identity"):
+        raise ValueError("registration revoked refusal cause differs")
+    rollback = {**counts(), "status": status}
+    if rollback != cases["revoked_operator_rolls_back"]:
+        raise ValueError("registration revoked rollback left partial rows")
+    return {"recovery_replaces_relations": recovery, "revoked_operator_rolls_back": rollback}
 
 def http_postcondition(request, scenario):
     if scenario == "environment-public":
@@ -1205,6 +1510,50 @@ def credential_replay_postcondition(request, observe):
     if (not recovered or recovered["verified_at"] is None or recovered["verified_at"] <= accepted["verified_at"]
         or recovered["challenge"] != fourth or fourth in {first, second, third}):
         raise ValueError("Directory replay fresh response recovery differs")
+
+def signature_mismatch_postcondition(request, observe):
+    # A heartbeat can accept metrics while refusing cryptographic liveness.
+    # Check persisted verification, not merely its HTTP success response.
+    import hmac, hashlib
+    if observe() is not None:
+        raise ValueError("Directory signature fixture identity already exists")
+    body = {"node_id": "fixture-replay", "endpoint": "http://127.0.0.1:1/v1/task",
+        "region": "eu-central", "nat_type": "public", "transport_method": "direct_ipv4",
+        "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
+    code, registered = request("/v1/register", body)
+    token, key = registered.get("node_token"), registered.get("node_hmac_key")
+    if code != 201 or registered.get("node_id") != body["node_id"] or not token or not key:
+        raise ValueError("Directory signature registration positive control differs")
+    def heartbeat(response=None):
+        payload = {"node_id": body["node_id"], "available": False}
+        if response is not None:
+            payload["challenge_response"] = response
+        status, value = request("/v1/heartbeat", payload, {"Authorization": "Bearer " + token})
+        challenge = value.get("challenge")
+        if status != 200 or value.get("ok") is not True or not isinstance(challenge, str) or not challenge:
+            raise ValueError("Directory signature heartbeat positive control differs")
+        return challenge
+    def answer(challenge):
+        return hmac.new(key.encode(), challenge.encode(), hashlib.sha256).hexdigest()
+    first = heartbeat()
+    if observe() != {"verified_at": None, "challenge": first}:
+        raise ValueError("Directory signature initial state differs")
+    second = heartbeat(answer(first))
+    accepted = observe()
+    if not accepted or accepted["verified_at"] is None or accepted["challenge"] != second or second == first:
+        raise ValueError("Directory signature valid response was not verified")
+    time.sleep(1.1)
+    valid = answer(second)
+    tampered = ("0" if valid[0] != "0" else "1") + valid[1:]
+    third = heartbeat(tampered)
+    if observe() != {"verified_at": accepted["verified_at"], "challenge": third} or third in {first, second}:
+        raise ValueError("Directory signature mismatch advanced verification or failed rotation")
+    time.sleep(1.1)
+    fourth = heartbeat(answer(third))
+    recovered = observe()
+    if (not recovered or recovered["verified_at"] is None or recovered["verified_at"] <= accepted["verified_at"]
+        or recovered["challenge"] != fourth or fourth in {first, second, third}):
+        raise ValueError("Directory signature valid recovery differs")
 
 def snapshot_checkpoint(path, pid):
     import stat
@@ -1465,8 +1814,501 @@ def stale_owner_postcondition(process, snapshot, request, contender, contender_l
     wait_snapshot_checkpoint(process, snapshot, sequence)
     return crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
 
-def rust_http_case(binary, env, scenario, version, database=False):
+def restricted_membership_command(binary, env, action, subject, scope="discovery", kind="client"):
+    import re
+    if (action not in {"issue", "revoke"} or kind not in {"node", "client"}
+            or not isinstance(subject, str) or len(subject) > 128
+            or (subject not in {"fallback-capability", "empty-health", "unstable-backend",
+                                "eligible", "below-realtime", "realtime"}
+                and not re.fullmatch(r"fixture(?:-[a-z0-9-]+)?|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", subject))
+            or scope not in {"registration", "discovery", "bootstrap", "heartbeat", "peers", "consumer_token", "dispatch", "relay"}):
+        raise ValueError("Directory membership fixture command differs")
+    argv = [str(binary), "trust-domain-membership-" + action,
+        "--kind", kind, "--subject", subject]
+    if action == "issue":
+        argv += ["--scopes", scope, "--ttl-seconds", "3600"]
+    with tempfile.TemporaryFile(dir=private_case_home(env)) as output:
+        result = subprocess.run(argv, cwd=binary.parent, env=env, stdout=output,
+            stderr=subprocess.DEVNULL, timeout=30, check=False)
+        output.seek(0)
+        raw = output.read(4097)
+    if result.returncode != 0 or len(raw) > 4096:
+        raise ValueError("Directory membership fixture administration failed")
+    value = raw.decode("utf-8").strip()
+    if ((action == "issue" and not re.fullmatch(r"iicp_mem_[0-9a-f]{64}", value))
+            or (action == "revoke" and value != "revoked")):
+        raise ValueError("Directory membership fixture output differs")
+    return value
+
+def restricted_mode_postcondition(request, administer):
+    discover = "/v1/discover?intent=urn:iicp:intent:llm:chat:v1"
+    def denied(headers=None, path=discover):
+        status, body = request(path, headers=headers)
+        if (status != 401 or body.get("error", {}).get("code") != "restricted_domain_denied"
+                or "restricted_domain_decision" in body):
+            raise ValueError("Directory restricted-mode denial differs")
+    denied()
+    token = administer("issue", "fixture-client", "discovery")
+    headers = {"X-IICP-Membership": token, "X-IICP-Subject-Id": "fixture-client"}
+    def eligible(credential):
+        status, body = request(discover, headers={**headers, "X-IICP-Membership": credential})
+        decision = body.get("restricted_domain_decision", {})
+        if (status != 200 or body.get("nodes") != [] or type(body.get("count")) is not int
+                or body["count"] != 0 or "error" in body
+                or decision.get("schema") != "iicp.restricted-trust-domain.directory-decision.v0"
+                or decision.get("profile") != "urn:iicp:profile:restricted-trust-domain:v1"
+                or decision.get("decision") != "eligible" or decision.get("operation") != "discovery"
+                or decision.get("domain_id") != "example.internal"
+                or decision.get("authority_id") != "did:key:directory"
+                or decision.get("subject_kind") != "client"
+                or type(decision.get("membership_generation")) is not int or decision["membership_generation"] < 1
+                or type(decision.get("membership_expires_at")) is not int
+                or decision["membership_expires_at"] <= int(time.time())):
+            raise ValueError("Directory restricted-mode eligibility differs")
+    eligible(token)
+    denied(headers, "/v1/bootstrap")
+    denied({**headers, "X-IICP-Subject-Id": "fixture-other"})
+    denied({**headers, "X-IICP-Membership": token[:-1] + ("a" if token[-1] != "a" else "b")})
+    wrong_scope = administer("issue", "fixture-other", "bootstrap")
+    denied({"X-IICP-Membership": wrong_scope, "X-IICP-Subject-Id": "fixture-other"})
+    rotated = administer("issue", "fixture-client", "discovery")
+    if rotated == token:
+        raise ValueError("Directory membership rotation did not replace credential")
+    denied(headers)
+    eligible(rotated)
+    administer("revoke", "fixture-client", "discovery")
+    denied({**headers, "X-IICP-Membership": rotated})
+    administer("revoke", "fixture-other", "bootstrap")
+
+def directory_support_postcondition():
+    import hashlib
+    workspace = Path.cwd()
+    paths = [workspace / ("directory-support-" + name + ".json") for name in ("contract", "behavior", "http")]
+    if any(path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 1024 * 1024 for path in paths):
+        raise ValueError("Directory support fixtures are missing or unsafe")
+    contract = json.loads(paths[0].read_text())
+    expected = {"behavior-contract-v1.json": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f",
+        "http-contract-v1.json": "62fad592a33305a754353c43f6476d257f01ccf6e3cfdbf391d03717ce4796b5"}
+    if (contract.get("contract_version") != "v1.10.80" or contract.get("fixtures") != expected
+            or [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths[1:]] != list(expected.values())):
+        raise ValueError("Directory support fixture contract differs")
+
+def rust_mode_environment(env, mode):
+    result = dict(env)
+    if mode == "restricted":
+        result.update(IICP_RESTRICTED_DOMAIN_ENABLED="true", IICP_REPLICA_MODE="false",
+            IICP_TRUST_DOMAIN_ID="example.internal", IICP_TRUST_DOMAIN_AUTHORITY_ID="did:key:directory",
+            IICP_TRUST_DOMAIN_MEMBERSHIP_EPOCH="1")
+    elif mode == "public":
+        result["IICP_RESTRICTED_DOMAIN_ENABLED"] = "false"
+    elif mode != "local-only":
+        raise ValueError("Directory mode differs")
+    return result
+
+def reset_directory_database(env):
     require_loopback_only()
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    sql = "DROP DATABASE IF EXISTS `" + config["database"] + "`; CREATE DATABASE `" + config["database"] + "`"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--no-defaults", "--batch", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--connect-timeout=3", "--user=" + config["username"], "--execute", sql]
+    with tempfile.TemporaryDirectory(prefix="directory-reset-home-", dir=private_case_home(env)) as home:
+        result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+    if result.returncode:
+        raise ValueError("Directory disposable database reset failed")
+
+def directory_fixture_sql(env, sql):
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--no-defaults", "--batch", "--raw", "--skip-column-names", "--protocol=TCP",
+        "--host=127.0.0.1", "--port=3306", "--connect-timeout=3",
+        "--user=" + config["username"], "--database=" + config["database"], "--execute", sql]
+    with tempfile.TemporaryDirectory(prefix="directory-schema-home-", dir=private_case_home(env)) as home, tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=output, stderr=errors, timeout=10, check=False)
+        output.seek(0); observed = output.read(65537)
+        errors.seek(0); failure = errors.read(65536)
+    if result.returncode or len(observed) > 65536:
+        retain_sql_failure(failure, password)
+        raise ValueError("Directory isolated schema oracle failed; bounded private error retained")
+    return observed
+
+def retain_sql_failure(failure, password):
+    # Never retain stdout, argv, SQL text, or the credential-bearing environment.
+    # MySQL error diagnostics are bounded, private and redact the actual password.
+    destination = os.environ.get("IICP_PRE1_CASE_EVIDENCE_ROOT")
+    if destination:
+        safe = failure[:65536].replace(password.encode(), b"[REDACTED]")[:65536]
+        with tempfile.NamedTemporaryFile(prefix="directory-sql-failure-", suffix=".log",
+                dir=destination, delete=False) as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(safe)
+
+
+def directory_database_export(env):
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    dump = tools / "mysqldump"
+    if not dump.is_file() or dump.is_symlink():
+        raise ValueError("Directory backup requires pinned mysqldump fixture")
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(dump),
+        "--no-defaults", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--user=" + config["username"], "--single-transaction",
+        "--skip-comments", "--skip-dump-date", "--skip-extended-insert", "--order-by-primary",
+        "--no-tablespaces", "--set-gtid-purged=OFF", config["database"]]
+    limit = 8 * 1024 * 1024
+    with tempfile.TemporaryDirectory(prefix="directory-backup-home-", dir=private_case_home(env)) as home, tempfile.TemporaryFile(dir=home) as output, tempfile.TemporaryFile(dir=home) as errors:
+        result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=output, stderr=errors, timeout=20, check=False,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)))
+        output.seek(0); value = output.read(limit + 1)
+        errors.seek(0); diagnostic = errors.read(4096).decode("utf-8", errors="replace").replace(password, "[REDACTED]")
+    if result.returncode or not value or len(value) > limit or b"CREATE TABLE" not in value:
+        raise ValueError("Directory bounded database export failed: exit=" + str(result.returncode) + " " + diagnostic)
+    return value
+
+def directory_database_import(env, backup):
+    require_loopback_only()
+    if not isinstance(backup, bytes) or not 0 < len(backup) <= 8 * 1024 * 1024:
+        raise ValueError("Directory restore input exceeds bound")
+    config, password = database_fixture_inputs()
+    tools = Path.cwd() / "directory-database-tools"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--no-defaults", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--connect-timeout=3", "--user=" + config["username"], "--database=" + config["database"]]
+    with tempfile.TemporaryDirectory(prefix="directory-restore-home-", dir=private_case_home(env)) as home:
+        result = subprocess.run(argv, input=backup,
+            env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False)
+    if result.returncode:
+        raise ValueError("Directory isolated database restore failed")
+
+def directory_database_state(env):
+    # Compare actual schema/data, not mysqldump's optional CHARACTER SET spelling.
+    import re
+    schema = directory_fixture_sql(env,
+        "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'NULL'),COLUMN_DEFAULT IS NULL,EXTRA,GENERATION_EXPRESSION,"
+        "COALESCE(CHARACTER_SET_NAME,'NULL'),COALESCE(COLLATION_NAME,'NULL') "
+        "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION;"
+        "SELECT TABLE_NAME,INDEX_NAME,COLUMN_NAME,NON_UNIQUE,SEQ_IN_INDEX,SUB_PART,INDEX_TYPE,IS_VISIBLE,EXPRESSION FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX;"
+        "SELECT TABLE_NAME,TABLE_TYPE,ENGINE,TABLE_COLLATION,CREATE_OPTIONS FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME;"
+        "SELECT TABLE_NAME,CONSTRAINT_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME "
+        "FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION;"
+        "SELECT TABLE_NAME,CONSTRAINT_NAME,UPDATE_RULE,DELETE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS "
+        "WHERE CONSTRAINT_SCHEMA=DATABASE() ORDER BY TABLE_NAME,CONSTRAINT_NAME;"
+        "SELECT CONSTRAINT_NAME,CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS "
+        "WHERE CONSTRAINT_SCHEMA=DATABASE() ORDER BY CONSTRAINT_NAME;")
+    raw = directory_fixture_sql(env, "SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION;")
+    columns = {}
+    for line in raw.decode("ascii").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or any(not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) for name in parts):
+            raise ValueError("Directory database observation identifiers differ")
+        columns.setdefault(parts[0], []).append(parts[1])
+    if not columns or len(columns) > 64 or any(len(names) > 128 for names in columns.values()):
+        raise ValueError("Directory database observation exceeds table/column bounds")
+    rows = {}
+    for table, names in columns.items():
+        fields = ",".join("IF(`" + name + "` IS NULL,'NULL',HEX(CAST(`" + name + "` AS BINARY)))" for name in names)
+        rows[table] = directory_fixture_sql(env, "SELECT " + fields + " FROM `" + table + "` ORDER BY "
+            + ",".join(str(i + 1) for i in range(len(names))))
+    if len(schema) + sum(len(value) for value in rows.values()) > 8 * 1024 * 1024:
+        raise ValueError("Directory database state exceeds bound")
+    return {"schema": schema, "rows": rows}
+
+def rollback_request_state(before, after, expected_count):
+    # Successful discovery is intentionally accounted by the released service.
+    # Verify its exact increment rather than ignoring telemetry or all-row drift.
+    if before["schema"] != after["schema"] or set(before["rows"]) != set(after["rows"]):
+        raise ValueError("Directory rollback request changed schema")
+    for table in before["rows"]:
+        if table != "dispatch_usage_daily" and before["rows"][table] != after["rows"][table]:
+            raise ValueError("Directory rollback request changed non-accounting data")
+    def usage(raw):
+        return [line.split(b"\t") for line in raw.splitlines()]
+    original, updated = usage(before["rows"]["dispatch_usage_daily"]), usage(after["rows"]["dispatch_usage_daily"])
+    if len(original) != len(updated) or not original:
+        raise ValueError("Directory rollback accounting row identity differs")
+    delta = 0
+    for old, new in zip(original, updated):
+        if len(old) != 6 or len(new) != 6 or old[:3] != new[:3] or old[4] != new[4]:
+            raise ValueError("Directory rollback accounting identity differs")
+        count = int(bytes.fromhex(new[3].decode())) - int(bytes.fromhex(old[3].decode()))
+        if count not in (0, 1) or new[5] < old[5] or (count == 0 and new != old):
+            raise ValueError("Directory rollback accounting mutation differs")
+        if count and bytes.fromhex(old[2].decode()) != b"legacy_dispatch":
+            raise ValueError("Directory rollback accounting mode differs")
+        delta += count
+    if delta != expected_count:
+        raise ValueError("Directory rollback accounting increment differs")
+
+def rollback_postcondition(binary, env, version, predecessor, predecessor_sha256):
+    # The caller must supply a preparation-bound predecessor. This probe is not
+    # admitted into qualification until its fixture is in the package binding.
+    import hashlib
+    import re
+    if (predecessor.is_symlink() or not predecessor.is_file()
+            or not re.fullmatch(r"sha256:[a-f0-9]{64}", predecessor_sha256)
+            or "sha256:" + hashlib.sha256(predecessor.read_bytes()).hexdigest() != predecessor_sha256):
+        raise ValueError("Directory rollback predecessor binding differs")
+    observed = subprocess.check_output([str(predecessor), "--version"], env=env, text=True, timeout=10)
+    if observed.strip() != "iicp-directory-rs 0.1.15":
+        raise ValueError("Directory rollback predecessor version differs")
+    baseline = {}
+    def authorization(request):
+        for subject, expected in (("fixture-rollback-allowed", 200), ("fixture-rollback-denied", 401)):
+            request_before = directory_database_state(env) if "state" in baseline else None
+            code, result = request("/v1/discover?intent=urn:iicp:intent:llm:chat:v1", headers=baseline[subject])
+            if request_before is not None:
+                rollback_request_state(request_before, directory_database_state(env), 1 if expected == 200 else 0)
+            if code != expected:
+                raise ValueError("Directory rollback authorization or revocation differs")
+            if expected == 200:
+                decision = result.get("restricted_domain_decision", {})
+                if (decision.get("decision") != "eligible" or decision.get("domain_id") != "example.internal"
+                        or decision.get("authority_id") != "did:key:directory"):
+                    raise ValueError("Directory rollback authority projection differs")
+            elif result.get("error", {}).get("code") != "restricted_domain_denied":
+                raise ValueError("Directory rollback denial cause differs")
+    def seed(request, scenario_request, executable, launch_env):
+        body = {"node_id": "fixture-rollback", "endpoint": "http://127.0.0.1:1/v1/task",
+            "region": "eu-central", "nat_type": "public", "transport_method": "direct_ipv4",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
+        code, registered = scenario_request("/v1/register", body)
+        if code != 201 or registered.get("node_id") != body["node_id"] or not registered.get("node_token"):
+            raise ValueError("Directory rollback registration positive control differs")
+        code, detail = request("/v1/node/fixture-rollback")
+        if code != 200 or detail.get("node_id") != body["node_id"]:
+            raise ValueError("Directory rollback seed observation differs")
+        baseline["detail"] = detail
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            for subject in ("fixture-rollback-allowed", "fixture-rollback-denied"):
+                token = restricted_membership_command(executable, launch_env, "issue", subject, "discovery")
+                baseline[subject] = {"X-IICP-Membership": token, "X-IICP-Subject-Id": subject}
+            restricted_membership_command(executable, launch_env, "revoke", "fixture-rollback-denied", "discovery")
+            authorization(request)
+    def readback(request, scenario_request, executable, launch_env):
+        code, detail = request("/v1/node/fixture-rollback")
+        if code != 200 or detail != baseline["detail"]:
+            raise ValueError("Directory rollback persistent HTTP state differs")
+        if directory_database_state(env) != baseline["state"]:
+            raise ValueError("Directory rollback startup changed persistent state")
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            authorization(request)
+        baseline["state"] = directory_database_state(env)
+    reset_directory_database(env)
+    try:
+        with tempfile.TemporaryDirectory(prefix="directory-rollback-", dir=private_case_home(env)) as directory:
+            active = Path(directory) / "current"
+            def select(executable):
+                pending = active.with_name("next")
+                pending.symlink_to(executable)
+                os.replace(pending, active)
+            select(predecessor)
+            rust_http_case(active, env, "rollback-seed", "0.1.15", database=True, postcondition=seed)
+            baseline["state"] = directory_database_state(env)
+            select(binary)
+            rust_http_case(active, env, "rollback-upgrade", version, database=True, postcondition=readback)
+            before = baseline["state"]
+            after_upgrade = directory_database_state(env)
+            if after_upgrade != before:
+                evidence = os.environ.get("IICP_PRE1_CASE_EVIDENCE_ROOT")
+                if evidence:
+                    changed = {name: {"before_sha256": hashlib.sha256(value).hexdigest(),
+                        "after_sha256": hashlib.sha256(after_upgrade["rows"].get(name, b"")).hexdigest()}
+                        for name, value in before["rows"].items()
+                        if value != after_upgrade["rows"].get(name)}
+                    destination = Path(tempfile.mkdtemp(prefix="directory-rollback-state-", dir=evidence))
+                    path = destination / "changed-tables.json"
+                    path.write_text(json.dumps({"schema_changed": before["schema"] != after_upgrade["schema"],
+                        "tables": changed, "qualification_credit": False}) + "\n")
+                    path.chmod(0o600)
+                raise ValueError("Directory upgrade changed rollback persistent state")
+            failure_env = {**env, "APP_ENV": "local", "IICP_ALLOW_IN_MEMORY": "false"}
+            failure_env.pop("DATABASE_URL", None)
+            # Do not accept an arbitrary crash as the intended failed upgrade.
+            with tempfile.TemporaryFile(dir=private_case_home(env)) as log:
+                result = subprocess.run([str(active)], cwd=active.parent, env=failure_env,
+                    stdout=log, stderr=subprocess.STDOUT, timeout=10, check=False)
+                output = os.pread(log.fileno(), 65537, 0)
+                evidence = os.environ.get("IICP_PRE1_CASE_EVIDENCE_ROOT")
+                if evidence:
+                    destination = Path(tempfile.mkdtemp(prefix="directory-rollback-failure-", dir=evidence))
+                    (destination / "stdout.log").write_bytes(output[:65536])
+                    (destination / "result.json").write_text(json.dumps({"exit_code": result.returncode,
+                        "qualification_credit": False, "stage": "failed-upgrade"}) + "\n")
+                    for item in destination.iterdir():
+                        item.chmod(0o600)
+                refusal = b"FATAL: DATABASE_URL is required; ephemeral memory requires non-production APP_ENV and IICP_ALLOW_IN_MEMORY=true"
+                if (result.returncode != 1 or len(output) > 65536
+                        or refusal not in output
+                        or b"listening on" in output):
+                    raise ValueError("Directory failed-upgrade cause differs")
+            if directory_database_state(env) != before:
+                raise ValueError("Directory failed upgrade changed persistent state")
+            select(predecessor)
+            if active.resolve() != predecessor.resolve():
+                raise ValueError("Directory predecessor managed path was not restored")
+            rust_http_case(active, env, "rollback-restart", "0.1.15", database=True, postcondition=readback)
+            if directory_database_state(env) != baseline["state"]:
+                raise ValueError("Directory rollback changed schema or persistent data")
+    finally:
+        reset_directory_database(env)
+
+def backup_restore_postcondition(binary, env, version):
+    baseline = {}
+    def seed(request, scenario_request, binary, launch_env):
+        body = {"node_id": "fixture-backup", "endpoint": "http://127.0.0.1:1/v1/task",
+            "region": "eu-central", "nat_type": "public", "transport_method": "direct_ipv4",
+            "capabilities": [{"intent": "urn:iicp:intent:llm:chat:v1", "models": ["fixture"]}]}
+        status, registered = scenario_request("/v1/register", body)
+        if status != 201 or registered.get("node_id") != body["node_id"] or not registered.get("node_token"):
+            raise ValueError("Directory backup registration positive control differs")
+        code, detail = request("/v1/node/fixture-backup")
+        if code != 200 or detail.get("node_id") != "fixture-backup":
+            raise ValueError("Directory backup HTTP observation differs")
+        baseline["detail"] = detail
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            for subject in ("fixture-backup-allowed", "fixture-backup-denied"):
+                token = restricted_membership_command(binary, launch_env, "issue", subject, "discovery")
+                baseline[subject] = {"X-IICP-Membership": token, "X-IICP-Subject-Id": subject}
+            restricted_membership_command(binary, launch_env, "revoke", "fixture-backup-denied", "discovery")
+            authorization(request)
+    def authorization(request):
+        for subject, expected in (("fixture-backup-allowed", 200), ("fixture-backup-denied", 401)):
+            code, value = request("/v1/discover?intent=urn:iicp:intent:llm:chat:v1", headers=baseline[subject])
+            if code != expected:
+                raise ValueError("Directory restored authorization or revocation differs")
+            if expected == 200:
+                decision = value.get("restricted_domain_decision", {})
+                if (decision.get("decision") != "eligible" or decision.get("domain_id") != "example.internal"
+                        or decision.get("authority_id") != "did:key:directory"):
+                    raise ValueError("Directory restored authority projection differs")
+            elif value.get("error", {}).get("code") != "restricted_domain_denied":
+                raise ValueError("Directory restore denial cause differs")
+    def readback(request, scenario_request, binary, launch_env):
+        code, detail = request("/v1/node/fixture-backup")
+        if code != 200 or detail != baseline["detail"]:
+            raise ValueError("Directory restored installed HTTP state differs")
+        if launch_env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true":
+            authorization(request)
+    reset_directory_database(env)
+    try:
+        rust_http_case(binary, env, "backup-seed", version, database=True, postcondition=seed)
+        before = directory_database_state(env)
+        backup = directory_database_export(env)
+        reset_directory_database(env)
+        directory_database_import(env, backup)
+        if directory_database_state(env) != before:
+            raise ValueError("Directory restored schema or persistent data differs")
+        directory_fixture_sql(env, "UPDATE nodes SET endpoint='http://127.0.0.1:2/v1/task' WHERE id='fixture-backup';")
+        if directory_database_state(env) == before:
+            raise ValueError("Directory backup state oracle ignored deliberate corruption")
+        reset_directory_database(env)
+        directory_database_import(env, backup)
+        if directory_database_state(env) != before:
+            raise ValueError("Directory backup failed to recover deliberate corruption")
+        rust_http_case(binary, env, "backup-readback", version, database=True, postcondition=readback)
+    finally:
+        reset_directory_database(env)
+
+def migration_interrupted_postcondition(binary, env, version):
+    # The released boundary is verify-only for an existing database. Never
+    # simulate recovery by repairing it from the harness after startup.
+    require_loopback_only()
+    config, password = database_fixture_inputs()
+    from urllib.parse import quote
+    launch_env = {**env, "APP_KEY": "iicp-pre1-isolated-synthetic-key",
+        "DATABASE_URL": "mysql://" + config["username"] + ":" + quote(password, safe="")
+            + "@127.0.0.1:3306/" + config["database"]}
+    observation = (
+        "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'NULL'),EXTRA "
+        "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION;"
+        "SELECT TABLE_NAME,INDEX_NAME,COLUMN_NAME,NON_UNIQUE FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX;"
+        "SELECT TABLE_NAME,TABLE_TYPE,ENGINE,TABLE_COLLATION,CREATE_OPTIONS FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME;"
+        "SELECT TABLE_NAME,CONSTRAINT_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME "
+        "FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() "
+        "ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION;"
+        "SELECT id FROM nodes ORDER BY id;")
+    reset_directory_database(env)
+    try:
+        # Same installed binary must first bootstrap an empty, valid fixture
+        # and serve its real HTTP contract before the negative control.
+        rust_http_case(binary, env, "credential-missing", version, database=True)
+        reset_directory_database(env)
+        directory_fixture_sql(env, "CREATE TABLE nodes (id VARCHAR(128) NOT NULL PRIMARY KEY);"
+            "INSERT INTO nodes (id) VALUES ('fixture-interrupted-schema');")
+        before = directory_fixture_sql(env, observation)
+        if not before.startswith(b"nodes\tid\t") or not before.endswith(b"fixture-interrupted-schema\n"):
+            raise ValueError("Directory interrupted schema fixture differs")
+        with tempfile.TemporaryFile(dir=private_case_home(env)) as log:
+            result = subprocess.run([str(binary)], cwd=binary.parent, env=launch_env,
+                stdout=log, stderr=subprocess.STDOUT, timeout=30, check=False)
+            log.seek(0); output = log.read(65537)
+        after = directory_fixture_sql(env, observation)
+        if (result.returncode != 1 or len(output) > 65536
+                or b"FATAL: MySQL schema verification failed: schema incompatible (" not in output
+                or b"listening on" in output or b"using InMemoryRepo" in output
+                or before != after):
+            raise ValueError("Directory installed startup did not preserve and reject the interrupted schema")
+    finally:
+        reset_directory_database(env)
+
+def restricted_request_adapter(request, binary, env):
+    operations = {("POST", "/v1/register"): "registration", ("GET", "/v1/discover"): "discovery",
+        ("GET", "/v1/bootstrap"): "bootstrap", ("POST", "/v1/heartbeat"): "heartbeat",
+        ("POST", "/v1/peers"): "peers", ("POST", "/v1/consumer-token"): "consumer_token",
+        ("POST", "/v1/dispatch/ticket"): "dispatch", ("POST", "/v1/relay/ticket"): "relay"}
+    projected = {"registration": "registration", "discovery": "discovery", "bootstrap": "bootstrap",
+        "consumer_token": "consumer_token", "dispatch": "dispatch_ticket"}
+    def execute(path, body=None, headers=None):
+        operation = operations.get(("GET" if body is None else "POST", path.split("?", 1)[0]))
+        if operation is None:
+            return request(path, body, headers)
+        supplied = dict(headers or {})
+        if any(key.lower() in {"x-iicp-membership", "x-iicp-subject-id"} for key in supplied):
+            raise ValueError("Directory scenario must not override fixture membership")
+        subject = body.get("node_id", "fixture-client") if isinstance(body, dict) else "fixture-client"
+        kind = "node" if operation in {"registration", "heartbeat", "peers"} else "client"
+        token = restricted_membership_command(binary, env, "issue", subject, operation, kind)
+        status, value = request(path, body, {**supplied, "X-IICP-Membership": token, "X-IICP-Subject-Id": subject})
+        error = value.get("error")
+        if isinstance(error, dict) and error.get("code") in {"restricted_domain_denied", "restricted_domain_unavailable"}:
+            raise ValueError("Directory membership rejection masked scenario behavior")
+        if 200 <= status < 300 and operation in projected:
+            decision = value.get("restricted_domain_decision")
+            if (not isinstance(decision, dict) or decision.get("decision") != "eligible"
+                    or decision.get("operation") != projected[operation]
+                    or decision.get("domain_id") != "example.internal"
+                    or decision.get("authority_id") != "did:key:directory"
+                    or decision.get("subject_kind") != kind):
+                raise ValueError("Directory scenario restricted projection differs")
+        return status, value
+    return execute
+
+def rust_http_case(binary, env, scenario, version, database=False, postcondition=None, request_timeout=2,
+                   listener_check=None):
+    # Transactional registration includes password hashing on bounded CI CPUs;
+    # this functional budget is not a latency qualification threshold.
+    if type(request_timeout) not in {int, float} or not 0 < request_timeout <= 10:
+        raise ValueError("Directory HTTP request budget differs")
+    require_loopback_only()
+    if scenario == "environment-restricted" and (not database
+            or env.get("IICP_RESTRICTED_DOMAIN_ENABLED") != "true"
+            or env.get("IICP_REPLICA_MODE") != "false"
+            or env.get("IICP_TRUST_DOMAIN_ID") != "example.internal"
+            or env.get("IICP_TRUST_DOMAIN_AUTHORITY_ID") != "did:key:directory"):
+        raise ValueError("Directory restricted fixture requires isolated database and exact mode")
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
@@ -1476,7 +2318,7 @@ def rust_http_case(binary, env, scenario, version, database=False):
             data=None if body is None else json.dumps(body).encode(),
             headers={"Content-Type": "application/json", **(headers or {})})
         try:
-            response = opener.open(req, timeout=2)
+            response = opener.open(req, timeout=request_timeout)
         except urllib.error.HTTPError as error:
             response = error
         with response:
@@ -1495,6 +2337,9 @@ def rust_http_case(binary, env, scenario, version, database=False):
             + "@127.0.0.1:3306/" + config["database"])
     else:
         launch_env["IICP_ALLOW_IN_MEMORY"] = "true"
+    scenario_request = (restricted_request_adapter(request, binary, launch_env)
+        if env.get("IICP_RESTRICTED_DOMAIN_ENABLED") == "true" and scenario != "environment-restricted"
+        else request)
     with tempfile.TemporaryDirectory(prefix="directory-health-", dir=private_case_home(env)) as health_dir, tempfile.TemporaryFile(dir=private_case_home(env)) as log:
         snapshot = Path(health_dir) / "health.json"
         launch_env["IICP_RUNTIME_HEALTH_FILE"] = str(snapshot)
@@ -1515,7 +2360,14 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 if time.monotonic() >= deadline:
                     raise ValueError("Directory HTTP fixture readiness timed out")
                 time.sleep(0.1)
-            if scenario == "config-permission-denied":
+            if listener_check is not None:
+                listener_check()
+            if postcondition is not None:
+                postcondition(request, scenario_request, binary, launch_env)
+            elif scenario == "environment-restricted":
+                restricted_mode_postcondition(request, lambda action, subject, scope:
+                    restricted_membership_command(binary, launch_env, action, subject, scope))
+            elif scenario == "config-permission-denied":
                 permission_snapshot_postcondition(process, snapshot, log, request)
             elif scenario == "disk-full":
                 disk_full_snapshot_postcondition(process, snapshot, log, request)
@@ -1535,10 +2387,12 @@ def rust_http_case(binary, env, scenario, version, database=False):
                         process = stale_owner_postcondition(process, snapshot, request, contender, contender_log, restart, version)
                 else:
                     process = crash_restart_snapshot_postcondition(process, snapshot, request, restart, version)
+            elif scenario == "signature-mismatch":
+                signature_mismatch_postcondition(scenario_request, database_observation)
             elif scenario == "credential-replayed":
-                credential_replay_postcondition(request, database_observation)
+                credential_replay_postcondition(scenario_request, database_observation)
             else:
-                http_postcondition(request, scenario)
+                http_postcondition(scenario_request, scenario)
         finally:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -1546,8 +2400,66 @@ def rust_http_case(binary, env, scenario, version, database=False):
                 pass
             process.wait(timeout=10)
 
+def retain_runtime_evidence(helper, output, env):
+    import shutil
+    root = helper.packages.safe_path(Path(os.environ["IICP_PRE1_CASE_EVIDENCE_ROOT"]))
+    destination_root = Path(tempfile.mkdtemp(prefix="directory-runtime-", dir=root))
+    (destination_root / "context.json").write_text(json.dumps(context, sort_keys=True) + "\n")
+    (destination_root / "context.json").chmod(0o600)
+    for name, limit in (("result.json", 65536), ("build.log", 8 * 1024 * 1024)):
+        source = output / name
+        if source.exists():
+            helper.packages.safe_path(source)
+            if source.stat().st_size > limit:
+                raise ValueError("runtime evidence exceeds private retention bound")
+            destination = destination_root / name
+            if destination.exists() or destination.is_symlink():
+                raise ValueError("runtime evidence destination already exists")
+            shutil.copyfile(source, destination)
+            destination.chmod(0o600)
+
+def minimum_runtime_postcondition(binary, env, version):
+    import importlib
+    workspace = Path.cwd()
+    tools = workspace / "directory-runtime-tools"
+    # These exact owning sources are staged and hashed by the package binding.
+    sys.path.insert(0, str(tools))
+    previous_bytecode_policy = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        helper = importlib.import_module("prepare_pre1_minimum_runtime")
+        cache = Path(os.environ["IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT"])
+        helper.packages.safe_path(cache)
+        if not cache.is_absolute() or cache.is_relative_to(workspace):
+            raise ValueError("runtime build storage must be separate from prepared inputs")
+        with tempfile.TemporaryDirectory(prefix="directory-runtime-", dir=cache) as temporary:
+            output = Path(temporary) / "build"
+            try:
+                result = helper.verify(workspace / "directory-runtime-fixture",
+                    workspace / "directory-runtime-candidate.json", output,
+                    Path(os.environ["IICP_PRE1_DIRECTORY_CARGO"]),
+                    Path(os.environ["IICP_PRE1_DIRECTORY_RUSTC"]),
+                    context["runtime"], context["target"],
+                    os.environ["IICP_PRE1_DIRECTORY_RUNTIME_FIXTURE_SHA256"], build_timeout=150)
+                if result["status"] != "PASS" or result["qualification_credit"] is not False:
+                    raise ValueError("runtime source diagnosis is not a passing non-authorizing proof")
+            finally:
+                retain_runtime_evidence(helper, output, env)
+    finally:
+        sys.path.pop(0)
+        sys.dont_write_bytecode = previous_bytecode_policy
+    # A source build never substitutes for the immutable installed artifact.
+    reported = subprocess.check_output([str(binary), "--version"], env=env, text=True, timeout=10)
+    if reported.strip() != "iicp-directory-rs " + version:
+        raise ValueError("installed minimum-runtime Directory identity differs")
+    rust_http_case(binary, env, "credential-missing", version,
+                   database=context["mode"] == "restricted")
+
 def rust_mode_postcondition(binary, env, mode, version):
     if mode == "local-only":
+        return
+    if mode == "restricted":
+        rust_http_case(binary, rust_mode_environment(env, mode), "environment-restricted", version, database=True)
         return
     if mode != "public":
         raise ValueError("Directory restricted mode remains unimplemented")
@@ -1674,7 +2586,7 @@ def interrupt_migration(installed, workspace, php, env, command, helper):
 
 context = json.loads(os.environ["IICP_PRE1_EXECUTION_CONTEXT"])
 component, scenario = context["component"], context["scenario_id"]
-if ((component == "directory-rust" and context["mode"] not in {"local-only", "public"})
+if ((component == "directory-rust" and context["mode"] not in {"local-only", "public", "restricted"})
         or (component != "directory-rust" and context["mode"] != "local-only")):
     raise ValueError("Directory packaged mode is not implemented")
 installed = Path(os.environ["IICP_PRE1_DIRECTORY_INSTALLED"])
@@ -1682,14 +2594,84 @@ assertion = sys.argv[1]
 env = {k: os.environ[k] for k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP") if k in os.environ}
 env.update(APP_ENV="testing", NO_COLOR="1")
 case_home = private_case_home(env)
+if scenario == "no-dual-authority":
+    import runpy
+    case = json.loads(Path("directory-case-map.json").read_text())["scenarios"][scenario]
+    if case != {"assertion": assertion, "command": ["@installed"]}:
+        raise ValueError("comparative Directory case map differs")
+    topology = runpy.run_path(str(Path("directory-topology.py").resolve()))
+    with topology["hold_peer_port"](component, require_loopback_only) as lease:
+        def observe_listener():
+            topology["observe_own_listener"](component, lease, require_loopback_only)
+        if component == "directory-rust":
+            launch = rust_mode_environment(env, context["mode"])
+            if context["mode"] == "restricted":
+                reset_directory_database(launch)
+            rust_mode_postcondition(installed / "iicp-directory-rs", launch,
+                context["mode"], os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+            if context["mode"] == "restricted":
+                reset_directory_database(launch)
+            rust_http_case(installed / "iicp-directory-rs", launch, "credential-missing",
+                os.environ["IICP_PRE1_DIRECTORY_VERSION"],
+                database=(Path.cwd() / "directory-operator-fixture.json").exists(),
+                listener_check=observe_listener)
+        else:
+            php_mode_postcondition(installed, env, context["mode"])
+            observation = runpy.run_path(str(Path("directory-discovery.py").resolve()))["execute"](
+                installed, os.environ["IICP_PRE1_DIRECTORY_PHP"], env, context["mode"],
+                listener_check=observe_listener)
+            if (not isinstance(observation, dict) or observation.get("mode") != context["mode"]
+                    or observation.get("scope") != "installed-php-tcp-discovery-and-registration-pricing"
+                    or observation.get("qualification_credit") is not False
+                    or not isinstance(observation.get("observations"), dict)
+                    or not observation["observations"]):
+                raise ValueError("installed PHP Directory TCP observation differs")
+        topology_result = topology["result"](component, context["mode"], lease)
+    print("IICP_PRE1_DIRECTORY_TOPOLOGY " + json.dumps(
+        topology_result, sort_keys=True))
+    print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+    raise SystemExit(0)
 if component == "directory-rust":
     argv = [str(installed / "iicp-directory-rs")]
+    env = rust_mode_environment(env, context["mode"])
+    if context["mode"] == "restricted":
+        reset_directory_database(env)
     rust_mode_postcondition(Path(argv[0]), env, context["mode"], os.environ["IICP_PRE1_DIRECTORY_VERSION"])
-    if context["mode"] == "public":
-        env["IICP_RESTRICTED_DOMAIN_ENABLED"] = "false"
+    if context["mode"] == "restricted":
+        reset_directory_database(env)
+    if scenario == "cross-flavor-equivalence":
+        observed = registration_scenario_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_REGISTRATION_OBSERVATION " + json.dumps(observed, sort_keys=True))
+        print("IICP_PRE1_REGISTRATION_TRANSPORT tcp")
+        discovery = discovery_scenario_postcondition(Path(argv[0]), env,
+            os.environ["IICP_PRE1_DIRECTORY_VERSION"], context["mode"])
+        print("IICP_PRE1_INSTALLED_DISCOVERY_OBSERVATION " + json.dumps(discovery, sort_keys=True))
+        endpoints = endpoint_scenario_postcondition(Path(argv[0]), env,
+            os.environ["IICP_PRE1_DIRECTORY_VERSION"], context["mode"])
+        print("IICP_PRE1_INSTALLED_ENDPOINT_OBSERVATION " + json.dumps(endpoints, sort_keys=True))
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    if scenario == "minimum-version":
+        minimum_runtime_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
     if scenario == "offline-locked-install":
         offline_locked_install_postcondition(installed, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
             os.environ["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    if scenario == "rollback-last-supported":
+        rollback_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"],
+            Path(os.environ["IICP_PRE1_ROLLBACK_PREDECESSOR"]), os.environ["IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    if scenario == "backup-restore":
+        backup_restore_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
+        print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
+        raise SystemExit(0)
+    if scenario == "migration-interrupted":
+        resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
+        migration_interrupted_postcondition(Path(argv[0]), env, os.environ["IICP_PRE1_DIRECTORY_VERSION"])
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
     if scenario in {"credential-missing", "unsupported-version", "credential-expired",
@@ -1699,11 +2681,19 @@ if component == "directory-rust":
             database=(Path.cwd() / "directory-operator-fixture.json").exists())
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
-    elif scenario == "credential-replayed":
-        rust_http_case(installed / "iicp-directory-rs", env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"], database=True)
+    elif scenario in {"credential-replayed", "signature-mismatch"}:
+        if scenario == "signature-mismatch":
+            reset_directory_database(env)
+        try:
+            rust_http_case(installed / "iicp-directory-rs", env, scenario, os.environ["IICP_PRE1_DIRECTORY_VERSION"], database=True)
+        finally:
+            if scenario == "signature-mismatch":
+                reset_directory_database(env)
         print("IICP_PRE1_DIRECTORY_ASSERTION_PASS " + assertion)
         raise SystemExit(0)
-    elif scenario == "package-version-self-report":
+    elif scenario in {"package-version-self-report", "support"}:
+        if scenario == "support":
+            directory_support_postcondition()
         argv.append("--version")
         expected = "iicp-directory-rs " + os.environ["IICP_PRE1_DIRECTORY_VERSION"]
         expected_code = 0
@@ -1715,7 +2705,8 @@ if component == "directory-rust":
             IICP_SEED_URL="https://seed.invalid/v1", IICP_SEED_DID="did:web:seed.invalid",
             IICP_REPLICA_DID="did:web:replica.invalid", IICP_REPLICA_ENDPOINT="https://replica.invalid/v1",
             IICP_DIRECTORY_DID="did:web:other.invalid")
-        expected = "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID"
+        expected = ("restricted trust-domain federation is not implemented; replica mode cannot be combined with restricted-domain mode"
+            if context["mode"] == "restricted" else "IICP_DIRECTORY_DID must equal IICP_REPLICA_DID")
         expected_code = 1
     else:
         raise ValueError("Directory packaged scenario is not implemented")
@@ -1757,7 +2748,7 @@ with tempfile.NamedTemporaryFile(prefix="directory-output-", dir=case_home, dele
     log.seek(0)
     output = log.read().decode("utf-8", errors="replace")
 if process.returncode != expected_code or (expected is not None and expected not in output) or (
-    component == "directory-rust" and scenario == "package-version-self-report" and output.strip() != expected
+    component == "directory-rust" and scenario in {"package-version-self-report", "support"} and output.strip() != expected
 ):
     raise ValueError("Directory packaged postcondition failed")
 if component == "directory-php":
@@ -1814,7 +2805,7 @@ def directory_archive_payload(artifact):
 
 def stage_directory_payload(artifact, workspace, component):
     workspace = safe_path(workspace)
-    home = safe_path(Path(os.environ["HOME"]))
+    home = prepared_package_home()
     if workspace == home or not workspace.is_relative_to(home) or list(workspace.iterdir()):
         raise ValueError("Directory staging requires an empty run workspace")
     safe_path(artifact)
@@ -1868,10 +2859,57 @@ def provision_directory_runtime_paths(installed):
 
 def directory_fixtures(root, component):
     result = {"directory-probe.py": DIRECTORY_PROBE.encode(),
-              "directory-case-map.json": safe_path(root / "qualification/pre1-cases.json").read_bytes()}
+              "directory-case-map.json": safe_path(root / "qualification/pre1-cases.json").read_bytes(),
+              "directory-topology.py": safe_path(root / "scripts/pre1_comparative_topology.py").read_bytes()}
     if component == "directory-php":
         result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
+    elif component == "directory-rust":
+        result["directory-discovery.py"] = safe_path(root / "scripts/pre1_installed_discovery.py").read_bytes()
+        result["directory-registration-delegation.json"] = safe_path(
+            root / "qualification/registration-delegation-v1.json").read_bytes()
+        for name, source in {"contract": "contract-v1.10.80.json", "behavior": "behavior-contract-v1.json", "http": "http-contract-v1.json"}.items():
+            result["directory-support-" + name + ".json"] = safe_path(root / "parity" / source).read_bytes()
     return result
+
+
+def directory_runtime_dependencies(workspace, bindings):
+    fixture = workspace / "directory-runtime-fixture"
+    candidate = workspace / "directory-runtime-candidate.json"
+    if not any(path.exists() or path.is_symlink() for path in (fixture, candidate)):
+        return {}
+    import prepare_pre1_minimum_runtime as helper
+    value = helper.validate_fixture(fixture, candidate)
+    if json.loads(candidate.read_text()).get("manifest_sha256") != bindings["candidate_manifest_sha256"]:
+        raise ValueError("runtime fixture candidate differs from installed package binding")
+    return {"runtime-fixture": value["fixture_sha256"], "runtime-candidate": file_digest(candidate)}
+
+
+def directory_rollback_dependencies(workspace, target):
+    fixture = workspace / "directory-rollback-fixture"
+    if not fixture.exists() and not fixture.is_symlink():
+        return {}
+    import prepare_pre1_minimum_runtime as helper
+    value = helper.validate_rollback_fixture(fixture, target)
+    return {"rollback-fixture": value["fixture_sha256"]}
+
+
+def directory_rollback_environment(workspace, context, version, env):
+    dependencies = directory_rollback_dependencies(workspace, context["target"])
+    if not dependencies or version != "0.1.16":
+        raise ValueError("Directory rollback requires the pinned profile-compatible successor fixture")
+    fixture = workspace / "directory-rollback-fixture"
+    return {**env, "IICP_PRE1_ROLLBACK_PREDECESSOR": str(fixture / "predecessor"),
+            "IICP_PRE1_ROLLBACK_PREDECESSOR_SHA256": file_digest(fixture / "predecessor")}
+
+
+def directory_auxiliary_environment(workspace, context, component_manifest, env):
+    if context["component"] != "directory-rust":
+        return env
+    if context["scenario_id"] == "minimum-version":
+        return directory_minimum_runtime_environment(workspace, context, env)
+    if context["scenario_id"] == "rollback-last-supported":
+        return directory_rollback_environment(workspace, context, component_manifest["source_version"], env)
+    return env
 
 
 def directory_payload(artifact, installed, component, target):
@@ -1926,7 +2964,7 @@ def directory_database_dependencies(workspace):
         raise ValueError("Directory database fixture dependency differs")
     files = tree(tools)
     if (not {"loader", "mysql"}.issubset(files) or not 3 <= len(files) <= 32
-        or any(not re.fullmatch(r"(?:loader|mysql|lib/[a-zA-Z0-9._+-]+)", name) for name in files)
+        or any(not re.fullmatch(r"(?:loader|mysql|mysqldump|lib/[a-zA-Z0-9._+-]+)", name) for name in files)
         or sum((tools / name).stat().st_size for name in files) > 64 * 1024 * 1024):
         raise ValueError("Directory database tool snapshot differs")
     return {"database-config": "sha256:" + hashlib.sha256(raw).hexdigest(),
@@ -1934,14 +2972,20 @@ def directory_database_dependencies(workspace):
 
 def create_directory_binding(root, workspace, installed, artifact, component, runtime, target, bindings, *, stage_fixtures=True):
     validate_immutable_bindings(bindings)
-    validate_workspace_boundary(safe_path(workspace), safe_path(Path(os.environ["HOME"])), safe_path(installed), root)
+    validate_workspace_boundary(safe_path(workspace), prepared_package_home(), safe_path(installed), root)
     payload, deps = directory_payload(artifact, installed, component, target)
     if component == "directory-rust":
         deps.update(directory_database_dependencies(workspace))
+        deps.update(directory_runtime_dependencies(workspace, bindings))
+        deps.update(directory_rollback_dependencies(workspace, target))
     fixtures = directory_fixtures(root, component)
+    if "runtime-fixture" in deps:
+        for name in ("prepare_pre1_minimum_runtime.py", "pre1_package_execution.py", "pre1_artifact_common.py"):
+            fixtures["directory-runtime-tools/" + name] = safe_path(root / "scripts" / name).read_bytes()
     for name, data in fixtures.items():
         dest = workspace / name
         if not dest.exists() and stage_fixtures:
+            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             with dest.open("xb") as output:
                 output.write(data)
             dest.chmod(0o600)
@@ -1969,15 +3013,17 @@ def validate_directory_binding(value, context, artifact, root):
 
 
 
-def require_directory_database_fixture(component, scenario, workspace):
-    if component == "directory-rust" and scenario in DIRECTORY_RUST_DATABASE_SCENARIOS:
+def require_directory_database_fixture(component, scenario, workspace, mode="local-only"):
+    if component == "directory-rust" and (scenario in DIRECTORY_RUST_DATABASE_SCENARIOS or mode == "restricted"):
         if not directory_database_dependencies(workspace):
             raise ValueError("Directory packaged database fixture is missing")
+        if scenario == "backup-restore" and not (workspace / "directory-database-tools/mysqldump").is_file():
+            raise ValueError("Directory backup requires pinned mysqldump fixture")
 
 
 def directory_package_command(root, context, component_manifest, artifact_root, env, value):
     component, scenario = context["component"], context["scenario_id"]
-    if ((component == "directory-rust" and context["mode"] not in {"local-only", "public"})
+    if ((component == "directory-rust" and context["mode"] not in {"local-only", "public", "restricted"})
             or (component != "directory-rust" and context["mode"] != "local-only")):
         raise ValueError("Directory packaged mode remains unimplemented")
     kind = "release-artifact" if component == "directory-rust" else "release-archive"
@@ -1992,15 +3038,40 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     case = mapping["support"] if scenario == "support" else mapping["scenarios"][scenario]
     if component == "directory-rust" and scenario not in DIRECTORY_RUST_SCENARIOS:
         raise ValueError("Directory black-box scenario remains unimplemented")
-    if component == "directory-php" and case["command"][0] != "@php":
+    if component == "directory-php" and scenario != "no-dual-authority" and case["command"][0] != "@php":
         raise ValueError("Directory structural checks are not packaged operation evidence")
     env = {**env, "IICP_PRE1_EXECUTION_CONTEXT": json.dumps(context, sort_keys=True),
            "IICP_PRE1_DIRECTORY_INSTALLED": value["installed_package"],
            "IICP_PRE1_DIRECTORY_VERSION": component_manifest["source_version"],
            "IICP_PRE1_DIRECTORY_ARTIFACT_SHA256": rows[0]["sha256"]}
-    require_directory_database_fixture(component, scenario, workspace)
+    require_directory_database_fixture(component, scenario, workspace, context["mode"])
+    env = directory_auxiliary_environment(workspace, context, component_manifest, env)
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
     argv = [sys.executable, "-I", "-S", str(workspace / "directory-probe.py"), case["assertion"]]
     return argv, env, workspace, {"value": value, "artifact": artifact, "vendor_artifact": None}
+
+
+def directory_minimum_runtime_environment(workspace, context, env):
+    deps = directory_runtime_dependencies(workspace, {key: context[key] for key in BINDINGS})
+    if not deps:
+        raise ValueError("Directory minimum runtime requires the pinned frozen-source fixture")
+    runtime_map = json.loads(safe_path(Path(env["IICP_PRE1_RUNTIME_MAP"])).read_text())
+    if (runtime_map.get("target") != context["target"]
+            or runtime_map.get("map_sha256") != context["runtime_map_sha256"]):
+        raise ValueError("Directory runtime map binding differs")
+    row = runtime_map["runtimes"][context["runtime"]]
+    programs = row["programs"]
+    import prepare_pre1_minimum_runtime as helper
+    for name in ("cargo", "rustc"):
+        helper.executable(Path(programs[name]))
+    output = safe_path(Path(env["IICP_PRE1_RUN_ROOT"]))
+    evidence = safe_path(Path(env["IICP_PRE1_CASE_EVIDENCE_ROOT"]))
+    home = safe_path(Path(env["HOME"]))
+    if any(path.is_relative_to(workspace) or path.is_relative_to(home) for path in (output, evidence)):
+        raise ValueError("Directory runtime output cannot mutate prepared inputs")
+    return {**env, "IICP_PRE1_DIRECTORY_CARGO": programs["cargo"],
+            "IICP_PRE1_DIRECTORY_RUSTC": programs["rustc"],
+            "IICP_PRE1_DIRECTORY_RUNTIME_OUTPUT": str(output),
+            "IICP_PRE1_DIRECTORY_RUNTIME_FIXTURE_SHA256": deps["runtime-fixture"]}
