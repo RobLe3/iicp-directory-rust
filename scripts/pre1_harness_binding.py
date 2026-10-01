@@ -19,6 +19,7 @@ TOOL_ONLY_PATHS = frozenset({
     "scripts/pre1_environment_contract.py",
     "scripts/pre1_package_execution.py",
     "scripts/test_pre1_package_execution.py",
+    "scripts/test_pre1_prepared_home.py",
     "scripts/run_php83_local_ci.py",
     "scripts/test_php83_local_ci.py",
     "scripts/prepare_pre1_minimum_runtime.py",
