@@ -1794,15 +1794,22 @@ class PackageExecutionTests(unittest.TestCase):
         response.__enter__.return_value = response
         response.read.return_value = b'{"ok":true,"version":"v9.9.9-rs"}'
         with self.directory_network({"lo"}), \
-             patch.object(subprocess, "Popen", return_value=process), \
+             patch.object(subprocess, "Popen", return_value=process) as launch, \
              patch.object(os, "pread", return_value=b"listening on 0.0.0.0:8090", create=True), \
              patch.object(os, "killpg", create=True) as kill, \
              patch.object(urllib.request, "build_opener") as opener:
             opener.return_value.open.return_value = response
             with self.assertRaisesRegex(ValueError, "identity differs"):
-                run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
+                run(Path("/fixture/binary"), {
+                    "HOME": str(self.home),
+                    "IICP_GENESIS_ED25519_SECRET_KEY": "11" * 64,
+                }, "credential-missing", "0.1.15")
             kill.assert_called_once()
             process.wait.assert_called_once_with(timeout=10)
+            self.assertEqual(
+                launch.call_args.kwargs["env"]["IICP_GENESIS_ED25519_SECRET_KEY"],
+                "00" * 64,
+            )
 
     def test_directory_http_listener_observation_precedes_case_and_cleanup(self):
         from unittest.mock import Mock, MagicMock

@@ -2329,7 +2329,8 @@ def rust_http_case(binary, env, scenario, version, database=False, postcondition
             if not isinstance(value, dict):
                 raise ValueError("Directory HTTP evidence must be an object")
             return response.code, value
-    launch_env = {**env, "APP_KEY": "iicp-pre1-isolated-synthetic-key"}
+    launch_env = {**env, "APP_KEY": "iicp-pre1-isolated-synthetic-key",
+        "IICP_GENESIS_ED25519_SECRET_KEY": "00" * 64}
     if database:
         config, password = database_fixture_inputs()
         from urllib.parse import quote
