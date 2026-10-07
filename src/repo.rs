@@ -163,10 +163,6 @@ pub struct HeartbeatOutcome {
     pub reputation_epoch: Option<String>,
 }
 
-// `async_trait` marks generated futures as `must_use`; Rust 1.99's Clippy also
-// sees the future type itself as `must_use` and reports every trait method as
-// `double_must_use`. Keep the lint scoped to this macro expansion.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NodeRepository: Send + Sync {
     /// Return a bounded, content-free database-pool snapshot when available.
