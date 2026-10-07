@@ -1234,6 +1234,42 @@ class PackageExecutionTests(unittest.TestCase):
             with self.subTest(index=index, field=field), patch("time.sleep"), self.assertRaises(ValueError):
                 check(Mock(side_effect=copy.deepcopy(responses)), Mock(side_effect=mutated))
 
+    def test_disposable_schema_initialization_uses_bound_snapshot_and_private_client(self):
+        from unittest.mock import Mock
+        ns = self.directory_http_functions()
+        ns["require_loopback_only"] = Mock()
+        config = {"username": "iicp_pre1_fixture", "database": "iicp_pre1_" + "a" * 16}
+        ns["database_fixture_inputs"] = Mock(return_value=(config, "synthetic-private-password"))
+        ns["directory_fixture_sql"] = Mock(return_value=b"0\n")
+        schema = self.workspace / "directory-baseline-v1.sql"
+        schema.write_bytes(b"SET FOREIGN_KEY_CHECKS=0;\nCREATE TABLE fixture (id INT);\n")
+        previous = Path.cwd()
+        try:
+            os.chdir(self.workspace)
+            def invoke(argv, **kwargs):
+                self.assertEqual(kwargs["stdin"].read(), schema.read_bytes())
+                self.assertNotIn("synthetic-private-password", " ".join(argv))
+                self.assertEqual(kwargs["env"]["MYSQL_PWD"], "synthetic-private-password")
+                self.assertEqual(kwargs["timeout"], 30)
+                self.assertIn("--database=" + config["database"], argv)
+                return Mock(returncode=0)
+            with patch("subprocess.run", side_effect=invoke):
+                ns["initialize_disposable_directory_schema"]({"HOME": str(self.home)})
+        finally:
+            os.chdir(previous)
+        schema.unlink()
+        with self.assertRaisesRegex(ValueError, "missing or unsafe"):
+            previous = Path.cwd()
+            try:
+                os.chdir(self.workspace)
+                ns["initialize_disposable_directory_schema"]({"HOME": str(self.home)})
+            finally:
+                os.chdir(previous)
+        ns["directory_fixture_sql"] = Mock(return_value=b"23\n")
+        with patch("subprocess.run") as invoke:
+            ns["initialize_disposable_directory_schema"]({"HOME": str(self.home)})
+        invoke.assert_not_called()
+
     def test_database_observation_uses_bounded_loopback_native_client(self):
         check = self.directory_http_functions()
         config = {"username": "iicp_pre1_fixture", "database": "iicp_pre1_" + "a" * 16}
@@ -1784,6 +1820,33 @@ class PackageExecutionTests(unittest.TestCase):
                 run(Path("/fixture/binary"), {"HOME": str(self.home)}, "credential-missing", "0.1.15")
             launch.assert_not_called()
 
+    def test_directory_http_database_initializes_schema_before_process_start(self):
+        from unittest.mock import Mock, MagicMock
+        import urllib.request
+        run = self.directory_http_functions()
+        events = []
+        run["initialize_disposable_directory_schema"] = lambda env: events.append("schema")
+        run["database_fixture_inputs"] = lambda: ({"username": "iicp_pre1_fixture",
+            "database": "iicp_pre1_" + "a" * 16}, "synthetic password")
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        response = MagicMock(code=200)
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok":true,"version":"v0.1.15-rs"}'
+        def launch(*args, **kwargs):
+            events.append("launch")
+            self.assertIn("synthetic%20password@127.0.0.1", kwargs["env"]["DATABASE_URL"])
+            return process
+        with self.directory_network({"lo"}), \
+             patch.object(subprocess, "Popen", side_effect=launch), \
+             patch.object(os, "pread", return_value=b"listening on 0.0.0.0:8090", create=True), \
+             patch.object(os, "killpg", create=True), \
+             patch.object(urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value = response
+            run["rust_http_case"](Path("/fixture/binary"), {"HOME": str(self.home)},
+                "credential-missing", "0.1.15", database=True, postcondition=lambda *_: None)
+        self.assertEqual(events, ["schema", "launch"])
+
     def test_directory_http_fixture_wrong_identity_kills_owned_process(self):
         from unittest.mock import Mock, MagicMock
         import urllib.request
@@ -1864,6 +1927,9 @@ class PackageExecutionTests(unittest.TestCase):
                         self.root / "scripts/pre1_comparative_topology.py")
         (self.root / "qualification").mkdir(exist_ok=True)
         (self.root / "parity").mkdir(exist_ok=True)
+        (self.root / "schema").mkdir(exist_ok=True)
+        shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "schema/baseline-v1.sql",
+                        self.root / "schema/baseline-v1.sql")
         shutil.copyfile(Path(adapter.__file__).resolve().parents[1] / "qualification/registration-delegation-v1.json",
                         self.root / "qualification/registration-delegation-v1.json")
         for name in ("contract-v1.10.80.json", "behavior-contract-v1.json", "http-contract-v1.json"):
@@ -1901,6 +1967,8 @@ class PackageExecutionTests(unittest.TestCase):
 
     def test_registration_delegation_is_immutable_preparation_input(self):
         artifact, installed, value, context = self.directory_inputs()
+        schema = self.workspace / "directory-baseline-v1.sql"
+        self.assertEqual(schema.read_bytes(), (self.root / "schema/baseline-v1.sql").read_bytes())
         fixture = self.workspace / "directory-registration-delegation.json"
         self.assertEqual(fixture.read_bytes(),
                          (self.root / "qualification/registration-delegation-v1.json").read_bytes())
