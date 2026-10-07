@@ -1808,7 +1808,8 @@ class PackageExecutionTests(unittest.TestCase):
             process.wait.assert_called_once_with(timeout=10)
             self.assertEqual(
                 launch.call_args.kwargs["env"]["IICP_GENESIS_ED25519_SECRET_KEY"],
-                "00" * 64,
+                "11" * 32
+                + "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
             )
 
     def test_directory_http_listener_observation_precedes_case_and_cleanup(self):
