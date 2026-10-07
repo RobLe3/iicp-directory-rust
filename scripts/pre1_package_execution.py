@@ -1111,7 +1111,9 @@ def endpoint_scenario_postcondition(binary, env, version, mode):
     spec.loader.exec_module(helper)
     contract = helper.read_contract("directory-support-behavior.json")
     production = {**env, "APP_ENV": "production", "IICP_SKIP_LIVENESS_CHECK": "false",
-        "IICP_DEV_ALLOW_INSECURE_TLS": "false", "IICP_GENESIS_ED25519_SECRET_KEY": "00" * 64}
+        "IICP_DEV_ALLOW_INSECURE_TLS": "false",
+        "IICP_GENESIS_ED25519_SECRET_KEY": "11" * 32
+            + "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"}
     observed = []
     def observe(raw_request, request, active_binary, launch_env):
         if any(launch_env.get(key) != production[key] for key in
@@ -2330,7 +2332,8 @@ def rust_http_case(binary, env, scenario, version, database=False, postcondition
                 raise ValueError("Directory HTTP evidence must be an object")
             return response.code, value
     launch_env = {**env, "APP_KEY": "iicp-pre1-isolated-synthetic-key",
-        "IICP_GENESIS_ED25519_SECRET_KEY": "00" * 64}
+        "IICP_GENESIS_ED25519_SECRET_KEY": "11" * 32
+            + "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"}
     if database:
         config, password = database_fixture_inputs()
         from urllib.parse import quote
