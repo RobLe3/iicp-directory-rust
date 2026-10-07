@@ -30,6 +30,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # pinned below
         with:
           toolchain: '1.98.0'
+          components: rustfmt, clippy
       - run: python3 scripts/test_disposable_cargo_target.py
       - run: python3 scripts/test_pre1_candidate_artifacts.py
       - run: python3 scripts/test_operator_persistence.py
