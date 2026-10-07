@@ -1921,6 +1921,35 @@ def reset_directory_database(env):
     if result.returncode:
         raise ValueError("Directory disposable database reset failed")
 
+def initialize_disposable_directory_schema(env):
+    require_loopback_only()
+    table_count = directory_fixture_sql(env,
+        "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()")
+    try:
+        existing_tables = int(table_count.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("Directory disposable schema state differs")
+    if existing_tables < 0:
+        raise ValueError("Directory disposable schema state differs")
+    if existing_tables:
+        return
+    config, password = database_fixture_inputs()
+    schema = Path.cwd() / "directory-baseline-v1.sql"
+    if (schema.is_symlink() or not schema.is_file() or not 0 < schema.stat().st_size <= 1024 * 1024):
+        raise ValueError("Directory schema fixture is missing or unsafe")
+    tools = Path.cwd() / "directory-database-tools"
+    argv = [str(tools / "loader"), "--library-path", str(tools / "lib"), str(tools / "mysql"),
+        "--no-defaults", "--batch", "--protocol=TCP", "--host=127.0.0.1", "--port=3306",
+        "--connect-timeout=3", "--user=" + config["username"], "--database=" + config["database"]]
+    with tempfile.TemporaryDirectory(prefix="directory-schema-home-", dir=private_case_home(env)) as home, schema.open("rb") as source, tempfile.TemporaryFile() as errors:
+        result = subprocess.run(argv, env={"PATH": env.get("PATH", ""), "MYSQL_PWD": password, "HOME": home},
+            stdin=source, stdout=subprocess.DEVNULL, stderr=errors, timeout=30, check=False)
+        errors.seek(0); failure = errors.read(65536)
+    if result.returncode:
+        retain_sql_failure(failure, password)
+        raise ValueError("Directory disposable schema initialization failed; bounded private error retained")
+
+
 def directory_fixture_sql(env, sql):
     require_loopback_only()
     config, password = database_fixture_inputs()
@@ -2335,6 +2364,7 @@ def rust_http_case(binary, env, scenario, version, database=False, postcondition
         "IICP_GENESIS_ED25519_SECRET_KEY": "11" * 32
             + "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"}
     if database:
+        initialize_disposable_directory_schema(env)
         config, password = database_fixture_inputs()
         from urllib.parse import quote
         launch_env["DATABASE_URL"] = ("mysql://" + config["username"] + ":" + quote(password, safe="")
@@ -2868,6 +2898,11 @@ def directory_fixtures(root, component):
     if component == "directory-php":
         result["directory-origin.php"] = DIRECTORY_ORIGIN.encode()
     elif component == "directory-rust":
+        # The installed Rust Directory is deliberately verify-only and never
+        # migrates operator databases. Bind the canonical schema snapshot as a
+        # test fixture so each newly reset disposable database can be
+        # initialized before the frozen binary starts.
+        result["directory-baseline-v1.sql"] = safe_path(root / "schema/baseline-v1.sql").read_bytes()
         result["directory-discovery.py"] = safe_path(root / "scripts/pre1_installed_discovery.py").read_bytes()
         result["directory-registration-delegation.json"] = safe_path(
             root / "qualification/registration-delegation-v1.json").read_bytes()
