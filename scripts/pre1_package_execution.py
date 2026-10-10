@@ -499,9 +499,8 @@ def validate_binding_context(value: dict, context: dict) -> None:
 
 def prepared_package_home() -> Path:
     """Keep the immutable preparation boundary separate from per-case HOME."""
-    return safe_path(
-        Path(os.environ.get("IICP_PRE1_PREPARED_PACKAGE_HOME", os.environ["HOME"]))
-    )
+    value = os.environ.get("IICP_PRE1_PREPARED_PACKAGE_HOME")
+    return safe_path(Path(value if value is not None else os.environ["HOME"]))
 
 
 def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
