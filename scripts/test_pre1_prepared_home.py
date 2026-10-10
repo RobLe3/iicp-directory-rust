@@ -23,6 +23,11 @@ class PreparedHomeTests(unittest.TestCase):
         with patch.dict(os.environ, {"HOME": str(self.prepared)}, clear=True):
             self.assertEqual(adapter.prepared_package_home(), self.prepared)
 
+    def test_explicit_preparation_home_does_not_require_home(self):
+        with patch.dict(os.environ,
+                {"IICP_PRE1_PREPARED_PACKAGE_HOME": str(self.prepared)}, clear=True):
+            self.assertEqual(adapter.prepared_package_home(), self.prepared)
+
     def test_execution_home_does_not_replace_preparation_owner(self):
         workspace = self.prepared / "workspace"
         installed = workspace / "payload"
