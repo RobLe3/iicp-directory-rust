@@ -3087,7 +3087,11 @@ def directory_package_command(root, context, component_manifest, artifact_root, 
     if component == "directory-php":
         runtime_map = json.loads(Path(os.environ["IICP_PRE1_RUNTIME_MAP"]).read_text())
         env["IICP_PRE1_DIRECTORY_PHP"] = runtime_map["runtimes"][context["runtime"]]["programs"]["php"]
-    argv = [sys.executable, "-I", "-S", str(workspace / "directory-probe.py"), case["assertion"]]
+    # The prepared workspace is an immutable qualification input.  Isolated
+    # mode ignores PYTHONDONTWRITEBYTECODE, so suppress bytecode explicitly;
+    # otherwise workspace-local imports can create __pycache__ and invalidate
+    # an otherwise successful installed-package execution proof.
+    argv = [sys.executable, "-I", "-S", "-B", str(workspace / "directory-probe.py"), case["assertion"]]
     return argv, env, workspace, {"value": value, "artifact": artifact, "vendor_artifact": None}
 
 
