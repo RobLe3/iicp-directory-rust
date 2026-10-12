@@ -2220,7 +2220,8 @@ class PackageExecutionTests(unittest.TestCase):
             self.root, {**context, "mode": "public"}, manifest, artifact_root, {}, value)
         self.assertEqual(json.loads(public_env["IICP_PRE1_EXECUTION_CONTEXT"])["mode"], "public")
         self.assertEqual(public_cwd, self.workspace)
-        self.assertEqual(Path(public_argv[3]), self.workspace / "directory-probe.py")
+        self.assertEqual(public_argv[1:4], ["-I", "-S", "-B"])
+        self.assertEqual(Path(public_argv[4]), self.workspace / "directory-probe.py")
         argv, env, cwd, proof = adapter.directory_package_command(self.root, context, manifest, artifact_root, {}, value)
         self.assertEqual(cwd, self.workspace)
         self.assertNotIn("cargo", argv)
@@ -2230,6 +2231,33 @@ class PackageExecutionTests(unittest.TestCase):
         self.assertEqual(argv[-1], "offline-locked-install")
         self.assertEqual(env["IICP_PRE1_DIRECTORY_ARTIFACT_SHA256"], adapter.file_digest(artifact))
         self.assertEqual(cwd, self.workspace)
+
+    def test_directory_command_prevents_workspace_bytecode_mutation(self):
+        artifact, _installed, value, context = self.directory_inputs()
+        artifact_root = self.home / "artifacts"
+        (artifact_root / "directory-rust").mkdir(parents=True)
+        import shutil
+        shutil.copyfile(artifact, artifact_root / "directory-rust" / artifact.name)
+        manifest = {"source_version": "0.1.15", "artifacts": [{"name": artifact.name,
+            "kind": "release-artifact", "target": "linux-aarch64",
+            "sha256": adapter.file_digest(artifact)}]}
+        argv, _env, _cwd, _proof = adapter.directory_package_command(
+            self.root, context, manifest, artifact_root, {}, value)
+
+        module = self.workspace / "workspace_module.py"
+        module.write_text("VALUE = 'installed-package-proof'\n")
+        probe = self.workspace / "bytecode-probe.py"
+        probe.write_text("import importlib.util\nfrom pathlib import Path\n"
+            "p=Path(__file__).with_name('workspace_module.py')\n"
+            "s=importlib.util.spec_from_file_location('workspace_module', p)\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            "assert m.VALUE == 'installed-package-proof'\n")
+        before = adapter.tree(self.workspace)
+        result = subprocess.run([*argv[:4], str(probe)], cwd=self.workspace,
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(adapter.tree(self.workspace), before)
+        self.assertFalse((self.workspace / "__pycache__").exists())
 
     def test_directory_http_commands_use_bound_installed_binary_not_source_tests(self):
         import shutil
