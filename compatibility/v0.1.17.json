@@ -47,7 +47,7 @@
   "php_deprecation_authorized": false,
   "php_parity_baseline": {
     "binding_kind": "development_source_reference",
-    "commit": "5c14effcdd8df5d9b480594b42da333ce4fdf209",
+    "commit": "8015e8df514eb12b09ee5b4a52e1e6f36dc055af",
     "package_publication_authorized": false,
     "production_deployment_authorized": false,
     "qualification_credit_granted": false,
