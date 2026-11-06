@@ -46,7 +46,7 @@
   "minimum_sdk_version": "0.7.102",
   "php_deprecation_authorized": false,
   "php_parity_baseline": {
-    "commit": "818387c2741773f08b7b5fa943a6ba410c360734",
+    "commit": "22b789a75da3caac200e2c0386a0c00279364a17",
     "status": "development_source_not_published",
     "version": "1.10.94"
   },
