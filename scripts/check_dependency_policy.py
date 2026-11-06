@@ -14,6 +14,17 @@ DENIED_EXACT = {
 }
 # RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc; fresh audit remains required.
 DENIED_EXACT |= {("rustls", f"0.23.{patch}") for patch in range(13, 45)}
+
+# Fresh RustSec source-supported series (2026-11-06). This fast deny gate
+# complements, and never replaces, a fresh advisory audit or applicability review.
+DENIED_EXACT |= {("rustls", f"0.23.{patch}") for patch in range(46)}
+DENIED_EXACT |= {("rustls-webpki", f"0.103.{patch}") for patch in range(16)}
+DENIED_EXACT |= {("webpki-roots", f"1.0.{patch}") for patch in range(10)}
+DENIED_EXACT |= {("quinn-proto", f"0.11.{patch}") for patch in range(18)}
+DENIED_EXACT |= {("tokio", f"1.51.{patch}") for patch in range(6)}
+DENIED_EXACT |= {("tokio", f"1.52.{patch}") for patch in range(4)}
+DENIED_EXACT |= {("tokio", f"1.53.{patch}") for patch in range(3)}
+
 DENIED_NAMES = {"proc-macro1", "proc-macro-en", "aovine", "arone", "aronenao", "tinymember"}
 ALLOWED_REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 
