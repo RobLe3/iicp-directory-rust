@@ -18,7 +18,7 @@
     },
     "parity_manifest": {
       "path": "parity/contract-v1.10.94.json",
-      "sha256": "3524d4dac046a230730091ac8728db0490e8fd85a27d171e0f9a9f6cab0e091a"
+      "sha256": "4a1175abcdea88dd127932f37811f9cf87b9c89d2ffd4520bc85e7b7e0fef8e8"
     },
     "replica_lifecycle": {
       "path": "parity/replica-lifecycle-contract-v1.json",
@@ -46,8 +46,11 @@
   "minimum_sdk_version": "0.7.102",
   "php_deprecation_authorized": false,
   "php_parity_baseline": {
-    "commit": "22b789a75da3caac200e2c0386a0c00279364a17",
-    "status": "development_source_not_published",
+    "binding_kind": "development_source_reference",
+    "commit": "5c14effcdd8df5d9b480594b42da333ce4fdf209",
+    "package_publication_authorized": false,
+    "production_deployment_authorized": false,
+    "qualification_credit_granted": false,
     "version": "1.10.94"
   },
   "production_authority": false,

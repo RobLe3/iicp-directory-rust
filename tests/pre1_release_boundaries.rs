@@ -102,4 +102,15 @@ fn successor_changes_only_declared_currency_contract_bindings() {
         "parity/contract-v1.10.94.json"
     );
     assert_eq!(current["php_parity_baseline"]["version"], "1.10.94");
+    assert_eq!(
+        current["php_parity_baseline"]["binding_kind"],
+        "development_source_reference"
+    );
+    for flag in [
+        "package_publication_authorized",
+        "qualification_credit_granted",
+        "production_deployment_authorized",
+    ] {
+        assert_eq!(current["php_parity_baseline"][flag], false);
+    }
 }

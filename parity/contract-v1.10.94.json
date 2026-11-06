@@ -3,8 +3,9 @@
     "runtime_version": "v1.10.94",
     "source_preparation": {
       "base_commit": "11e63a1b2a3846d376810d260bf9ccbbf59b3d7c",
-      "publication": "NOT_PUBLISHED",
-      "qualification": "NOT_QUALIFIED",
+      "package_publication_authorized": false,
+      "production_deployment_authorized": false,
+      "qualification_credit_granted": false,
       "repository": "RobLe3/iicp-directory-php"
     }
   },
