@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 0.1.17 source preparation — not published
+
+- Prepare current discovery currency 0.7.109 and explicit PHP 1.10.94 development fixture bindings. Preserve 0.1.15/0.1.16 compatibility bytes and their original rollback assertion. No publication, deployment, qualification credit transfer or Genesis authority follows.
+
 ### 0.1.16 preparation — not published
 
 - Prepare the existing post-0.1.15 implementation changes and qualification

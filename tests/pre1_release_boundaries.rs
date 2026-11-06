@@ -3,7 +3,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-const CURRENT: &str = include_str!("../compatibility/v0.1.16.json");
+const CURRENT: &str = include_str!("../compatibility/v0.1.17.json");
+const HISTORICAL_CURRENT: &str = include_str!("../compatibility/v0.1.16.json");
 const PREVIOUS: &str = include_str!("../compatibility/v0.1.15.json");
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 const UPDATER: &str = include_str!("../scripts/directory_self_update.sh");
@@ -50,7 +51,7 @@ fn minimum_rust_version_is_declared_and_candidate_remains_pre1() {
 
 #[test]
 fn last_supported_generation_is_pinned_for_bounded_rollback() {
-    let current = manifest(CURRENT);
+    let current = manifest(HISTORICAL_CURRENT);
     let previous = manifest(PREVIOUS);
     assert_eq!(previous["implementation"]["version"], "0.1.15");
     assert_eq!(current["implementation"]["version"], "0.1.16");
@@ -66,5 +67,50 @@ fn preview_contract_never_authorizes_dual_genesis() {
         assert_eq!(value["production_authority"], false);
         assert_eq!(value["genesis_cutover_authorized"], false);
         assert_eq!(value["php_deprecation_authorized"], false);
+    }
+}
+
+#[test]
+fn successor_changes_only_declared_currency_contract_bindings() {
+    let current = manifest(CURRENT);
+    let previous = manifest(HISTORICAL_CURRENT);
+    assert_eq!(current["implementation"]["version"], "0.1.17");
+    assert_eq!(
+        current["minimum_sdk_version"],
+        previous["minimum_sdk_version"]
+    );
+    assert_eq!(
+        current["contracts"].as_object().unwrap().len(),
+        previous["contracts"].as_object().unwrap().len()
+    );
+    for (name, contract) in previous["contracts"].as_object().unwrap() {
+        if name == "discovery_evidence" || name == "parity_manifest" {
+            assert_ne!(&current["contracts"][name], contract);
+        } else {
+            assert_eq!(
+                &current["contracts"][name], contract,
+                "unrelated contract changed: {name}"
+            );
+        }
+    }
+    assert_eq!(
+        current["contracts"]["discovery_evidence"]["path"],
+        "parity/discovery-evidence-v1.10.94.json"
+    );
+    assert_eq!(
+        current["contracts"]["parity_manifest"]["path"],
+        "parity/contract-v1.10.94.json"
+    );
+    assert_eq!(current["php_parity_baseline"]["version"], "1.10.94");
+    assert_eq!(
+        current["php_parity_baseline"]["binding_kind"],
+        "development_source_reference"
+    );
+    for flag in [
+        "package_publication_authorized",
+        "qualification_credit_granted",
+        "production_deployment_authorized",
+    ] {
+        assert_eq!(current["php_parity_baseline"][flag], false);
     }
 }

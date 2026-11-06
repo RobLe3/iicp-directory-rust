@@ -117,9 +117,58 @@ def test_substituted_nested_fixture_name_fails() -> tuple[bool, str]:
     finally:
         shutil.rmtree(root.parent)
 
+def test_active_source_manifest_and_historical_predecessors() -> tuple[bool, str]:
+    root = fixture_root()
+    try:
+        for selected in (None, "v0.1.15.json", "v0.1.16.json"):
+            if "PASS" not in compatibility.verify(root, selected):
+                return False, "active or historical binding failed"
+        return True, "source-selected successor and both immutable predecessors pass"
+    finally:
+        shutil.rmtree(root.parent)
+
+
+def test_active_current_corruption_controls() -> tuple[bool, str]:
+    for fault in ("fixture", "nested_digest", "missing_nested", "escape", "manifest", "source_version"):
+        root = fixture_root()
+        try:
+            manifest = root / "compatibility/v0.1.17.json"
+            value = json.loads(manifest.read_text())
+            parity = root / value["contracts"]["parity_manifest"]["path"]
+            payload = json.loads(parity.read_text())
+            if fault == "fixture":
+                fixture = root / value["contracts"]["discovery_evidence"]["path"]
+                fixture.write_text(fixture.read_text() + "\n")
+            elif fault == "manifest":
+                manifest.unlink()
+            elif fault == "source_version":
+                cargo = root / "Cargo.toml"
+                cargo.write_text(cargo.read_text().replace('version = "0.1.17"', 'version = "0.1.18"', 1))
+            else:
+                if fault == "nested_digest":
+                    payload["fixtures"]["replica-lifecycle-contract-v1.json"] = "a" * 48
+                elif fault == "missing_nested":
+                    payload["fixtures"]["missing.json"] = "a" * 64
+                else:
+                    payload["fixtures"]["../escape.json"] = "a" * 64
+                parity.write_text(json.dumps(payload))
+                value["contracts"]["parity_manifest"]["sha256"] = compatibility.sha256(parity)
+                manifest.write_text(json.dumps(value))
+            try:
+                compatibility.verify(root)
+            except (ValueError, OSError):
+                continue
+            return False, f"active source corruption accepted: {fault}"
+        finally:
+            shutil.rmtree(root.parent)
+    return True, "six corruptions of actually source-selected current bindings rejected"
+
+
 def main() -> int:
     failed = []
     for name, test in (
+        ("active_and_predecessors", test_active_source_manifest_and_historical_predecessors),
+        ("active_corruption", test_active_current_corruption_controls),
         ("current_contract", test_current_contract_passes),
         ("safe_nested_path", test_current_release_accepts_safe_nested_fixture_paths),
         ("tampered_nested", test_tampered_nested_fixture_fails),
