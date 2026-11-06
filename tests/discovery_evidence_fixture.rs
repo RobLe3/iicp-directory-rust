@@ -28,3 +28,17 @@ fn discovery_evidence_fixture_is_content_free_and_pins_parity_values() {
         assert!(!rendered.contains(forbidden));
     }
 }
+
+#[test]
+fn successor_fixture_changes_only_latest_known_currency() {
+    let original: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/discovery-evidence-v1.json")).unwrap();
+    let mut successor: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/discovery-evidence-v1.10.94.json")).unwrap();
+    assert_eq!(
+        successor["invariants"]["sdk_latest_known_version"],
+        "0.7.109"
+    );
+    successor["invariants"]["sdk_latest_known_version"] = serde_json::json!("0.7.106");
+    assert_eq!(original, successor);
+}

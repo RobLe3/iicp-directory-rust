@@ -24,7 +24,7 @@ use crate::{
 };
 
 pub(crate) const SDK_BASELINE_VERSION: &str = "0.7.68";
-const SDK_LATEST_KNOWN_VERSION: &str = "0.7.106";
+const SDK_LATEST_KNOWN_VERSION: &str = "0.7.109";
 const PROFILE_ID: &str = "iicp.profile.compatibility.v0";
 const PROFILE_VERSION: &str = "0.4.0-draft";
 pub(crate) const PROFILE_FIXTURE_SHA256: &str =
@@ -1140,4 +1140,31 @@ fn version_parts(version: &str) -> Vec<u32> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod currency_tests {
+    use super::*;
+
+    #[test]
+    fn currency_projection_preserves_compatibility_floor() {
+        for (version, relation, compatibility) in [
+            ("0.7.67", "behind_known", "downlevel"),
+            ("0.7.106", "behind_known", "current"),
+            ("0.7.109", "latest_known", "current"),
+            ("0.7.110", "ahead_of_known", "current"),
+        ] {
+            let node: types::Node = serde_json::from_value(serde_json::json!({
+                "node_id": "synthetic-currency-node", "endpoint": "https://node.example.test",
+                "region": "test", "score": 0.5, "available": true, "sdk_version": version
+            }))
+            .unwrap();
+            let value = live_node_value(&node);
+            assert_eq!(value["sdk_release"]["latest_known_version"], "0.7.109");
+            assert_eq!(value["sdk_release"]["relation"], relation);
+            assert_eq!(value["sdk_status"], compatibility);
+            assert_eq!(value["sdk_baseline_version"], "0.7.68");
+            assert_eq!(value["upgrade_required"], compatibility != "current");
+        }
+    }
 }

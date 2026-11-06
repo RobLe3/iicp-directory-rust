@@ -1,0 +1,55 @@
+{
+  "contracts": {
+    "behavior": {
+      "path": "parity/behavior-contract-v1.json",
+      "sha256": "61f84608db554cf2a3da02c46e01f27c77e57c9553ade0da8c5a017860d73f3f"
+    },
+    "discovery_evidence": {
+      "path": "parity/discovery-evidence-v1.10.94.json",
+      "sha256": "7fbf0b54d3a3e4fab4a9e0cb9e86ac7c082e534bf3c4c510c9241403d18ffaf2"
+    },
+    "http": {
+      "path": "parity/http-contract-v2.json",
+      "sha256": "08edc5cf302a858e5576cb59e07f5b71657ae6015b5537999985db71cc4128f6"
+    },
+    "implementation_metadata": {
+      "path": "parity/directory-implementation-metadata-v1.json",
+      "sha256": "5bdd9ebd838cd5c4c972176fabebb4971a759b0ca69014328e8370a02d6ee08f"
+    },
+    "parity_manifest": {
+      "path": "parity/contract-v1.10.94.json",
+      "sha256": "3524d4dac046a230730091ac8728db0490e8fd85a27d171e0f9a9f6cab0e091a"
+    },
+    "replica_lifecycle": {
+      "path": "parity/replica-lifecycle-contract-v1.json",
+      "sha256": "9ae2e3536891c3488a2b4d04e543364359a2b9a2c389203ece0eaca1a341b541"
+    },
+    "replica_token": {
+      "path": "parity/federation-profile-v1.json",
+      "sha256": "0f1fb2271aa438dc3d2fdcb39ff6863e3a675edcef678f5b05b8bd5c200567d9"
+    },
+    "restricted_domain_membership": {
+      "path": "parity/restricted-trust-domain-membership-v0.json",
+      "sha256": "78cb70b19dabed5be0175555cf2b4bb123dd4bc77ce36b67b745f311f3d941d4"
+    },
+    "schema": {
+      "path": "schema/contract-v1.json",
+      "sha256": "c3567df04131cbbddf8cf236268f576f2cd611def0b4b228a7954a2d56d0e655"
+    }
+  },
+  "genesis_cutover_authorized": false,
+  "implementation": {
+    "flavor": "rust",
+    "status": "operator_preview",
+    "version": "0.1.17"
+  },
+  "minimum_sdk_version": "0.7.102",
+  "php_deprecation_authorized": false,
+  "php_parity_baseline": {
+    "commit": "818387c2741773f08b7b5fa943a6ba410c360734",
+    "status": "development_source_not_published",
+    "version": "1.10.94"
+  },
+  "production_authority": false,
+  "schema": "iicp.directory-implementation-compatibility.v1"
+}
