@@ -87,6 +87,24 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Registry primary lookup distinguishes absent nodes from SQL failure
+        timeout-minutes: 10
+        env:
+          MYSQL_SERVICE_ID: ${{ job.services.mysql.id }}
+          IICP_REGISTRY_OK_URL: mysql://root:root@127.0.0.1:3306/iicp_g2_registry_ok?ssl-mode=DISABLED
+          IICP_REGISTRY_FAULT_URL: mysql://root:root@127.0.0.1:3306/iicp_g2_registry_fault?ssl-mode=DISABLED
+        run: |
+          set -euo pipefail
+          test -n "$MYSQL_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$MYSQL_SERVICE_ID")" = true
+          # Only the job's disposable MySQL service is used. Refuse pre-existing
+          # fixture schemas rather than deleting or adopting unknown contents.
+          existing=$(docker exec -e MYSQL_PWD=root "$MYSQL_SERVICE_ID" mysql -uroot --batch --skip-column-names -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name IN ('iicp_g2_registry_ok','iicp_g2_registry_fault')")
+          test "$existing" = 0
+          docker exec -e MYSQL_PWD=root "$MYSQL_SERVICE_ID" mysql -uroot -e 'CREATE DATABASE iicp_g2_registry_ok; CREATE DATABASE iicp_g2_registry_fault;'
+          cargo test --locked tests::registry_mysql_primary_lookup_contract -- --exact --ignored --nocapture
+          # Schema lifetime belongs to the existing CI service teardown. Never
+          # drop an external database or treat this regression as qualification.
       - name: Discovery population and result-count matrix
         run: >-
           cargo test --locked

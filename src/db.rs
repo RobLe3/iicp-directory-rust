@@ -888,6 +888,33 @@ pub struct MySqlRepo {
 }
 
 impl MySqlRepo {
+    /// Shared primary query. Pricing retains its legacy error/enrichment behavior;
+    /// the Registry path must not collapse backend failures into missing nodes.
+    async fn available_node_by_prefix(&self, prefix: &str) -> Result<Option<Node>, sqlx::Error> {
+        let row: Option<NodeRow> = sqlx::query_as(
+            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
+                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
+                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
+                      exposure_mode, transport_endpoint,
+                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
+                      pricing_model, attested, tasks_failed,
+                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
+                      operator_pubkey, operator_verified, operator_trust_tier, CAST(policy_manifest AS CHAR) AS policy_manifest
+               FROM nodes
+               WHERE (id = ? OR id LIKE CONCAT(?, '%')) AND available = 1
+               ORDER BY (id = ?) DESC
+               LIMIT 1"#,
+        )
+        .bind(prefix)
+        .bind(prefix)
+        .bind(prefix)
+        .fetch_optional(&self.pool)
+        .await
+        ?;
+
+        Ok(row.map(Node::from))
+    }
+
     #[cfg(test)]
     pub fn new(pool: Pool<MySql>) -> Self {
         Self {
@@ -1852,33 +1879,17 @@ impl NodeRepository for MySqlRepo {
         Some(node)
     }
 
-    async fn node_by_prefix(&self, prefix: &str) -> Option<Node> {
-        // PHP RegistryController::show parity — exact id OR id-prefix (UUID 8-hex prefix or
-        // custom name), AVAILABLE only, exact match preferred. The website resolves node
-        // detail by 8-hex prefix, so exact-only get() would 404 those.
-        let row: Option<NodeRow> = sqlx::query_as(
-            r#"SELECT id, endpoint, region, CAST(reputation_score AS DOUBLE) AS reputation_score, reputation_model, reputation_epoch,
-                      available, CAST(`load` AS DOUBLE) AS `load`, active_jobs, max_concurrent,
-                      tasks_total, CAST(avg_latency_ms AS DOUBLE) AS avg_latency_ms,
-                      exposure_mode, transport_endpoint,
-                      CAST(credit_cost_multiplier AS DOUBLE) AS credit_cost_multiplier,
-                      pricing_model, attested, tasks_failed,
-                      public_reachable, relay_capable, backend, CAST(supported_receipt_profiles AS CHAR) AS supported_receipt_profiles,
-                      operator_pubkey, operator_verified, operator_trust_tier, CAST(policy_manifest AS CHAR) AS policy_manifest
-               FROM nodes
-               WHERE (id = ? OR id LIKE CONCAT(?, '%')) AND available = 1
-               ORDER BY (id = ?) DESC
-               LIMIT 1"#,
-        )
-        .bind(prefix)
-        .bind(prefix)
-        .bind(prefix)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
+    async fn registry_node_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<Node>, crate::repo::RegistryLookupError> {
+        self.available_node_by_prefix(prefix)
+            .await
+            .map_err(|_| crate::repo::RegistryLookupError::BackendFailure)
+    }
 
-        let mut node = row.map(Node::from)?;
+    async fn node_by_prefix(&self, prefix: &str) -> Option<Node> {
+        let mut node = self.available_node_by_prefix(prefix).await.ok().flatten()?;
         node.supported_profiles = capability_profile_union(&self.pool, &node.node_id).await;
         node.capabilities = capability_records(&self.pool, &node.node_id, None).await;
         Some(node)

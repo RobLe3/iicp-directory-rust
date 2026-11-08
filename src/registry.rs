@@ -83,8 +83,8 @@ pub(crate) async fn registry_node_detail(
         );
     }
 
-    match st.repo.node_by_prefix(&id).await {
-        Some(n) => {
+    match st.repo.registry_node_by_prefix(&id).await {
+        Ok(Some(n)) => {
             let is_uuid = uuid::Uuid::parse_str(&n.node_id).is_ok();
             let prefix = if is_uuid {
                 n.node_id[..8.min(n.node_id.len())].to_string()
@@ -130,11 +130,18 @@ pub(crate) async fn registry_node_detail(
                 })),
             )
         }
-        None => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "REGISTRY-NODE-NOT-FOUND",
                 "message": "No active node found for this prefix."
+            })),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "REGISTRY-UNAVAILABLE",
+                "message": "Registry lookup unavailable."
             })),
         ),
     }

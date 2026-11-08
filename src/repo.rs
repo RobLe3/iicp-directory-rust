@@ -163,6 +163,12 @@ pub struct HeartbeatOutcome {
     pub reputation_epoch: Option<String>,
 }
 
+/// Failure of the Registry primary lookup; never carries backend details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryLookupError {
+    BackendFailure,
+}
+
 #[async_trait]
 pub trait NodeRepository: Send + Sync {
     /// Return a bounded, content-free database-pool snapshot when available.
@@ -210,6 +216,13 @@ pub trait NodeRepository: Send + Sync {
     /// AVAILABLE nodes, exact match preferred. Mirrors PHP RegistryController::show
     /// (`id = ? OR id LIKE ?%` AND available). `None` if no available node matches.
     async fn node_by_prefix(&self, prefix: &str) -> Option<Node>;
+
+    /// Registry-only primary read model; capability enrichment is not required.
+    /// Distinguishes a failed backend lookup from a successful absence.
+    async fn registry_node_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<Node>, RegistryLookupError>;
 
     /// Count of nodes that are available and within the 90-second liveness window.
     /// Used by `/v1/stats`. InMemoryRepo counts all available records (no timestamp).
@@ -1269,6 +1282,13 @@ impl NodeRepository for InMemoryRepo {
             node.supported_profiles.dedup();
             node
         })
+    }
+
+    async fn registry_node_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<Node>, RegistryLookupError> {
+        Ok(self.node_by_prefix(prefix).await)
     }
 
     async fn node_by_prefix(&self, prefix: &str) -> Option<Node> {
