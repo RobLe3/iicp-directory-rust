@@ -4583,3 +4583,183 @@ fn shared_implementation_metadata_fixture_matches_validation_contract() {
         }
     }
 }
+
+// G2: primary lookup failure must not masquerade as a missing Registry node.
+#[tokio::test]
+async fn registry_lookup_backend_failure_is_sanitized_503_and_pricing_stays_legacy() {
+    use crate::repo::{NodeRepository, RegistryLookupError};
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .connect_lazy("mysql://synthetic:private-marker@127.0.0.1:1/unused")
+        .unwrap();
+    pool.close().await;
+    let repository = Arc::new(crate::db::MySqlRepo::new(pool));
+    assert!(matches!(
+        repository.registry_node_by_prefix("a").await,
+        Err(RegistryLookupError::BackendFailure)
+    ));
+    assert!(repository.node_by_prefix("a").await.is_none());
+    let mut state = test_state();
+    state.repo = repository;
+    let response = app(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/registry/nodes/a")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response.headers().get("retry-after").is_none());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":"REGISTRY-UNAVAILABLE","message":"Registry lookup unavailable."})
+    );
+}
+
+#[tokio::test]
+async fn registry_lookup_keeps_available_absent_unavailable_and_invalid_outcomes() {
+    let state = test_state();
+    for (id, status) in [("a", 200), ("missing", 404), ("invalid!", 422)] {
+        let response = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/registry/nodes/{id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+    state
+        .repo
+        .heartbeat("a", 0.0, false, 0, 0, 0, 0.0, None, None)
+        .await;
+    let response = app(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/registry/nodes/a")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+#[ignore = "requires owned healthy and empty-fault MySQL fixture databases"]
+async fn registry_mysql_primary_lookup_contract() {
+    use crate::repo::{NodeRepository, RegistryLookupError};
+    use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+    let mut pools = Vec::new();
+    for (key, expected) in [
+        ("IICP_REGISTRY_OK_URL", "iicp_g2_registry_ok"),
+        ("IICP_REGISTRY_FAULT_URL", "iicp_g2_registry_fault"),
+    ] {
+        let options: MySqlConnectOptions = std::env::var(key)
+            .expect("owned fixture URL required")
+            .parse()
+            .expect("valid fixture URL");
+        assert_eq!(options.get_host(), "127.0.0.1");
+        assert_eq!(options.get_database(), Some(expected));
+        let pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let database: String = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(database, expected);
+        pools.push(pool);
+    }
+    let good = &pools[0];
+    let bad = &pools[1];
+    crate::schema::ensure_schema(good).await.unwrap();
+    sqlx::query("INSERT INTO nodes (id,endpoint,region,node_token_hash,max_concurrent,tokens_per_min,available) VALUES ('registry-live','https://example.invalid/v1','test','synthetic',1,1,1)")
+        .execute(good).await.unwrap();
+    let repository = Arc::new(crate::db::MySqlRepo::new(good.clone()));
+    assert_eq!(
+        repository
+            .node_by_prefix("registry-live")
+            .await
+            .unwrap()
+            .node_id,
+        "registry-live"
+    );
+    assert!(repository.node_by_prefix("missing").await.is_none());
+    let mut state = test_state();
+    state.repo = repository;
+    for (id, status) in [("registry-live", 200), ("missing", 404), ("invalid!", 422)] {
+        let response = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/registry/nodes/{id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+    sqlx::query("UPDATE nodes SET available=0 WHERE id='registry-live'")
+        .execute(good)
+        .await
+        .unwrap();
+    let response = app(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/registry/nodes/registry-live")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()",
+    )
+    .fetch_one(bad)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "fault database must remain empty");
+    let error = sqlx::query("SELECT id FROM nodes")
+        .fetch_optional(bad)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("42S02")
+    );
+    let bad_repository = Arc::new(crate::db::MySqlRepo::new(bad.clone()));
+    assert!(matches!(
+        bad_repository.registry_node_by_prefix("a").await,
+        Err(RegistryLookupError::BackendFailure)
+    ));
+    assert!(bad_repository.node_by_prefix("a").await.is_none());
+    let mut state = test_state();
+    state.repo = bad_repository;
+    let response = app(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/registry/nodes/a")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response.headers().get("retry-after").is_none());
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({"error":"REGISTRY-UNAVAILABLE","message":"Registry lookup unavailable."})
+    );
+    for pool in pools {
+        pool.close().await;
+    }
+}
