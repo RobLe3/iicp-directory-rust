@@ -532,6 +532,72 @@ mod tests {
         assert!(!compare_observed_default("nodes", "operator_url", missing, Some("")).is_empty());
     }
 
+    #[tokio::test]
+    #[ignore = "requires the owned disposable MySQL schema default fixture"]
+    async fn mysql_character_default_metadata_is_compared_literally() {
+        use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+
+        const DATABASE: &str = "iicp_g2_schema_defaults";
+        let options: MySqlConnectOptions = std::env::var("IICP_SCHEMA_DEFAULT_FIXTURE_URL")
+            .expect("owned fixture URL required")
+            .parse()
+            .expect("valid fixture URL");
+        assert_eq!(options.get_host(), "127.0.0.1");
+        assert_eq!(options.get_database(), Some(DATABASE));
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let database: String = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(database, DATABASE);
+        assert_eq!(
+            base_table_count(&pool).await.unwrap(),
+            0,
+            "fixture must start empty"
+        );
+        assert_eq!(
+            ensure_schema(&pool).await.unwrap(),
+            SchemaStatus::BootstrappedEmpty
+        );
+        verify_existing_schema(&pool).await.unwrap();
+
+        for (statement, literal) in [
+            (
+                "ALTER TABLE nodes ALTER COLUMN status SET DEFAULT 'ACTIVE'",
+                "ACTIVE",
+            ),
+            (
+                "ALTER TABLE nodes ALTER COLUMN status SET DEFAULT 'active '",
+                "active ",
+            ),
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+            let mut observed = BTreeMap::new();
+            load_columns(&pool, &mut observed).await.unwrap();
+            assert_eq!(
+                observed["nodes"].columns["status"].default.as_deref(),
+                Some(literal)
+            );
+            let error = verify_existing_schema(&pool).await.unwrap_err();
+            assert!(
+                matches!(error, SchemaError::Incompatible(ref problems)
+                    if problems == &["column default mismatch nodes.status"]),
+                "unexpected schema refusal: {error}"
+            );
+        }
+
+        sqlx::query("ALTER TABLE nodes ALTER COLUMN status SET DEFAULT 'active'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        verify_existing_schema(&pool).await.unwrap();
+        // The CI service owns the fixture lifetime. Do not drop schemas here.
+    }
+
     #[test]
     fn partial_schema_generation_is_rejected_without_repair() {
         let contract: Contract = serde_json::from_str(CONTRACT_JSON).unwrap();
