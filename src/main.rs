@@ -639,21 +639,27 @@ async fn deregister(
             ),
         );
     }
-    if st.repo.deregister(&req.node_id).await {
-        // #442 — emit a SIGNED DEREGISTER event (was an unsigned log_event) so replicas
-        // mirror the removal over /v1/events. No-op when unsigned (no key configured).
-        emit_event(&st, "DEREGISTER", &req.node_id, serde_json::json!({})).await;
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "deregistered": true })),
-        )
-    } else {
-        (
+    match st.repo.deregister(&req.node_id).await {
+        Ok(true) => {
+            // #442 — emit a signed event only after a successful deletion.
+            emit_event(&st, "DEREGISTER", &req.node_id, serde_json::json!({})).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "deregistered": true })),
+            )
+        }
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(
                 serde_json::json!({ "error": { "code": "IICP-E003", "message": "node not found" } }),
             ),
-        )
+        ),
+        Err(repo::RepoError::Persistence) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": { "code": "server_error", "message": "deregistration persistence failed" }
+            })),
+        ),
     }
 }
 

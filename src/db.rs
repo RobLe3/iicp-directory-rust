@@ -1956,12 +1956,14 @@ impl NodeRepository for MySqlRepo {
 
     /// Deregister: hard-delete the node row. Capabilities are removed via CASCADE.
     /// Credits (on nodes.credit_balance) are lost — matching PHP deregister behavior.
-    async fn deregister(&self, node_id: &str) -> bool {
+    async fn deregister(&self, node_id: &str) -> Result<bool, RepoError> {
         let result = sqlx::query("DELETE FROM nodes WHERE id = ?")
             .bind(node_id)
             .execute(&self.pool)
             .await;
-        result.map(|r| r.rows_affected() > 0).unwrap_or(false)
+        result
+            .map(|r| r.rows_affected() > 0)
+            .map_err(|_| RepoError::Persistence)
     }
 
     /// Token verification via bcrypt::verify (matches PHP password_verify).
@@ -4291,7 +4293,7 @@ mod tests {
         capability_records, capability_records_batch_query, credit_ttl_idle, init_pool,
         median_outlier_weight, MySqlRepo,
     };
-    use crate::repo::{DiscoverQuery, NodeRepository, ProbeRouteTransition};
+    use crate::repo::{DiscoverQuery, NodeRepository, ProbeRouteTransition, RepoError};
     use serde_json::Value;
     use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
     use sqlx::{MySql, QueryBuilder};
@@ -4301,6 +4303,14 @@ mod tests {
 
     fn s(vals: &[f64]) -> Vec<(f64,)> {
         vals.iter().map(|&v| (v,)).collect()
+    }
+
+    #[tokio::test]
+    async fn deregistration_with_closed_pool_is_not_absence() {
+        let pool = MySqlPoolOptions::new().connect_lazy_with(MySqlConnectOptions::new());
+        pool.close().await;
+        let repo = MySqlRepo::new(pool);
+        assert_eq!(repo.deregister("node").await, Err(RepoError::Persistence));
     }
 
     #[test]
