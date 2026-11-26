@@ -106,6 +106,19 @@ jobs:
           cargo test --locked tests::registry_mysql_primary_lookup_contract -- --exact --ignored --nocapture
           # Schema lifetime belongs to the existing CI service teardown. Never
           # drop an external database or treat this regression as qualification.
+      - name: Compare literal column defaults from MySQL metadata
+        timeout-minutes: 10
+        env:
+          MYSQL_SERVICE_ID: ${{ job.services.mysql.id }}
+          IICP_SCHEMA_DEFAULT_FIXTURE_URL: mysql://root:root@127.0.0.1:3306/iicp_g2_schema_defaults?ssl-mode=DISABLED
+        run: |
+          set -euo pipefail
+          test -n "$MYSQL_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$MYSQL_SERVICE_ID")" = true
+          existing=$(docker exec -e MYSQL_PWD=root "$MYSQL_SERVICE_ID" mysql --protocol=TCP --host=127.0.0.1 -uroot --batch --skip-column-names -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'iicp_g2_schema_defaults'")
+          test "$existing" = 0
+          docker exec -e MYSQL_PWD=root "$MYSQL_SERVICE_ID" mysql --protocol=TCP --host=127.0.0.1 -uroot -e 'CREATE DATABASE iicp_g2_schema_defaults'
+          cargo test --locked --bin iicp-directory-rs schema::tests::mysql_character_default_metadata_is_compared_literally -- --exact --ignored
       - name: Discovery population and result-count matrix
         run: >-
           cargo test --locked

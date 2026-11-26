@@ -230,7 +230,8 @@ async fn load_columns(
             ColumnContract {
                 column_type: normalize(&row.column_type),
                 nullable: row.is_nullable == "YES",
-                default: row.column_default.map(|value| normalize_default(&value)),
+                // Keep literal bytes until the expected column type determines how to compare.
+                default: row.column_default,
                 extra: normalize(&row.extra),
             },
         );
@@ -426,9 +427,17 @@ fn compare_column_storage(
     found: &ColumnContract,
     problems: &mut Vec<String>,
 ) {
-    if expected.default.as_deref().map(normalize_default)
-        != found.default.as_deref().map(normalize_default)
+    let column_type = normalize(&expected.column_type);
+    let defaults_match = if column_type.starts_with("char(") || column_type.starts_with("varchar(")
     {
+        // SQL metadata presents character literal defaults without quotes.
+        // Case and whitespace are part of the stored value, not formatting.
+        expected.default == found.default
+    } else {
+        expected.default.as_deref().map(normalize_default)
+            == found.default.as_deref().map(normalize_default)
+    };
+    if !defaults_match {
         problems.push(format!(
             "column default mismatch {table_name}.{column_name}"
         ));
@@ -467,6 +476,126 @@ mod tests {
             "current_timestamp"
         );
         assert_eq!(normalize_default("current_timestamp"), "current_timestamp");
+    }
+
+    fn compare_observed_default(
+        table: &str,
+        column: &str,
+        expected: &ColumnContract,
+        observed: Option<&str>,
+    ) -> Vec<String> {
+        let actual = ColumnContract {
+            column_type: expected.column_type.clone(),
+            nullable: expected.nullable,
+            default: observed.map(str::to_owned),
+            extra: expected.extra.clone(),
+        };
+        let mut problems = Vec::new();
+        compare_column_storage(table, column, expected, &actual, &mut problems);
+        problems
+    }
+
+    #[test]
+    fn literal_character_defaults_reject_case_and_whitespace_drift() {
+        let contract: Contract = serde_json::from_str(CONTRACT_JSON).unwrap();
+        let expected = &contract.tables["nodes"].columns["status"];
+        assert_eq!(expected.default.as_deref(), Some("active"));
+        assert!(compare_observed_default("nodes", "status", expected, Some("active")).is_empty());
+        for altered in [Some("ACTIVE"), Some("active "), None] {
+            assert_eq!(
+                compare_observed_default("nodes", "status", expected, altered),
+                ["column default mismatch nodes.status"],
+                "drift at {altered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_comparison_keeps_temporal_numeric_and_missing_equivalence() {
+        let contract: Contract = serde_json::from_str(CONTRACT_JSON).unwrap();
+        let probes = &contract.tables["iicp_telemetry_probes"].columns;
+        assert!(compare_observed_default(
+            "iicp_telemetry_probes",
+            "probed_at",
+            &probes["probed_at"],
+            Some("current_timestamp()"),
+        )
+        .is_empty());
+
+        let nodes = &contract.tables["nodes"].columns;
+        let numeric = &nodes["available"];
+        assert_eq!(numeric.default.as_deref(), Some("1"));
+        assert!(compare_observed_default("nodes", "available", numeric, Some(" 1 ")).is_empty());
+        let missing = &nodes["operator_url"];
+        assert!(missing.default.is_none());
+        assert!(compare_observed_default("nodes", "operator_url", missing, None).is_empty());
+        assert!(!compare_observed_default("nodes", "operator_url", missing, Some("")).is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the owned disposable MySQL schema default fixture"]
+    async fn mysql_character_default_metadata_is_compared_literally() {
+        use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+
+        const DATABASE: &str = "iicp_g2_schema_defaults";
+        let options: MySqlConnectOptions = std::env::var("IICP_SCHEMA_DEFAULT_FIXTURE_URL")
+            .expect("owned fixture URL required")
+            .parse()
+            .expect("valid fixture URL");
+        assert_eq!(options.get_host(), "127.0.0.1");
+        assert_eq!(options.get_database(), Some(DATABASE));
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let database: String = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(database, DATABASE);
+        assert_eq!(
+            base_table_count(&pool).await.unwrap(),
+            0,
+            "fixture must start empty"
+        );
+        assert_eq!(
+            ensure_schema(&pool).await.unwrap(),
+            SchemaStatus::BootstrappedEmpty
+        );
+        verify_existing_schema(&pool).await.unwrap();
+
+        for (statement, literal) in [
+            (
+                "ALTER TABLE nodes ALTER COLUMN status SET DEFAULT 'ACTIVE'",
+                "ACTIVE",
+            ),
+            (
+                "ALTER TABLE nodes ALTER COLUMN status SET DEFAULT 'active '",
+                "active ",
+            ),
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+            let mut observed = BTreeMap::new();
+            load_columns(&pool, &mut observed).await.unwrap();
+            assert_eq!(
+                observed["nodes"].columns["status"].default.as_deref(),
+                Some(literal)
+            );
+            let error = verify_existing_schema(&pool).await.unwrap_err();
+            assert!(
+                matches!(error, SchemaError::Incompatible(ref problems)
+                    if problems == &["column default mismatch nodes.status"]),
+                "unexpected schema refusal: {error}"
+            );
+        }
+
+        sqlx::query("ALTER TABLE nodes ALTER COLUMN status SET DEFAULT 'active'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        verify_existing_schema(&pool).await.unwrap();
+        // The CI service owns the fixture lifetime. Do not drop schemas here.
     }
 
     #[test]
