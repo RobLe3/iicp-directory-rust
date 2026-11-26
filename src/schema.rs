@@ -230,7 +230,8 @@ async fn load_columns(
             ColumnContract {
                 column_type: normalize(&row.column_type),
                 nullable: row.is_nullable == "YES",
-                default: row.column_default.map(|value| normalize_default(&value)),
+                // Keep literal bytes until the expected column type determines how to compare.
+                default: row.column_default,
                 extra: normalize(&row.extra),
             },
         );
@@ -426,9 +427,17 @@ fn compare_column_storage(
     found: &ColumnContract,
     problems: &mut Vec<String>,
 ) {
-    if expected.default.as_deref().map(normalize_default)
-        != found.default.as_deref().map(normalize_default)
+    let column_type = normalize(&expected.column_type);
+    let defaults_match = if column_type.starts_with("char(") || column_type.starts_with("varchar(")
     {
+        // SQL metadata presents character literal defaults without quotes.
+        // Case and whitespace are part of the stored value, not formatting.
+        expected.default == found.default
+    } else {
+        expected.default.as_deref().map(normalize_default)
+            == found.default.as_deref().map(normalize_default)
+    };
+    if !defaults_match {
         problems.push(format!(
             "column default mismatch {table_name}.{column_name}"
         ));
@@ -467,6 +476,60 @@ mod tests {
             "current_timestamp"
         );
         assert_eq!(normalize_default("current_timestamp"), "current_timestamp");
+    }
+
+    fn compare_observed_default(
+        table: &str,
+        column: &str,
+        expected: &ColumnContract,
+        observed: Option<&str>,
+    ) -> Vec<String> {
+        let actual = ColumnContract {
+            column_type: expected.column_type.clone(),
+            nullable: expected.nullable,
+            default: observed.map(str::to_owned),
+            extra: expected.extra.clone(),
+        };
+        let mut problems = Vec::new();
+        compare_column_storage(table, column, expected, &actual, &mut problems);
+        problems
+    }
+
+    #[test]
+    fn literal_character_defaults_reject_case_and_whitespace_drift() {
+        let contract: Contract = serde_json::from_str(CONTRACT_JSON).unwrap();
+        let expected = &contract.tables["nodes"].columns["status"];
+        assert_eq!(expected.default.as_deref(), Some("active"));
+        assert!(compare_observed_default("nodes", "status", expected, Some("active")).is_empty());
+        for altered in [Some("ACTIVE"), Some("active "), None] {
+            assert_eq!(
+                compare_observed_default("nodes", "status", expected, altered),
+                ["column default mismatch nodes.status"],
+                "drift at {altered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_comparison_keeps_temporal_numeric_and_missing_equivalence() {
+        let contract: Contract = serde_json::from_str(CONTRACT_JSON).unwrap();
+        let probes = &contract.tables["iicp_telemetry_probes"].columns;
+        assert!(compare_observed_default(
+            "iicp_telemetry_probes",
+            "probed_at",
+            &probes["probed_at"],
+            Some("current_timestamp()"),
+        )
+        .is_empty());
+
+        let nodes = &contract.tables["nodes"].columns;
+        let numeric = &nodes["available"];
+        assert_eq!(numeric.default.as_deref(), Some("1"));
+        assert!(compare_observed_default("nodes", "available", numeric, Some(" 1 ")).is_empty());
+        let missing = &nodes["operator_url"];
+        assert!(missing.default.is_none());
+        assert!(compare_observed_default("nodes", "operator_url", missing, None).is_empty());
+        assert!(!compare_observed_default("nodes", "operator_url", missing, Some("")).is_empty());
     }
 
     #[test]
