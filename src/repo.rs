@@ -238,8 +238,9 @@ pub trait NodeRepository: Send + Sync {
     /// No intent filter — any available node qualifies. Sorted by last_seen desc.
     async fn bootstrap(&self, limit: usize) -> Vec<Node>;
 
-    /// Remove a node from the directory (iicp-dir §3.6 deregister). Returns true if found.
-    async fn deregister(&self, node_id: &str) -> bool;
+    /// Remove a node from the directory. False means a successful delete affected
+    /// no row; an uncertain or failed delete is a distinct persistence error.
+    async fn deregister(&self, node_id: &str) -> Result<bool, RepoError>;
 
     /// Verify that `token` is valid for `node_id`. InMemoryRepo is permissive
     /// by default and can opt into plaintext-token checks for focused lifecycle
@@ -937,6 +938,8 @@ pub struct InMemoryRepo {
     /// Optional strict token checking for HTTP lifecycle canaries. Ordinary
     /// in-memory tests retain the historical permissive behavior.
     verify_tokens: bool,
+    #[cfg(test)]
+    fail_deregistration: bool,
     /// Outstanding ADR-047 challenge by node ID. Kept separate from the public node model.
     liveness_challenges: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// ADR-048 (#374): per-(node, evaluator) health snapshots —
@@ -986,6 +989,8 @@ impl InMemoryRepo {
         Self {
             records: std::sync::Mutex::new(records),
             verify_tokens: false,
+            #[cfg(test)]
+            fail_deregistration: false,
             liveness_challenges: std::sync::Mutex::new(std::collections::HashMap::new()),
             health_obs: std::sync::Mutex::new(Vec::new()),
             replicas: std::sync::Mutex::new(Vec::new()),
@@ -996,6 +1001,14 @@ impl InMemoryRepo {
             dispatch_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
             probe_results: std::sync::Mutex::new(Vec::new()),
             last_metrics_batches: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_deregistration_failure() -> Self {
+        Self {
+            fail_deregistration: true,
+            ..Self::default()
         }
     }
 
@@ -1337,11 +1350,15 @@ impl NodeRepository for InMemoryRepo {
             .collect()
     }
 
-    async fn deregister(&self, node_id: &str) -> bool {
+    async fn deregister(&self, node_id: &str) -> Result<bool, RepoError> {
+        #[cfg(test)]
+        if self.fail_deregistration {
+            return Err(RepoError::Persistence);
+        }
         let mut guard = self.records.lock().unwrap();
         let before = guard.len();
         guard.retain(|r| r.node.node_id != node_id);
-        guard.len() < before
+        Ok(guard.len() < before)
     }
 
     /// InMemoryRepo keeps issued tokens only in process memory.  Comparing them

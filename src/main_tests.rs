@@ -3682,6 +3682,30 @@ async fn deregister_unknown_node_is_404() {
 }
 
 #[tokio::test]
+async fn deregister_persistence_failure_is_redacted_server_error() {
+    let mut state = test_state();
+    state.repo = Arc::new(InMemoryRepo::new_with_deregistration_failure());
+    let request = axum::http::Request::builder()
+        .method("DELETE")
+        .uri("/v1/register")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test-token")
+        .body(axum::body::Body::from(
+            serde_json::json!({ "node_id": "fixture-node" }).to_string(),
+        ))
+        .unwrap();
+    let response = app(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "error": { "code": "server_error", "message": "deregistration persistence failed" }
+        })
+    );
+}
+
+#[tokio::test]
 async fn metrics_returns_prometheus_text() {
     let resp = app(test_state())
         .oneshot(

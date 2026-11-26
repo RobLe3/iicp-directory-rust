@@ -546,6 +546,18 @@ pub async fn run_replica_sync(
                     }
                     prev_sig = ev.sig.clone();
                 }
+                if outcome == ApplyOutcome::DeregisterPersistenceFailed {
+                    // Do not acknowledge or automatically retry an uncertain write.
+                    ready.store(false, Ordering::Release);
+                    write_replica_status(
+                        &cfg,
+                        ReplicaPhase::Degraded,
+                        Some(snapshot_seq),
+                        Some(since_seq),
+                        Some("deregistration persistence failed"),
+                    );
+                    return;
+                }
                 if matches!(
                     outcome,
                     ApplyOutcome::Rejected("bad signature")
@@ -620,6 +632,8 @@ pub enum ApplyOutcome {
     Skipped,
     /// Refused — signature invalid, seq non-monotonic, or malformed. State unchanged.
     Rejected(&'static str),
+    /// The deletion could not be confirmed. Do not advance past this event.
+    DeregisterPersistenceFailed,
 }
 
 /// Intents the node serves, from the REGISTER event's `capabilities[]` (#438).
@@ -836,8 +850,13 @@ pub async fn apply_event(repo: &dyn NodeRepository, ev: &FederatedEvent) -> Appl
     match ev.event_type.as_str() {
         "REGISTER" => apply_register(repo, ev).await,
         "DEREGISTER" => match ev.node_id.as_deref() {
-            Some(id) if repo.deregister(id).await => ApplyOutcome::Applied,
-            Some(_) => ApplyOutcome::Skipped, // unknown node
+            Some(id) => match repo.deregister(id).await {
+                Ok(true) => ApplyOutcome::Applied,
+                Ok(false) => ApplyOutcome::Skipped, // unknown node
+                Err(crate::repo::RepoError::Persistence) => {
+                    ApplyOutcome::DeregisterPersistenceFailed
+                }
+            },
             None => ApplyOutcome::Rejected("DEREGISTER missing node_id"),
         },
         "HEALTH" => apply_health(repo, ev).await,
@@ -1060,7 +1079,7 @@ pub async fn verify_and_apply(
     // never on malformed or rejected input.
     let high_water = match outcome {
         ApplyOutcome::Applied | ApplyOutcome::Skipped => ev.seq,
-        ApplyOutcome::Rejected(_) => last_applied_seq,
+        ApplyOutcome::Rejected(_) | ApplyOutcome::DeregisterPersistenceFailed => last_applied_seq,
     };
     (outcome, high_water)
 }
@@ -1302,6 +1321,22 @@ mod tests {
         };
         assert_eq!(apply_event(&repo, &dereg).await, ApplyOutcome::Applied);
         assert!(discoverable(&repo, CHAT).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deregister_advances_cursor_only_for_genuine_absence() {
+        let mut event = register_event("missing-node", 8);
+        event.event_type = "DEREGISTER".into();
+        let empty = InMemoryRepo::default();
+        assert_eq!(
+            verify_and_apply(&empty, &event, None, 7, None).await,
+            (ApplyOutcome::Skipped, 8)
+        );
+        let failed = InMemoryRepo::new_with_deregistration_failure();
+        assert_eq!(
+            verify_and_apply(&failed, &event, None, 7, None).await,
+            (ApplyOutcome::DeregisterPersistenceFailed, 7)
+        );
     }
 
     #[tokio::test]
