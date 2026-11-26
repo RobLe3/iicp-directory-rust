@@ -289,24 +289,41 @@ async fn discover_api_v1_contains_live_php_compatibility_fields() {
 
 #[tokio::test]
 async fn replica_discovery_fails_closed_until_verified_sync_is_ready() {
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     let mut state = test_state();
-    state.replica_ready = Some(Arc::new(AtomicBool::new(false)));
-    let resp = app(state)
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "10");
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["error"]["code"], "replica_not_ready");
+    let ready = Arc::new(AtomicBool::new(false));
+    state.replica_ready = Some(Arc::clone(&ready));
+    let router = app(state);
+
+    // Drive the same readiness flag the sync worker updates. Reuse the same
+    // router to catch a gate that accidentally caches its initial decision.
+    for synced in [false, true, false] {
+        ready.store(synced, Ordering::Release);
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/discover?intent=urn:iicp:intent:llm:chat:v1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if synced {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(!resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        } else {
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "10");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["code"], "replica_not_ready");
+        }
+    }
 }
 
 #[tokio::test]
